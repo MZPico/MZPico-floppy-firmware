@@ -1,0 +1,260 @@
+#include "floppy.hpp"
+
+#include "flux/arch_rp2.h"
+
+#include "hardware/gpio.h"
+#include "pico/time.h"
+
+// Small Arduino-compat shims so the ported logic reads like the original.
+static inline uint32_t millis() {
+  return to_ms_since_boot(get_absolute_time());
+}
+static inline void out_high(int pin) { gpio_put(pin, 1); }
+static inline void out_low(int pin) { gpio_put(pin, 0); }
+static inline void write_pin(int pin, bool v) { gpio_put(pin, v); }
+static inline bool read_pin(int pin) { return gpio_get(pin); }
+
+static void init_out(int pin, bool level) {
+  if (pin < 0)
+    return;
+  gpio_init(pin);
+  gpio_set_dir(pin, GPIO_OUT);
+  gpio_put(pin, level);
+}
+static void init_in_pullup(int pin) {
+  if (pin < 0)
+    return;
+  gpio_init(pin);
+  gpio_set_dir(pin, GPIO_IN);
+  gpio_pull_up(pin);
+}
+static void init_in_nopull(int pin) {
+  if (pin < 0)
+    return;
+  gpio_init(pin);
+  gpio_set_dir(pin, GPIO_IN);
+  gpio_disable_pulls(pin); // RDATA has an external pull-up
+}
+
+FloppyDrive::FloppyDrive(int densitypin, int indexpin, int selectpin,
+                         int motorpin, int directionpin, int steppin,
+                         int wrdatapin, int wrgatepin, int track0pin,
+                         int protectpin, int rddatapin, int sidepin,
+                         int readypin)
+    : _densitypin(densitypin), _indexpin(indexpin), _selectpin(selectpin),
+      _motorpin(motorpin), _directionpin(directionpin), _steppin(steppin),
+      _wrdatapin(wrdatapin), _wrgatepin(wrgatepin), _track0pin(track0pin),
+      _protectpin(protectpin), _rddatapin(rddatapin), _sidepin(sidepin),
+      _readypin(readypin) {}
+
+bool FloppyDrive::begin() {
+  soft_reset();
+  return true;
+}
+
+void FloppyDrive::soft_reset() {
+  // Index: input with pull-up (active low)
+  init_in_pullup(_indexpin);
+
+  // Write data idle high, write gate released (input, pulled up)
+  init_out(_wrdatapin, true);
+  init_in_pullup(_wrgatepin);
+
+  // Read data: input, no internal pull (external pull-up on the board bodge)
+  init_in_nopull(_rddatapin);
+
+  // Deselect drive (select active low)
+  init_out(_selectpin, true);
+  // Motor off (active low -> high = off)
+  init_out(_motorpin, true);
+  // Direction: low = inward
+  init_out(_directionpin, false);
+  // Step idle high (pulses low)
+  init_out(_steppin, true);
+  // Side 0 (head 0 = logic high)
+  init_out(_sidepin, true);
+
+  init_in_pullup(_track0pin);
+  init_in_pullup(_protectpin);
+  init_in_pullup(_readypin);
+
+  // Density low
+  init_out(_densitypin, false);
+
+  select_delay_us = 10;
+  step_delay_us = 12000;
+  settle_delay_ms = 15;
+  motor_delay_ms = 1000;
+  watchdog_delay_ms = 1000;
+
+  _is_drive_selected = false;
+  _is_motor_spinning = false;
+  _is_index_seen = false;
+}
+
+void FloppyDrive::end() {
+  gpio_set_dir(_rddatapin, GPIO_IN);
+  if (_wrdatapin >= 0)
+    gpio_set_dir(_wrdatapin, GPIO_IN);
+  if (_wrgatepin >= 0)
+    gpio_set_dir(_wrgatepin, GPIO_IN);
+  if (_indexpin >= 0)
+    gpio_set_dir(_indexpin, GPIO_IN);
+  _is_drive_selected = false;
+  _is_motor_spinning = false;
+  _is_index_seen = false;
+}
+
+bool FloppyDrive::read_index() {
+  if (_indexpin < 0)
+    return true;
+  return read_pin(_indexpin);
+}
+
+void FloppyDrive::select(bool selected) {
+  write_pin(_selectpin, !selected); // selected = logic 0
+  _is_drive_selected = selected;
+  sleep_us(select_delay_us);
+}
+
+bool FloppyDrive::side(int head) {
+  if (head != 0 && head != 1)
+    return false;
+  if (_sidepin < 0 && head != 0)
+    return false;
+  _side = head;
+  write_pin(_sidepin, !head); // head 0 = logic 1, head 1 = logic 0
+  return true;
+}
+
+bool FloppyDrive::spin_motor(bool motor_on) {
+  if (motor_on != _is_motor_spinning) {
+    write_pin(_motorpin, !motor_on); // motor on = logic 0
+    _is_motor_spinning = motor_on;
+  }
+  if (!motor_on) {
+    _is_index_seen = false;
+    return true;
+  }
+  if (_is_index_seen)
+    return true;
+
+  sleep_ms(motor_delay_ms);
+
+  uint32_t index_stamp = millis();
+  bool timedout = false;
+  while (read_index()) {
+    if ((millis() - index_stamp) > 1000) {
+      timedout = true;
+      break;
+    }
+  }
+  _is_index_seen = !timedout;
+  return _is_index_seen;
+}
+
+void FloppyDrive::step(bool dir, uint8_t times) {
+  write_pin(_directionpin, dir);
+  sleep_us(10);
+  uint32_t half = (step_delay_us / 1000UL) + 1;
+  while (times--) {
+    out_high(_steppin);
+    sleep_ms(half);
+    out_low(_steppin);
+    sleep_ms(half);
+    out_high(_steppin);
+  }
+  sleep_ms(half); // one more for good measure
+}
+
+bool FloppyDrive::goto_track(int track_num) {
+  static const int FLOPPY_MAX_TRACK = 80; // FLOPPY_IBMPC_HD_TRACKS
+
+  if ((_track < 0) || track_num == 0) {
+    uint8_t max_steps = 100;
+    while (max_steps--) {
+      if (!read_pin(_track0pin)) { // track0 active low
+        _track = 0;
+        break;
+      }
+      step(STEP_OUT, 1);
+    }
+    if (read_pin(_track0pin)) {
+      // never saw track 0 stepping out; try stepping in a bit
+      max_steps = 20;
+      while (max_steps--) {
+        if (!read_pin(_track0pin)) {
+          _track = 0;
+          break;
+        }
+        step(STEP_IN, 1);
+      }
+      if (read_pin(_track0pin)) {
+        _track = -1;
+        return false;
+      }
+    }
+  }
+  sleep_ms(settle_delay_ms);
+
+  if (track_num > FLOPPY_MAX_TRACK - 1)
+    track_num = FLOPPY_MAX_TRACK - 1;
+  if (_track == track_num)
+    return true;
+
+  int steps = track_num - _track;
+  if (steps > 0) {
+    step(STEP_IN, steps);
+  } else {
+    step(STEP_OUT, -steps);
+  }
+  sleep_ms(settle_delay_ms);
+  _track = track_num;
+  return true;
+}
+
+bool FloppyDrive::get_write_protect() {
+  if (_protectpin < 0)
+    return false;
+  return !read_pin(_protectpin);
+}
+
+bool FloppyDrive::get_ready_sense() {
+  if (_readypin < 0)
+    return true;
+  return !read_pin(_readypin);
+}
+
+bool FloppyDrive::get_track0_sense() {
+  if (_track0pin < 0)
+    return track() != 0;
+  return !read_pin(_track0pin);
+}
+
+bool FloppyDrive::set_density(bool high_density) {
+  if (_densitypin < 0)
+    return !high_density;
+  write_pin(_densitypin, high_density);
+  return true;
+}
+
+uint32_t FloppyDrive::getSampleFrequency() const { return 24000000UL; }
+
+size_t FloppyDrive::capture_track(volatile uint8_t *pulses, size_t max_pulses,
+                                  int32_t *falling_index_offset,
+                                  bool store_greaseweazle, uint32_t capture_ms,
+                                  uint32_t index_wait_ms) {
+  for (size_t i = 0; i < max_pulses; i++)
+    pulses[i] = 0;
+  return rp2040_flux_capture(_indexpin, _rddatapin, pulses, pulses + max_pulses,
+                             falling_index_offset, store_greaseweazle,
+                             capture_ms * (getSampleFrequency() / 1000),
+                             index_wait_ms);
+}
+
+bool FloppyDrive::write_track(uint8_t *pulses, size_t n_pulses,
+                              bool store_greaseweazle, bool use_index) {
+  return rp2040_flux_write(_indexpin, _wrgatepin, _wrdatapin, pulses,
+                           pulses + n_pulses, store_greaseweazle,
+                           /*is_apple2=*/false, use_index);
+}
