@@ -6,6 +6,7 @@
 #include "board_config.h"
 #include "floppy.hpp"
 #include "mfm_decode.hpp"
+#include "mfm_encode.hpp"
 
 #include "tusb.h"
 #include "pico/time.h"
@@ -41,7 +42,9 @@
 // MZPico extension commands (outside the greaseweazle command range, so the
 // gw host tools never send them; only tools/mzp_probe.py does).
 #define MZP_CMD_SCAN 0x80 // scan one track's MFM sectors (Phase-2 validation)
+#define MZP_CMD_ENCTEST 0x81 // encode->decode round-trip (encoder validation)
 #define MZP_MAX_SECTORS 40
+#define MZP_MAX_ENC_SECTORS 18
 
 #define GW_ACK_OK 0
 #define GW_ACK_BADCMD 1
@@ -69,6 +72,7 @@ static bool flux_status = false;
 // MZP scan-track scratch
 static SectorInfo g_scan_sectors[MZP_MAX_SECTORS];
 static uint8_t g_scan_scratch[1024]; // largest sector (128 << 3)
+static uint8_t g_enc_sectors[MZP_MAX_ENC_SECTORS * 512]; // encode-test source
 
 static uint32_t bandwidth_timer;
 static uint32_t transfered_bytes;
@@ -513,6 +517,54 @@ void gw_task() {
     // Report: [cmd, ACK, ns, nflux(4 LE), then {cyl,head,sec,n,flags} * ns].
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = (uint8_t)ns;
+    reply_buffer[i++] = nflux & 0xFF;
+    reply_buffer[i++] = (nflux >> 8) & 0xFF;
+    reply_buffer[i++] = (nflux >> 16) & 0xFF;
+    reply_buffer[i++] = (nflux >> 24) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+    for (int k = 0; k < ns; k++) {
+      SectorInfo *s = &g_scan_sectors[k];
+      uint8_t rec[5] = {
+          s->cyl, s->head, s->sec, s->n,
+          (uint8_t)((s->id_crc_ok ? 1 : 0) | (s->data_crc_ok ? 2 : 0) |
+                    (s->has_data ? 4 : 0) | (s->deleted ? 8 : 0))};
+      cdc_write_all(rec, 5);
+    }
+  }
+
+  else if (cmd == MZP_CMD_ENCTEST) {
+    // Encoder validation, no disk: encode a synthetic uniform track then decode
+    // it with the scanner and count sectors that round-trip with valid CRCs.
+    // cmd_buffer[2]=n_sectors, [3]=size_code (0..2), [4]=density.
+    uint8_t nsec = cmd_buffer[2];
+    uint8_t sizecode = cmd_buffer[3] & 3;
+    uint8_t dens = cmd_buffer[4];
+    float bt = dens ? 1.0f : 2.0f;
+    if (sizecode > 2)
+      sizecode = 2; // buffer holds up to 512-byte sectors
+    if (nsec > MZP_MAX_ENC_SECTORS)
+      nsec = MZP_MAX_ENC_SECTORS;
+    size_t ssize = 128u << sizecode;
+
+    for (size_t k = 0; k < (size_t)nsec * ssize; k++)
+      g_enc_sectors[k] = (uint8_t)(k * 7 + 3); // deterministic pattern
+
+    size_t nflux =
+        mfm_encode_track(flux_transitions, sizeof(flux_transitions),
+                         g_enc_sectors, nsec, sizecode, bt, 0, 0);
+    int ns = mfm_scan_track(flux_transitions, nflux, bt, g_scan_sectors,
+                            MZP_MAX_SECTORS, g_scan_scratch,
+                            sizeof(g_scan_scratch));
+    int valid = 0;
+    for (int k = 0; k < ns; k++)
+      if (g_scan_sectors[k].id_crc_ok && g_scan_sectors[k].data_crc_ok)
+        valid++;
+
+    // Report: [cmd, ACK, nsec, ns, valid, nflux(4 LE)] then {..}*ns.
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = nsec;
+    reply_buffer[i++] = (uint8_t)ns;
+    reply_buffer[i++] = (uint8_t)valid;
     reply_buffer[i++] = nflux & 0xFF;
     reply_buffer[i++] = (nflux >> 8) & 0xFF;
     reply_buffer[i++] = (nflux >> 16) & 0xFF;

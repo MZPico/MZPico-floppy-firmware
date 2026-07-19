@@ -10,3 +10,7 @@ Sharp_MZ-800_ROM_Vypis_Odehnal-Veverka.pdf
 *.scp
 *.img
 readback.dsk
+
+# Python
+__pycache__/
+*.pyc
