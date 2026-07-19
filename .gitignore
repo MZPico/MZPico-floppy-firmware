@@ -1,4 +1,7 @@
 /build/
+# Third-party copyrighted reference material — kept locally, not committed.
+MZ2Z046.ASM
+Sharp_MZ-800_ROM_Vypis_Odehnal-Veverka.pdf
 *.uf2
 *.elf
 *.bin

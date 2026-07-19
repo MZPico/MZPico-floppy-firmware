@@ -74,21 +74,63 @@ accordingly rather than reusing FRUGAL's separate 16-pin addr+data layout.
 Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 `~WGATE` (GPIO17), `~INDEX` (GPIO21).
 
-## Key open design decisions (resolve early, record answers here)
+## Key design decisions (✅ = resolved)
 
-1. **Core split:** reference already uses core1 for the hard-real-time bus loop.
-   The floppy flux engine is also latency-sensitive and PIO-heavy. Decide PIO
-   instance / SM and core allocation so bus servicing and flux I/O don't fight.
-2. **Latency bridging:** MZ-800 FDC reads expect a fast reply (via EXWAIT
-   stall); a physical seek + track read takes milliseconds. Plan a
-   **track/sector cache** so most FDC sector reads hit RAM, with EXWAIT covering
-   misses.
-3. **Geometry mapping:** map MZ-800 disk geometry (track/side/sector/size) onto
-   MFM decode results from the real disk; handle format/density (`DEN_RDY`).
-4. **Writes:** reference is currently read-only. Physical write-back means MFM
-   encode + `write_track` + `WGATE`/`WPT` handling.
-5. **Build system:** Pico-SDK + CMake (follow reference), pulling in the needed
-   Adafruit flux/MFM sources rather than the whole Arduino library.
+> Full FDC spec: **[docs/wd-fidelity.md](docs/wd-fidelity.md)** (register map,
+> inverted bus, the ROM's polled-DRQ handshake, commands, architecture). The
+> MZ-800 side is derived from the Disk BASIC ROM `MZ2Z046.ASM` (in repo root).
+
+- **Emulation goal:** ✅ be **as faithful as possible to the original WD FDC**
+  — target the **WD179x / FD1791-02** register+command model (WD1773/WD2797 are
+  compatible supersets). Keep the reference `fdc.cpp` WD state machine and refine
+  it for fidelity; back it with the **real drive in real time** (not an image).
+- **Async, not stall-and-wait:** ✅ a faithful WD is inherently async
+  (command → **BUSY** → **DRQ** per byte → **INTRQ**; CPU polls STATUS). So the
+  physical seek+read (tens of ms) runs in the **background while the CPU polls**,
+  NOT while the Z80 is held in a WAIT state. `~EXWAIT` is used only for µs-scale
+  register-access sync — never for the whole physical latency (which would stall
+  Z80 refresh / the MZ-800's DRAM). This replaces the reference's stall-based
+  shortcut (fine for its instant flash/RAM storage, wrong for a real drive).
+  With a real drive, index/seek/rotation timing can be **real**, not synthesized.
+- **MZ-800 boot:** ✅ **the MZ-800 ROM already has floppy support** — it drives
+  the FDC at ports 0xD8+ directly. No SRAM boot-loader injection needed (unlike
+  the reference's other devices). Phase 3 is testable on real MZ-800 hardware
+  directly.
+- **No cache — real-time bridge:** ✅ the physical disk IS the storage, read/
+  written in **real time** (no track cache, no on-device EDSK). This is what
+  preserves fidelity — rotational latency, real CRC, deleted marks, and
+  **weak-bit copy protection** all fall out for free, because we ride the real
+  disk each revolution. A cache would defeat weak-bit protection; it may return
+  later only as an optional read-ahead. (Weak bits are a media property, not a WD
+  feature — see the spec.)
+- **Data pacing = software DRQ polling:** ✅ the ROM driver polls STATUS and
+  transfers a byte only when **DRQ** is set (it does *not* use wait-states for
+  data). So we maintain accurate **BUSY/DRQ/RNF/CRC/NOT-READY** status; the CPU
+  self-paces, and real-time decode makes DRQ toggle at the disk byte rate →
+  authentic timing for free. `~EXWAIT` is used **only** for register bus-timing
+  (µs), never the whole latency (no Z80/DRAM stall).
+- **Inverted data bus:** ✅ the ROM `CPL`s every FDC byte — emulated registers
+  must present/accept **bit-complemented** values on `0xD8`–`0xDB`.
+- **Multi-sector + Force Interrupt:** ✅ the ROM uses Read/Write **Multiple**
+  (`0x90`/`0xB4`) terminated by **Force Interrupt** (`0xD0`) — must be supported.
+- **On-device MFM (streaming):** ✅ required from Phase 2 (Phase 1 was flux-only,
+  host-side MFM). Vendor Adafruit's `mfm_impl.h` and make the decode/encode
+  **streaming** (rotational-position tracking), not batch-to-buffer.
+- **Geometry:** ✅ format-agnostic — MFM IDAMs give each sector's id/size, which
+  is exactly what the WD variable-geometry logic expects. Density via `~DEN_RDY`.
+- **Core/PIO split:** ✅ **core1** = host/register side (bus PIO, WD registers,
+  STATUS, DRQ/BUSY, `~INT`, `~EXWAIT`); **core0** = disk side (streaming flux
+  decode/encode, ID/CRC, write-splice, STEP/DIR/WGATE). core0's IRQ-disable
+  during flux doesn't stall core1. Fit bus_io SMs + flux SM across pio0/pio1.
+- **Build system:** ✅ Pico-SDK + CMake, pico-sdk 2.2.0 submodule (done, Phase 1).
+
+### Still open
+- **Decode `0xDC`–`0xDE` bits** (motor / drive-select / side / density) from the
+  ROM.
+- **`~EXWAIT` budget** for putting a byte on the shared C0..C7 bus in time on a
+  register access.
+- **WRITE SECTOR** in-place splice details (chosen approach) — timing/gap
+  handling; add write-precomp only if inner-track writes prove marginal.
 
 ## Conventions (inherited from the reference firmware)
 
@@ -121,5 +163,15 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   `mzpico_floppy.uf2`, 35 KB flash / 151 KB RAM) **and is hardware-verified**:
   `gw` enumerates it and `rpm` / full `read` / `write` all work against real
   disks — the complete flux read+write path runs on this firmware.
-- **Next (Phase 2+):** on-device MFM sector layer, then MZ-800 bus + FDC
-  emulation (from `../MZPico-firmware-reference`).
+- **Phase 2 (streaming MFM): NEXT** — vendor Adafruit `mfm_impl.h`; build a
+  **streaming** MFM data-separator (flux → sectors with ID/CRC + rotational
+  position) and encoder (sectors → flux, incl. in-place write-splice). Validate
+  over USB (dump/patch a sector) before any MZ-800. No cache.
+- **Phase 3 (WD FDC + MZ-800 bus):** real-time WD179x bridge per
+  [docs/wd-fidelity.md](docs/wd-fidelity.md) — core1 register/bus side (adapt the
+  DELUXE-style `bus.hpp` to the shared C0..C7 scheme; inverted bus; polled DRQ;
+  `~INT`/`~EXWAIT`), core0 disk side. Refactor the reference `fdc.cpp` WD state
+  machine onto the streaming disk engine. Testable on real MZ-800 (its ROM has
+  floppy support — no boot loader needed).
+- **Phase 4 (robustness):** write-precomp if needed, density/`0xDC`–`0xDE`
+  decode, multi-drive, error handling.

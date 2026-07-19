@@ -5,6 +5,7 @@
 
 #include "board_config.h"
 #include "floppy.hpp"
+#include "mfm_decode.hpp"
 
 #include "tusb.h"
 #include "pico/time.h"
@@ -37,6 +38,11 @@
 #define GW_CMD_GETPIN 20
 #define GW_CMD_GETPIN_TRACK0 26
 
+// MZPico extension commands (outside the greaseweazle command range, so the
+// gw host tools never send them; only tools/mzp_probe.py does).
+#define MZP_CMD_SCAN 0x80 // scan one track's MFM sectors (Phase-2 validation)
+#define MZP_MAX_SECTORS 40
+
 #define GW_ACK_OK 0
 #define GW_ACK_BADCMD 1
 #define GW_ACK_NOINDEX 2
@@ -59,6 +65,10 @@ static uint8_t cmd_buffer[32];
 static uint8_t reply_buffer[128];
 static uint8_t flux_transitions[MAX_FLUX_PULSE_PER_TRACK];
 static bool flux_status = false;
+
+// MZP scan-track scratch
+static SectorInfo g_scan_sectors[MZP_MAX_SECTORS];
+static uint8_t g_scan_scratch[1024]; // largest sector (128 << 3)
 
 static uint32_t bandwidth_timer;
 static uint32_t transfered_bytes;
@@ -464,6 +474,58 @@ void gw_task() {
       reply_buffer[i++] = GW_ACK_BADPIN;
     }
     cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_SCAN) {
+    // MZPico Phase-2 validation: seek a track, capture raw flux, decode its
+    // sectors on-device, and report the layout. cmd_buffer[2]=track,
+    // [3]=side, [4]=density (0=DD/2.0us, 1=HD/1.0us).
+    if (!floppy)
+      setbustype(GW_CMD_SETBUSTYPE_IBM);
+    if (!floppy) {
+      reply_buffer[i++] = GW_ACK_BADCMD;
+      cdc_write_all(reply_buffer, 2);
+      return;
+    }
+    uint8_t track = cmd_buffer[2];
+    uint8_t sidev = cmd_buffer[3];
+    uint8_t dens = cmd_buffer[4];
+    float bt = dens ? 1.0f : 2.0f;
+
+    floppy->select(true);
+    floppy->spin_motor(true);
+    floppy->side(sidev);
+    floppy->goto_track(track);
+
+    int32_t idx;
+    uint32_t nflux = floppy->capture_track(flux_transitions,
+                                           sizeof(flux_transitions), &idx,
+                                           /*store_greaseweazle=*/false,
+                                           /*capture_ms=*/220,
+                                           /*index_wait_ms=*/250);
+    int ns = mfm_scan_track(flux_transitions, nflux, bt, g_scan_sectors,
+                            MZP_MAX_SECTORS, g_scan_scratch,
+                            sizeof(g_scan_scratch));
+
+    floppy->spin_motor(false);
+    floppy->select(false);
+
+    // Report: [cmd, ACK, ns, nflux(4 LE), then {cyl,head,sec,n,flags} * ns].
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = (uint8_t)ns;
+    reply_buffer[i++] = nflux & 0xFF;
+    reply_buffer[i++] = (nflux >> 8) & 0xFF;
+    reply_buffer[i++] = (nflux >> 16) & 0xFF;
+    reply_buffer[i++] = (nflux >> 24) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+    for (int k = 0; k < ns; k++) {
+      SectorInfo *s = &g_scan_sectors[k];
+      uint8_t rec[5] = {
+          s->cyl, s->head, s->sec, s->n,
+          (uint8_t)((s->id_crc_ok ? 1 : 0) | (s->data_crc_ok ? 2 : 0) |
+                    (s->has_data ? 4 : 0) | (s->deleted ? 8 : 0))};
+      cdc_write_all(rec, 5);
+    }
   }
 
   else {
