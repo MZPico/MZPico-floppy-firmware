@@ -22,6 +22,9 @@ public:
 
   void select(bool selected);
   bool spin_motor(bool motor_on);
+  // Assert/deassert the motor line only — no spin-up delay, no index wait.
+  // For FDC Type I stepping, which does not need the motor fully up.
+  void motor_raw(bool motor_on);
   bool goto_track(int track_num);
   void step(bool dir, uint8_t times);
   bool side(int head);

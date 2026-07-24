@@ -8,6 +8,7 @@
 #include "mfm_decode.hpp"
 #include "mfm_encode.hpp"
 #include "bus/mz_bus.hpp"
+#include "bus/fdc.hpp"
 
 #include "tusb.h"
 #include "pico/time.h"
@@ -48,6 +49,9 @@
 #define MZP_CMD_DRIVE 0x83   // bench: drive C0..C7 to a value and hold
 #define MZP_CMD_GPIOREAD 0x84 // bench: read live C0..C7 input byte (jumper test)
 #define MZP_CMD_PINTEST 0x85   // bench: per-pad internal pull-up/down self-test
+#define MZP_CMD_FDCDUMP 0x86   // read WD FDC register/state snapshot
+#define MZP_CMD_FDCLOG 0x87    // read WD FDC recent-command ring log
+#define MZP_CMD_FDCSEEK 0x88   // bench: inject motor-on + RESTORE/SEEK via the FDC
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -147,6 +151,11 @@ static uint8_t get_cmd(uint8_t *buff, uint8_t maxbuff) {
 void gw_init() {
   floppy = nullptr;
   timestamp = millis();
+  // Bring up the drive GPIOs and hand the drive to the FDC bridge. The FDC disk
+  // task stays idle until the MZ-800 first touches an FDC port, so it doesn't
+  // conflict with greaseweazle/USB drive control when no machine is attached.
+  g_drive.begin();
+  fdc_init(&g_drive);
 }
 
 void gw_task() {
@@ -622,6 +631,64 @@ void gw_task() {
     uint8_t raw = bus_read_pins(cmd_buffer[2] != 0);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = raw;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FDCDUMP) {
+    // [cmd, ACK, status, track, sector, data, command, flags, drive,
+    //  at_track0, phys_track, op_seq, op_done].
+    FdcDebug d;
+    fdc_debug_snapshot(&d);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = d.status;
+    reply_buffer[i++] = d.track;
+    reply_buffer[i++] = d.sector;
+    reply_buffer[i++] = d.data;
+    reply_buffer[i++] = d.command;
+    reply_buffer[i++] = d.flags;
+    reply_buffer[i++] = d.drive;
+    reply_buffer[i++] = d.at_track0;
+    reply_buffer[i++] = d.phys_track;
+    reply_buffer[i++] = d.op_seq;
+    reply_buffer[i++] = d.op_done;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FDCSEEK) {
+    // Bench (no MZ-800): synchronously select + motor + seek and report the
+    // result. cmd_buffer[2]=target, [3..4]=param ms (LE), [5]=mode. Same 11
+    // data bytes as FDCDUMP, so the probe reuses fdc_line().
+    uint8_t target = cmd_buffer[2];
+    uint16_t param = (uint16_t)cmd_buffer[3] | ((uint16_t)cmd_buffer[4] << 8);
+    uint8_t mode = cmd_buffer[5];
+    FdcDebug d;
+    fdc_bench_seek(target, param, mode, &d);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = d.status;
+    reply_buffer[i++] = d.track;
+    reply_buffer[i++] = d.sector;
+    reply_buffer[i++] = d.data;
+    reply_buffer[i++] = d.command;
+    reply_buffer[i++] = d.flags;
+    reply_buffer[i++] = d.drive;
+    reply_buffer[i++] = d.at_track0;
+    reply_buffer[i++] = d.phys_track;
+    reply_buffer[i++] = d.op_seq;
+    reply_buffer[i++] = d.op_done;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FDCLOG) {
+    // [cmd, ACK, count_lo, count_hi, n, opcodes[n]] (oldest->newest).
+    uint8_t log[16];
+    uint16_t count = 0;
+    uint8_t n = fdc_debug_cmdlog(log, &count);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = count & 0xFF;
+    reply_buffer[i++] = (count >> 8) & 0xFF;
+    reply_buffer[i++] = n;
+    for (uint8_t k = 0; k < n; k++)
+      reply_buffer[i++] = log[k];
     cdc_write_all(reply_buffer, i);
   }
 

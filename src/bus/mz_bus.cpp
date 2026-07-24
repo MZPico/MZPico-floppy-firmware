@@ -1,5 +1,6 @@
 #include "mz_bus.hpp"
 #include "board_bus.h"
+#include "fdc.hpp"
 
 #include "bus.pio.h"
 #include "hardware/gpio.h"
@@ -78,9 +79,9 @@ RAM_FUNC static void listen_loop(void) {
       g_bus_hello.addr_high |= addr;
       if (port_is_ours(addr)) {
         uint8_t idx = addr - FDC_PORT_BASE;
-        uint8_t v = g_bus_hello.reg[idx];
+        uint8_t bus_byte = fdc_reg_read(addr); // inversion handled by the FDC
         set_exwait();
-        write_data_bus((uint8_t)~v); // ROM CPLs on read
+        write_data_bus(bus_byte);
         acquire_data_bus_for_writing();
         data_dir_drive();
         data_buffer_on();
@@ -92,6 +93,7 @@ RAM_FUNC static void listen_loop(void) {
         data_buffer_off();
         release_data_bus();
         data_dir_read();
+        g_bus_hello.reg[idx] = bus_byte;
         g_bus_hello.rd[idx]++;
       }
     } else if (!pio_sm_is_rx_fifo_empty(BUS_PIO, SM_WRITE)) {
@@ -108,10 +110,10 @@ RAM_FUNC static void listen_loop(void) {
         uint8_t raw = read_data_bus();
         data_buffer_off();
         release_exwait();
+        fdc_reg_write(addr, raw); // FDC applies per-port inversion + decode
         g_bus_hello.dat_low |= (uint8_t)~raw; // write-data bit activity
         g_bus_hello.dat_high |= raw;
-        g_bus_hello.last_raw[idx] = raw;      // raw, un-inverted
-        g_bus_hello.reg[idx] = (uint8_t)~raw; // ROM CPLs on write
+        g_bus_hello.last_raw[idx] = raw; // raw, un-inverted
         g_bus_hello.wr[idx]++;
       }
     }
@@ -199,10 +201,8 @@ void bus_drive_test(uint8_t value, uint8_t mode) {
 }
 
 void bus_init(void) {
-  // Default STATUS (0xD8) = NOT READY (bit7) so the MZ-800 boot ROM sees "no
-  // drive" and boots to a prompt rather than hanging on a bogus FDC.
-  g_bus_hello.reg[0] = 0x80;
-
+  // STATUS starts as NOT READY (the FDC reports NOT READY until the ROM commands
+  // the motor on), so the MZ-800 boot ROM sees "no drive" rather than hanging.
   init_bus_gpio();
   setup_bus_pio();
   multicore_launch_core1(core1_entry);

@@ -26,6 +26,7 @@ add_executable(mzpico_floppy
     src/mfm_decode.cpp
     src/mfm_encode.cpp
     src/bus/mz_bus.cpp
+    src/bus/fdc.cpp
     src/flux/arch_rp2.cpp
     src/usb_descriptors.c
 )

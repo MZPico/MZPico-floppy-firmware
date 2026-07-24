@@ -7,6 +7,9 @@ Usage:
     python mzp_probe.py PORT busdump                      # MZ-800 bus hello state
     python mzp_probe.py PORT gpioread [once]              # live C0..C7 input byte
     python mzp_probe.py PORT pintest                     # per-pad pull-up/down self-test
+    python mzp_probe.py PORT fdcdump [loop]              # WD FDC state (1 line; loop=on-change)
+    python mzp_probe.py PORT fdclog                      # recent WD command opcodes
+    python mzp_probe.py PORT fdcseek [track] [param_ms] [mode]  # bench seek; mode 1=spin_motor 0=raw
     python mzp_probe.py PORT <track> <side> [dens]        # shorthand for scan
 
     dens: 0 = DD / 250 kbit/s (default), 1 = HD / 500 kbit/s
@@ -27,6 +30,9 @@ MZP_CMD_BUSDUMP = 0x82
 MZP_CMD_DRIVE = 0x83
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
+MZP_CMD_FDCDUMP = 0x86
+MZP_CMD_FDCLOG = 0x87
+MZP_CMD_FDCSEEK = 0x88
 
 
 def read_exact(s, n):
@@ -133,7 +139,7 @@ def do_busdump(s):
 def do_gpioread(s, once):
     # Isolate on the first read (halts SMs, C-pins = SIO in, no pull), then poll.
     def sample(isolate):
-        s.write(bytes([MZP_CMD_GPIOREAD, 3, 1 if isolate else 0, 0]))
+        s.write(bytes([MZP_CMD_GPIOREAD, 3, 1 if isolate else 0]))
         s.flush()
         r = read_exact(s, 3)
         if len(r) < 3 or r[1] != 0:
@@ -159,6 +165,75 @@ def do_gpioread(s, once):
                 show(v)
     except KeyboardInterrupt:
         pass
+
+
+STATUS_BITS = ["B", "Idx", "T00", "CRC", "Seek", "HL", "WP", "NRdy"]
+
+
+def decode_cmd(c):
+    hi = c >> 4
+    names = {0x0: "RESTORE", 0x1: "SEEK", 0x2: "STEP", 0x3: "STEP",
+             0x4: "STEP-IN", 0x5: "STEP-IN", 0x6: "STEP-OUT", 0x7: "STEP-OUT",
+             0x8: "READ-SEC", 0x9: "READ-SEC(M)", 0xA: "WRITE-SEC",
+             0xB: "WRITE-SEC(M)", 0xC: "READ-ADDR", 0xD: "FORCE-INT",
+             0xE: "READ-TRACK", 0xF: "WRITE-TRACK"}
+    return names.get(hi, "?")
+
+
+def fdc_line(r):
+    (status, track, sector, data, command, flags, drive,
+     at0, phys, opseq, opdone) = r[2:13]
+    sb = "".join(n + " " for k, n in enumerate(STATUS_BITS) if status & (1 << k))
+    return (f"ST={status:02X}[{sb.strip()}] TRK={track:<2} SEC={sector:<2} "
+            f"DAT={data:02X} CMD={command:02X}({decode_cmd(command)}) "
+            f"mot={'1' if flags & 0x80 else '0'} sd={1 if flags & 4 else 0} "
+            f"wp={1 if flags & 2 else 0} busy={1 if flags & 1 else 0} "
+            f"t0={at0} phys={'?' if phys == 0xFF else phys} seek={opdone}/{opseq}")
+
+
+def do_fdcdump(s, loop):
+    def sample():
+        s.write(bytes([MZP_CMD_FDCDUMP, 2]))
+        s.flush()
+        r = read_exact(s, 13)
+        if len(r) < 13 or r[1] != 0:
+            return None
+        return r
+
+    r = sample()
+    if r is None:
+        print("bad reply")
+        return
+    print(fdc_line(r))
+    if not loop:
+        return
+    print("polling on-change (Ctrl-C to stop):")
+    last = None
+    import time
+    try:
+        while True:
+            r = sample()
+            if r is not None and r != last:
+                print(fdc_line(r))
+                last = r
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+
+
+def do_fdclog(s):
+    s.write(bytes([MZP_CMD_FDCLOG, 2]))
+    s.flush()
+    hdr = read_exact(s, 5)  # cmd, ACK, count_lo, count_hi, n
+    if len(hdr) < 5 or hdr[1] != 0:
+        print(f"bad reply: {hdr.hex()}")
+        return
+    count = hdr[2] | (hdr[3] << 8)
+    n = hdr[4]
+    ops = read_exact(s, n)
+    print(f"total commands: {count}; last {n} (oldest->newest):")
+    for c in ops:
+        print(f"  0x{c:02X}  {decode_cmd(c)}")
 
 
 def do_pintest(s):
@@ -208,6 +283,27 @@ def main():
             do_gpioread(s, once)
         elif cmd == "pintest":
             do_pintest(s)
+        elif cmd == "fdcdump":
+            loop = len(sys.argv) > 3 and sys.argv[3] == "loop"
+            do_fdcdump(s, loop)
+        elif cmd == "fdclog":
+            do_fdclog(s)
+        elif cmd == "fdcseek":
+            # Synchronous bench seek: device does the whole move, then replies
+            # with the result. args: target [motor_settle_ms].
+            target = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+            param = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            mode = int(sys.argv[5]) if len(sys.argv) > 5 else 1
+            s.write(bytes([MZP_CMD_FDCSEEK, 6, target & 0xFF,
+                           param & 0xFF, (param >> 8) & 0xFF, mode & 0xFF]))
+            s.flush()
+            r = read_exact(s, 13)
+            if len(r) < 13 or r[1] != 0:
+                print(f"bad reply: {r.hex()}")
+            else:
+                what = "RESTORE" if target == 0 else f"SEEK {target}"
+                mdesc = "spin_motor+index" if mode == 1 else "motor_raw+delay"
+                print(f"after {what} ({mdesc}, param {param}ms):\n  {fdc_line(r)}")
         elif cmd == "drive":
             val = int(sys.argv[3], 0)
             mode = int(sys.argv[4]) if len(sys.argv) > 4 else 1

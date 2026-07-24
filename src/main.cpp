@@ -4,6 +4,7 @@
 #include "board_config.h"
 #include "gw_protocol.hpp"
 #include "bus/mz_bus.hpp"
+#include "bus/fdc.hpp"
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
@@ -21,7 +22,8 @@ int main() {
   bus_init(); // Milestone 3.0: launch the MZ-800 bus listener on core1
 
   while (true) {
-    tud_task();  // service USB (core0)
-    gw_task();   // process one greaseweazle / MZP command if pending
+    tud_task();       // service USB (core0)
+    gw_task();        // process one greaseweazle / MZP command if pending
+    fdc_disk_task();  // run pending MZ-800 FDC physical ops (motor/seek) on core0
   }
 }

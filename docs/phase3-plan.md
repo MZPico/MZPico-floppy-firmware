@@ -70,9 +70,18 @@ BUSY-polling covers latency instead, per the ROM driver).
   enable — cleared on the board. Bench isolation tools added to `mzp_probe.py`
   (`gpioread`, `pintest`) but note the shared C-net means true pad-isolation needs
   the MZ-800 powered.
-- **3.1 — Type I + status.** RESTORE/SEEK/STEP drive the real head; STATUS returns
-  real BUSY/TRK00/INDEX/READY/WP. Test: MZ-800 boot/DOS issues RESTORE, head
-  seeks to track 0, TRK00 reported.
+- **3.1 — Type I + status. ✅ DONE (hardware-verified).** RESTORE/SEEK/STEP drive
+  the real head; STATUS returns real BUSY/TRK00/WRITE-PROTECT/NOT-READY. The
+  MZ-800 ROM issues `RESTORE → SEEK → READ-SEC(M)` — i.e. it accepts our Type I
+  and advances to sector reads. Async model: core1 decodes commands + serves the
+  WD register file (with per-port inversion: 0xD8–0xDB CPL'd, 0xDC–0xDE not);
+  core0 runs motor/select/side/seek in the background while the CPU polls BUSY
+  (no wait-state stall). Control ports decoded from `MZ2Z046.ASM`: 0xDC b7=motor
+  b1..0=drive, 0xDD b0=side, 0xDE b0=density. **Drive gotchas found:** this drive
+  needs the spindle actually spinning before it will step to TRK00 (spin_motor
+  with a 300 ms pre-sleep), and a motor-off delay keeps it spinning between the
+  ROM's retries. `fdc.{cpp,hpp}`; probe cmds `fdcdump`/`fdclog`/`fdcseek`. No
+  INTRQ yet — the ROM polls STATUS for Type I.
 - **3.2 — READ SECTOR (single + multiple) — the payoff.** On command: BUSY set,
   core0 streaming-decodes the live flux, finds the sector by ID, streams data to
   DATA with DRQ; core1 serves the software-polled transfer; INTRQ at end; CRC/RNF
@@ -105,10 +114,12 @@ BUSY-polling covers latency instead, per the ROM driver).
 
 ## Immediate next step
 
-**Milestone 3.1 — Type I + status.** M3.0 is done (bus round-trips cleanly). Next:
-decode the `0xDC`–`0xDE` control bits (motor/drive-select/side/density) from
-`MZ2Z046.ASM`, then wire the reference `fdc.cpp` WD state machine's Type I
-commands (RESTORE/SEEK/STEP) onto the real drive (STEP/DIR/TRK00) and return real
-STATUS (BUSY/TRK00/INDEX/READY/WP). Test: MZ-800 boot/DOS issues RESTORE → head
-seeks to track 0 → TRK00 reported. Keep the same discipline that made Phases 0–2
-and M3.0 succeed: one testable milestone at a time.
+**Milestone 3.2 — READ SECTOR (single + multiple).** M3.1 is done; the ROM now
+issues `READ-SEC(M)` (0x94) and errors ("FD Loading error") because Type II isn't
+implemented. Next: on a Read Sector command, core0 streaming-decodes the live
+flux (seek is already in place), finds the sector by ID (Track/Sector registers,
+side), and streams the data field to the DATA register with **DRQ** as the ROM
+polls STATUS; set BUSY during, RNF/CRC on error, and support multi-sector
+terminated by Force Interrupt (0xD0). Reuse the Phase-2 streaming MFM decoder.
+Test: **MZ-800 reads a directory / boots CP/M from the physical disk.** Keep the
+same discipline: one testable milestone at a time.

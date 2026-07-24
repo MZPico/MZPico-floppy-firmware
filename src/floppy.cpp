@@ -153,6 +153,13 @@ bool FloppyDrive::spin_motor(bool motor_on) {
   return _is_index_seen;
 }
 
+void FloppyDrive::motor_raw(bool motor_on) {
+  write_pin(_motorpin, !motor_on); // motor on = logic 0
+  _is_motor_spinning = motor_on;
+  if (!motor_on)
+    _is_index_seen = false;
+}
+
 void FloppyDrive::step(bool dir, uint8_t times) {
   write_pin(_directionpin, dir);
   sleep_us(10);
