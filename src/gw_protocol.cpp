@@ -7,6 +7,7 @@
 #include "floppy.hpp"
 #include "mfm_decode.hpp"
 #include "mfm_encode.hpp"
+#include "bus/mz_bus.hpp"
 
 #include "tusb.h"
 #include "pico/time.h"
@@ -43,6 +44,10 @@
 // gw host tools never send them; only tools/mzp_probe.py does).
 #define MZP_CMD_SCAN 0x80 // scan one track's MFM sectors (Phase-2 validation)
 #define MZP_CMD_ENCTEST 0x81 // encode->decode round-trip (encoder validation)
+#define MZP_CMD_BUSDUMP 0x82 // read MZ-800 bus hello shadow regs + counters
+#define MZP_CMD_DRIVE 0x83   // bench: drive C0..C7 to a value and hold
+#define MZP_CMD_GPIOREAD 0x84 // bench: read live C0..C7 input byte (jumper test)
+#define MZP_CMD_PINTEST 0x85   // bench: per-pad internal pull-up/down self-test
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -578,6 +583,56 @@ void gw_task() {
                     (s->has_data ? 4 : 0) | (s->deleted ? 8 : 0))};
       cdc_write_all(rec, 5);
     }
+  }
+
+  else if (cmd == MZP_CMD_BUSDUMP) {
+    // Per-port telemetry for ports 0xD8..0xDF:
+    // [cmd, ACK, last_raw[8], wr[8]*2 LE, rd[8]*2 LE].
+    reply_buffer[i++] = GW_ACK_OK;
+    for (int k = 0; k < 8; k++)
+      reply_buffer[i++] = g_bus_hello.last_raw[k];
+    for (int k = 0; k < 8; k++) {
+      uint16_t w = g_bus_hello.wr[k];
+      reply_buffer[i++] = w & 0xFF;
+      reply_buffer[i++] = (w >> 8) & 0xFF;
+    }
+    for (int k = 0; k < 8; k++) {
+      uint16_t r = g_bus_hello.rd[k];
+      reply_buffer[i++] = r & 0xFF;
+      reply_buffer[i++] = (r >> 8) & 0xFF;
+    }
+    reply_buffer[i++] = g_bus_hello.addr_low;
+    reply_buffer[i++] = g_bus_hello.addr_high;
+    reply_buffer[i++] = g_bus_hello.dat_low;
+    reply_buffer[i++] = g_bus_hello.dat_high;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_DRIVE) {
+    // Bench hardware isolation: drive C0..C7 to a value and hold.
+    // cmd_buffer[2]=value, [3]=mode (0 release, 1 Pico pins only, 2 to bus).
+    bus_drive_test(cmd_buffer[2], cmd_buffer[3]);
+    reply_buffer[i++] = GW_ACK_OK;
+    cdc_write_all(reply_buffer, 2);
+  }
+
+  else if (cmd == MZP_CMD_GPIOREAD) {
+    // Bench pin-read: report the live C0..C7 input byte. cmd_buffer[2] != 0 ->
+    // isolate (halt SMs, C-pins = SIO in, no pull) so a jumper on C0 owns it.
+    uint8_t raw = bus_read_pins(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = raw;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_PINTEST) {
+    // Bench per-pad self-test: [cmd, ACK, pullup_byte, pulldown_byte].
+    uint8_t pu = 0, pd = 0;
+    bus_pin_selftest(&pu, &pd);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = pu;
+    reply_buffer[i++] = pd;
+    cdc_write_all(reply_buffer, i);
   }
 
   else {

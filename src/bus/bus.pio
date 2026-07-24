@@ -1,0 +1,63 @@
+; MZ-800 expansion-bus servicing for the MZPico-800-Floppy-Board.
+; SAFE data-buffer scheme: the PIO side-set drives ONLY the address buffer (EN0).
+; The data '245 (U2) is enabled by core1 and ONLY for the FDC ports we own, so we
+; never drive/load the MZ-800 data bus during other devices' I/O cycles. core1
+; sets EN1 (data-buffer OE) and RD1 (direction) directly for the data phase.
+;   side-set (1 bit) = EN0 (GPIO26, address-buffer /OE, active low)
+;     side 0 -> EN0 low : address buffer ON  (C0..C7 carry the port address)
+;     side 1 -> EN0 high: address buffer OFF (freed so core1 can drive data on U2)
+; C0..C7 = GPIO0-7 (in base 0). Control: IORQ=8, RD=9, WR=10.
+
+; MZ I/O READ cycle: capture the port address, then core1 drives the data byte.
+; jmp_pin = RD.
+.program bus_read
+.side_set 1 opt
+.wrap_target
+    nop                 side 0        ; address buffer ON
+wait_iorq_low:
+    wait 0 gpio 8
+    jmp pin, wait_iorq_low            ; loop while RD high (not a read)
+    in pins, 8          side 1        ; sample port addr; address buffer OFF
+    wait 1 gpio 8
+.wrap
+
+; MZ I/O WRITE cycle: capture the port address, then core1 reads the data byte.
+; jmp_pin = WR.
+.program bus_write
+.side_set 1 opt
+.wrap_target
+    nop                 side 0
+wait_iorq_low:
+    wait 0 gpio 8
+    jmp pin, wait_iorq_low            ; loop while WR high
+    in pins, 8          side 1        ; sample port addr; address buffer OFF
+    wait 1 gpio 8
+.wrap
+
+% c-sdk {
+#include "hardware/pio.h"
+
+static inline void bus_read_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = bus_read_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, 0);          // C0..C7 = GPIO0-7
+    sm_config_set_jmp_pin(&c, 9);          // RD
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_sideset_pins(&c, 26);    // EN0 (address buffer OE)
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_set_consecutive_pindirs(pio, sm, 26, 1, true);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void bus_write_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = bus_write_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, 0);
+    sm_config_set_jmp_pin(&c, 10);         // WR
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_sideset_pins(&c, 26);
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_set_consecutive_pindirs(pio, sm, 26, 1, true);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

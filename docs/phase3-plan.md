@@ -57,11 +57,19 @@ BUSY-polling covers latency instead, per the ROM driver).
 
 ## Milestones (each independently testable on a real MZ-800)
 
-- **3.0 — Bus bring-up ("hello MZ-800").** Respond to a read of one FDC port with
-  a fixed value; confirm from the MZ-800 (`INP(&HD8)` in BASIC / monitor) that it
-  reads the expected (inverted) byte, and that writes are received. *Validates the
-  entire bus handshake — the riskiest bit, the Phase-0-equivalent for the bus.*
-  Start here; nothing else works until this does.
+- **3.0 — Bus bring-up ("hello MZ-800"). ✅ DONE (hardware-verified).** The board
+  answers I/O reads/writes on the FDC ports (0xD8–0xDE) over the shared C0..C7 bus:
+  `OUT`/`INP` from the MZ-800 round-trip bit-for-bit (with the ROM's data-bus
+  inversion), even and odd ports both register, and the `busdump` bit-activity
+  monitor shows all 8 C-lines toggling. *Validated the entire bus handshake — the
+  riskiest bit.* Design: PIO (pio1) side-sets ONLY the address buffer (EN0);
+  **core1 drives the data buffer (EN1/RD1) directly and only for our ports**, so
+  non-FDC I/O by other MZ-800 devices is never touched. `~EXWAIT` times the
+  register access only. A hardware bug found during bring-up: a solder bridge
+  between U2 pin 18 (C0) and pin 19 (~EN1) corrupted both bit0 and the data-buffer
+  enable — cleared on the board. Bench isolation tools added to `mzp_probe.py`
+  (`gpioread`, `pintest`) but note the shared C-net means true pad-isolation needs
+  the MZ-800 powered.
 - **3.1 — Type I + status.** RESTORE/SEEK/STEP drive the real head; STATUS returns
   real BUSY/TRK00/INDEX/READY/WP. Test: MZ-800 boot/DOS issues RESTORE, head
   seeks to track 0, TRK00 reported.
@@ -97,10 +105,10 @@ BUSY-polling covers latency instead, per the ROM driver).
 
 ## Immediate next step
 
-**Milestone 3.0 only** — get the board answering the MZ-800 on the FDC ports.
-Concretely: study `../MZPico-firmware-reference` `bus_io.pio` + `device.cpp`
-(DELUXE bus path), adapt the bus servicing to this board's pins/EN topology, and
-implement a minimal handler that returns a fixed (inverted) byte for a read of
-0xD8 and logs writes. Test with `INP`/`OUT` from MZ-800 BASIC. Do **not** build
-the FDC state machine until the bus round-trips cleanly — same discipline that
-made Phases 0–2 succeed.
+**Milestone 3.1 — Type I + status.** M3.0 is done (bus round-trips cleanly). Next:
+decode the `0xDC`–`0xDE` control bits (motor/drive-select/side/density) from
+`MZ2Z046.ASM`, then wire the reference `fdc.cpp` WD state machine's Type I
+commands (RESTORE/SEEK/STEP) onto the real drive (STEP/DIR/TRK00) and return real
+STATUS (BUSY/TRK00/INDEX/READY/WP). Test: MZ-800 boot/DOS issues RESTORE → head
+seeks to track 0 → TRK00 reported. Keep the same discipline that made Phases 0–2
+and M3.0 succeed: one testable milestone at a time.

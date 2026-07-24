@@ -4,6 +4,9 @@
 Usage:
     python mzp_probe.py PORT scan    <track> <side> [dens]
     python mzp_probe.py PORT enctest <n_sectors> <size_code> [dens]
+    python mzp_probe.py PORT busdump                      # MZ-800 bus hello state
+    python mzp_probe.py PORT gpioread [once]              # live C0..C7 input byte
+    python mzp_probe.py PORT pintest                     # per-pad pull-up/down self-test
     python mzp_probe.py PORT <track> <side> [dens]        # shorthand for scan
 
     dens: 0 = DD / 250 kbit/s (default), 1 = HD / 500 kbit/s
@@ -20,6 +23,10 @@ import serial  # pip install pyserial
 
 MZP_CMD_SCAN = 0x80
 MZP_CMD_ENCTEST = 0x81
+MZP_CMD_BUSDUMP = 0x82
+MZP_CMD_DRIVE = 0x83
+MZP_CMD_GPIOREAD = 0x84
+MZP_CMD_PINTEST = 0x85
 
 
 def read_exact(s, n):
@@ -85,8 +92,101 @@ def do_enctest(s, nsec, sizecode, dens):
           f"with valid CRCs.")
 
 
+def do_busdump(s):
+    s.write(bytes([MZP_CMD_BUSDUMP, 2]))
+    s.flush()
+    # cmd, ack, last_raw[8], wr[8]*2, rd[8]*2, addr_low, addr_high, dat_low, dat_high
+    hdr = read_exact(s, 46)
+    if len(hdr) < 46 or hdr[1] != 0:
+        print(f"bad/short reply: {hdr.hex()}")
+        return
+    last_raw = hdr[2:10]
+    wr = [int.from_bytes(hdr[10 + 2 * k:12 + 2 * k], "little") for k in range(8)]
+    rd = [int.from_bytes(hdr[26 + 2 * k:28 + 2 * k], "little") for k in range(8)]
+    addr_low, addr_high, dat_low, dat_high = hdr[42], hdr[43], hdr[44], hdr[45]
+    print("port  reads  writes  last_raw_write")
+    for k in range(8):
+        print(f"0x{0xD8 + k:02X}  {rd[k]:5d}  {wr[k]:6d}  0x{last_raw[k]:02X}")
+
+    def bit_activity(name, low, high):
+        # A healthy line toggles -> bit set in BOTH low and high.
+        toggling = low & high
+        stuck_hi = high & ~low & 0xFF
+        stuck_lo = low & ~high & 0xFF
+        print(f"\n{name}: sampled-low=0b{low:08b}  sampled-high=0b{high:08b}")
+        for k in range(8):
+            m = 1 << k
+            if toggling & m:
+                v = "toggles OK"
+            elif stuck_hi & m:
+                v = "STUCK HIGH (never seen 0)"
+            elif stuck_lo & m:
+                v = "stuck low (never seen 1)"
+            else:
+                v = "-- no activity --"
+            print(f"  bit{k} (C{k}): {v}")
+
+    bit_activity("ADDRESS bus", addr_low, addr_high)
+    bit_activity("WRITE-DATA (our ports)", dat_low, dat_high)
+
+
+def do_gpioread(s, once):
+    # Isolate on the first read (halts SMs, C-pins = SIO in, no pull), then poll.
+    def sample(isolate):
+        s.write(bytes([MZP_CMD_GPIOREAD, 3, 1 if isolate else 0, 0]))
+        s.flush()
+        r = read_exact(s, 3)
+        if len(r) < 3 or r[1] != 0:
+            return None
+        return r[2]
+
+    def show(v):
+        bits = " ".join(f"C{k}={(v >> k) & 1}" for k in range(8))
+        print(f"C0..C7 = 0b{v:08b} (0x{v:02X})   {bits}")
+
+    v = sample(True)
+    if v is None:
+        print("bad reply")
+        return
+    show(v)
+    if once:
+        return
+    print("polling (Ctrl-C to stop) — jumper C0 to GND then 3.3V; C0 must reach 0 and 1:")
+    try:
+        while True:
+            v = sample(False)
+            if v is not None:
+                show(v)
+    except KeyboardInterrupt:
+        pass
+
+
+def do_pintest(s):
+    s.write(bytes([MZP_CMD_PINTEST, 2]))
+    s.flush()
+    r = read_exact(s, 4)
+    if len(r) < 4 or r[1] != 0:
+        print(f"bad reply: {r.hex()}")
+        return
+    pu, pd = r[2], r[3]
+    print(f"pull-up  read = 0b{pu:08b} (0x{pu:02X})   want 0xFF")
+    print(f"pull-down read = 0b{pd:08b} (0x{pd:02X})   want 0x00")
+    print("\npin  pull-up  pull-down  verdict")
+    for k in range(8):
+        u, d = (pu >> k) & 1, (pd >> k) & 1
+        if u == 1 and d == 0:
+            v = "OK (pad follows pull)"
+        elif u == 1 and d == 1:
+            v = "STUCK HIGH (dead pad or net shorted to 3.3V)"
+        elif u == 0 and d == 0:
+            v = "STUCK LOW (dead pad or net shorted to GND/driven)"
+        else:
+            v = "INVERTED?! (u=0,d=1 — wiring odd)"
+        print(f"C{k}     {u}        {d}       {v}")
+
+
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
     port = sys.argv[1]
@@ -101,6 +201,22 @@ def main():
             nsec, sc = int(sys.argv[3]), int(sys.argv[4])
             dens = int(sys.argv[5]) if len(sys.argv) > 5 else 0
             do_enctest(s, nsec, sc, dens)
+        elif cmd == "busdump":
+            do_busdump(s)
+        elif cmd == "gpioread":
+            once = len(sys.argv) > 3 and sys.argv[3] == "once"
+            do_gpioread(s, once)
+        elif cmd == "pintest":
+            do_pintest(s)
+        elif cmd == "drive":
+            val = int(sys.argv[3], 0)
+            mode = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+            s.write(bytes([MZP_CMD_DRIVE, 5, val & 0xFF, mode & 0xFF, 0]))
+            s.flush()
+            r = read_exact(s, 2)
+            print(f"drive C0..C7 = 0x{val & 0xFF:02X}, mode {mode} "
+                  f"-> {'ok' if len(r) == 2 and r[1] == 0 else 'FAIL'} "
+                  f"(measure Pico pins 1..; mode 0 to release)")
         else:  # shorthand: PORT track side [dens]
             t, sd = int(sys.argv[2]), int(sys.argv[3])
             dens = int(sys.argv[4]) if len(sys.argv) > 4 else 0

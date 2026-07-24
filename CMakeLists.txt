@@ -25,9 +25,13 @@ add_executable(mzpico_floppy
     src/floppy.cpp
     src/mfm_decode.cpp
     src/mfm_encode.cpp
+    src/bus/mz_bus.cpp
     src/flux/arch_rp2.cpp
     src/usb_descriptors.c
 )
+
+# Generate the MZ-800 bus PIO header (bus.pio.h) and add it to the include path.
+pico_generate_pio_header(mzpico_floppy ${CMAKE_CURRENT_LIST_DIR}/src/bus/bus.pio)
 
 # src/ is on the include path so TinyUSB finds tusb_config.h.
 target_include_directories(mzpico_floppy PRIVATE
@@ -40,6 +44,7 @@ target_compile_options(mzpico_floppy PRIVATE -O3)
 
 target_link_libraries(mzpico_floppy
     pico_stdlib
+    pico_multicore
     hardware_pio
     hardware_clocks
     hardware_vreg

@@ -14,3 +14,6 @@ readback.dsk
 # Python
 __pycache__/
 *.pyc
+
+# Editor workspace files
+*.code-workspace
