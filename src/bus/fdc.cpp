@@ -124,7 +124,12 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     break;
   }
   case 0xD9:
-    S.track = (uint8_t)~raw; // TRACK (CPL'd)
+    // TRACK register: inverted like the other FDC registers. The ROM doesn't
+    // CPL it in software because it keeps track values complemented internally
+    // (its seek-skip compare uses ~target); we invert here so our WD state holds
+    // the true track. The ROM's 0xA5 write is a presence-detect pattern, not a
+    // track — it round-trips regardless.
+    S.track = (uint8_t)~raw;
     break;
   case 0xDA:
     S.sector = (uint8_t)~raw; // SECTOR (CPL'd)
@@ -151,7 +156,7 @@ RAM_FUNC uint8_t fdc_reg_read(uint8_t addr) {
   case 0xD8:
     return (uint8_t)~compose_status(); // STATUS (driven CPL'd)
   case 0xD9:
-    return (uint8_t)~S.track;
+    return (uint8_t)~S.track; // inverted like the other registers
   case 0xDA:
     return (uint8_t)~S.sector;
   case 0xDB:
