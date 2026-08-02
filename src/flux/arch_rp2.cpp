@@ -226,6 +226,58 @@ static uint8_t *capture_foreground(int index_pin, uint8_t *start, uint8_t *end,
   return ptr;
 }
 
+// ---- Incremental (streaming) capture ----
+
+// Persists across drain() calls, unlike capture_foreground's local `last` --
+// each drain() picks up the delta computation exactly where the previous one
+// left off, so there is no gap/discontinuity at poll boundaries.
+static int g_stream_last;
+
+bool rp2040_flux_capture_start(int index_pin, int rdpin) {
+  if (!init_capture(index_pin, rdpin)) {
+    return false;
+  }
+  start_common();
+  uint32_t irq = save_and_disable_interrupts();
+  pio_sm_clear_fifos(g_reader.pio, g_reader.sm);
+  g_reader.half = 0;
+  pio_sm_set_enabled(g_reader.pio, g_reader.sm, true);
+  g_stream_last = read_fifo();
+  restore_interrupts(irq);
+  return true;
+}
+
+size_t rp2040_flux_capture_drain(volatile uint8_t *dest, size_t dest_cap,
+                                 size_t already_written,
+                                 bool store_greaseweazle) {
+  uint8_t *ptr = (uint8_t *)dest + already_written;
+  uint8_t *end = (uint8_t *)dest + dest_cap;
+
+  uint32_t irq = save_and_disable_interrupts();
+  while (ptr != end && data_available()) {
+    int data = read_fifo();
+    int delta = g_stream_last - data;
+    if (delta < 0)
+      delta += 65536;
+    delta /= 2;
+    g_stream_last = data;
+
+    if (store_greaseweazle) {
+      ptr = greasepack(ptr, end, delta);
+    } else {
+      *ptr++ = delta > 255 ? 255 : delta;
+    }
+  }
+  restore_interrupts(irq);
+
+  return (size_t)(ptr - (uint8_t *)dest);
+}
+
+void rp2040_flux_capture_stop(void) {
+  disable_capture();
+  free_capture();
+}
+
 // ---- Write ----
 
 static bool init_write(int wrdata_pin, bool is_apple2) {

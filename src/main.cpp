@@ -22,8 +22,12 @@ int main() {
   bus_init(); // Milestone 3.0: launch the MZ-800 bus listener on core1
 
   while (true) {
+    // Prioritize disk-side FDC work first: the MZ-800 ROM's READ timeout window
+    // is only a few milliseconds, so reducing core0 scheduling latency here is
+    // more important than USB/probe responsiveness.
+    fdc_disk_task();
     tud_task();       // service USB (core0)
     gw_task();        // process one greaseweazle / MZP command if pending
-    fdc_disk_task();  // run pending MZ-800 FDC physical ops (motor/seek) on core0
+    fdc_disk_task();  // run a second pass after USB/protocol servicing
   }
 }

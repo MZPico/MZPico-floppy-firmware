@@ -11,8 +11,8 @@
 struct BusHelloState {
   volatile uint8_t reg[8];      // stored inverted value (what a read drives back)
   volatile uint8_t last_raw[8]; // last RAW (un-inverted) byte the MZ wrote, per port
-  volatile uint16_t wr[8];      // per-port write count
-  volatile uint16_t rd[8];      // per-port read count
+  volatile uint32_t wr[8];      // per-port write count (32-bit: a uint16 wraps
+  volatile uint32_t rd[8];      // in 0.5 s under a tight OUT loop)
   // Bit-activity accumulators over ALL I/O cycles the machine runs (not just our
   // ports). A bit set in *_low means the PIO sampled that C-line LOW at least
   // once; set in *_high means it sampled HIGH at least once. A healthy line
@@ -25,6 +25,26 @@ struct BusHelloState {
 };
 
 extern BusHelloState g_bus_hello;
+
+// Cycle-timing telemetry for the core1 listen loop. The Z80 I/O window is only
+// ~560 ns; these counters say whether core1 is making it or not, so a data
+// mismatch can be attributed to "arrived too late" rather than guessed at.
+struct BusDiag {
+  volatile uint32_t wr_late_at_pop;    // WRITE: IORQ already high when core1 got
+                                       // the address -> capture skipped entirely
+  volatile uint32_t wr_late_at_sample; // WRITE: IORQ rose while we were sampling
+                                       // -> the byte we read may be corrupt
+  volatile uint32_t rd_late_at_pop;    // READ: cycle over before we could drive
+  volatile uint32_t wr_backlog;        // WRITE: >1 entry drained in one pass
+  volatile uint32_t rd_backlog;        // READ: >1 entry drained in one pass
+};
+
+extern BusDiag g_bus_diag;
+
+// Zero the per-port counters, bit-activity accumulators and cycle telemetry.
+// (busdump counters are cumulative from boot otherwise, which makes a clean
+// single-experiment measurement impossible.)
+void bus_diag_reset(void);
 
 // Init bus GPIO + PIO and launch the core1 listen loop. Call once from main().
 void bus_init(void);

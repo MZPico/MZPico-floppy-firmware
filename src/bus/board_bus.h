@@ -36,6 +36,15 @@
 #define FDC_PORT_BASE 0xD8
 #define FDC_PORT_LAST 0xDE
 
+// Buffer-settle delay between switching a '245 gate and sampling/driving C0..C7.
+// An LVC245 propagates in ~5 ns; the RP2040 GPIO input synchroniser costs 2
+// sysclk. Six nops @180 MHz is ~33 ns -- ample, and ~5x cheaper than the
+// `for (volatile int k...)` loop it replaces (which burned ~150 ns of the ~560 ns
+// Z80 I/O window). See docs/phase3-plan.md "Board-specific bus handshake".
+ALWAYS_INLINE void bus_settle(void) {
+  __asm volatile("nop; nop; nop; nop; nop; nop" ::: "memory");
+}
+
 ALWAYS_INLINE uint8_t read_data_bus(void) {
   return (sio_hw->gpio_in >> DATA_BUS_BASE) & 0xFF;
 }

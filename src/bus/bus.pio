@@ -8,17 +8,26 @@
 ;     side 1 -> EN0 high: address buffer OFF (freed so core1 can drive data on U2)
 ; C0..C7 = GPIO0-7 (in base 0). Control: IORQ=8, RD=9, WR=10.
 
+; GUARD DELAY (~23 cycles = ~128 ns @180 MHz) between "IORQ released" and
+; re-enabling the address buffer. Without it the SM re-asserts EN0 the instant
+; IORQ rises, while core1 is still driving C0..C7 (read cycle) or still has the
+; data '245 enabled (write cycle) -- putting U1's 24 mA drivers in contention with
+; the Pico pads / U2 on every single cycle. Cheap: the Z80 cannot start another
+; I/O cycle for >=3 us. Cf. the 8 nops in the reference's bus_write_deluxe.
+
 ; MZ I/O READ cycle: capture the port address, then core1 drives the data byte.
 ; jmp_pin = RD.
 .program bus_read
 .side_set 1 opt
 .wrap_target
+    wait 1 gpio 8       [7]           ; cycle over -- then guard before EN0 returns
+    nop                 [7]
+    nop                 [6]
     nop                 side 0        ; address buffer ON
 wait_iorq_low:
     wait 0 gpio 8
     jmp pin, wait_iorq_low            ; loop while RD high (not a read)
     in pins, 8          side 1        ; sample port addr; address buffer OFF
-    wait 1 gpio 8
 .wrap
 
 ; MZ I/O WRITE cycle: capture the port address, then core1 reads the data byte.
@@ -26,12 +35,14 @@ wait_iorq_low:
 .program bus_write
 .side_set 1 opt
 .wrap_target
+    wait 1 gpio 8       [7]
+    nop                 [7]
+    nop                 [6]
     nop                 side 0
 wait_iorq_low:
     wait 0 gpio 8
     jmp pin, wait_iorq_low            ; loop while WR high
     in pins, 8          side 1        ; sample port addr; address buffer OFF
-    wait 1 gpio 8
 .wrap
 
 % c-sdk {

@@ -9,6 +9,7 @@
 #include "mfm_encode.hpp"
 #include "bus/mz_bus.hpp"
 #include "bus/fdc.hpp"
+#include "flux/arch_rp2.h"
 
 #include "tusb.h"
 #include "pico/time.h"
@@ -52,6 +53,14 @@
 #define MZP_CMD_FDCDUMP 0x86   // read WD FDC register/state snapshot
 #define MZP_CMD_FDCLOG 0x87    // read WD FDC recent-command ring log
 #define MZP_CMD_FDCSEEK 0x88   // bench: inject motor-on + RESTORE/SEEK via the FDC
+#define MZP_CMD_FDCREAD 0x89   // bench: READ SECTOR via the FDC (capture+decode)
+#define MZP_CMD_STREAMSCAN 0x8A // bench: scan a track using the incremental
+                                // (streaming) capture API, for A/B comparison
+                                // against MZP_CMD_SCAN's batch capture
+#define MZP_CMD_BUSTEST_RESET 0x8B // reset port-0xDF bus-test counters/state
+#define MZP_CMD_BUSTEST 0x8C // port-0xDF loopback + cycle-timing diagnostics
+#define MZP_CMD_RDDIAG 0x8D  // why the last Type II read succeeded / RNF'd
+#define MZP_CMD_SIDESWAP 0x8E // invert ROM side-select -> physical head
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -74,7 +83,7 @@ static FloppyDrive g_drive(PIN_DENSITY, PIN_INDEX, PIN_SELECT, PIN_MOTOR,
 static FloppyDrive *floppy = nullptr;
 
 static uint8_t cmd_buffer[32];
-static uint8_t reply_buffer[128];
+static uint8_t reply_buffer[256];
 static uint8_t flux_transitions[MAX_FLUX_PULSE_PER_TRACK];
 static bool flux_status = false;
 
@@ -82,6 +91,12 @@ static bool flux_status = false;
 static SectorInfo g_scan_sectors[MZP_MAX_SECTORS];
 static uint8_t g_scan_scratch[1024]; // largest sector (128 << 3)
 static uint8_t g_enc_sectors[MZP_MAX_ENC_SECTORS * 512]; // encode-test source
+
+uint8_t *mzp_flux_buffer(size_t *cap) {
+  if (cap)
+    *cap = sizeof(flux_transitions);
+  return flux_transitions;
+}
 
 static uint32_t bandwidth_timer;
 static uint32_t transfered_bytes;
@@ -546,6 +561,69 @@ void gw_task() {
     }
   }
 
+  else if (cmd == MZP_CMD_STREAMSCAN) {
+    // A/B test: same seek + decode as MZP_CMD_SCAN, but flux comes from the
+    // incremental (streaming) capture API instead of the batch capture_track
+    // call, to isolate whether that new capture path itself produces valid,
+    // decodable flux -- independent of any live-FDC timing/settle questions.
+    // cmd_buffer[2]=track, [3]=side, [4]=density, [5..6]=capture_ms (LE).
+    if (!floppy)
+      setbustype(GW_CMD_SETBUSTYPE_IBM);
+    if (!floppy) {
+      reply_buffer[i++] = GW_ACK_BADCMD;
+      cdc_write_all(reply_buffer, 2);
+      return;
+    }
+    uint8_t track = cmd_buffer[2];
+    uint8_t sidev = cmd_buffer[3];
+    uint8_t dens = cmd_buffer[4];
+    uint16_t capture_ms = (uint16_t)cmd_buffer[5] | ((uint16_t)cmd_buffer[6] << 8);
+    if (capture_ms == 0)
+      capture_ms = 220;
+    float bt = dens ? 1.0f : 2.0f;
+
+    floppy->select(true);
+    floppy->spin_motor(true);
+    floppy->side(sidev);
+    floppy->goto_track(track);
+
+    uint32_t nflux = 0;
+    if (rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA)) {
+      uint32_t t0 = to_ms_since_boot(get_absolute_time());
+      while (to_ms_since_boot(get_absolute_time()) - t0 < capture_ms &&
+             nflux < sizeof(flux_transitions)) {
+        nflux = rp2040_flux_capture_drain(flux_transitions,
+                                          sizeof(flux_transitions), nflux,
+                                          /*store_greaseweazle=*/false);
+      }
+      rp2040_flux_capture_stop();
+    }
+    int ns = mfm_scan_track(flux_transitions, nflux, bt, g_scan_sectors,
+                            MZP_MAX_SECTORS, g_scan_scratch,
+                            sizeof(g_scan_scratch));
+
+    floppy->spin_motor(false);
+    floppy->select(false);
+
+    // Same reply shape as MZP_CMD_SCAN: [cmd, ACK, ns, nflux(4 LE)] then
+    // {cyl,head,sec,n,flags} * ns.
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = (uint8_t)ns;
+    reply_buffer[i++] = nflux & 0xFF;
+    reply_buffer[i++] = (nflux >> 8) & 0xFF;
+    reply_buffer[i++] = (nflux >> 16) & 0xFF;
+    reply_buffer[i++] = (nflux >> 24) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+    for (int k = 0; k < ns; k++) {
+      SectorInfo *s = &g_scan_sectors[k];
+      uint8_t rec[5] = {
+          s->cyl, s->head, s->sec, s->n,
+          (uint8_t)((s->id_crc_ok ? 1 : 0) | (s->data_crc_ok ? 2 : 0) |
+                    (s->has_data ? 4 : 0) | (s->deleted ? 8 : 0))};
+      cdc_write_all(rec, 5);
+    }
+  }
+
   else if (cmd == MZP_CMD_ENCTEST) {
     // Encoder validation, no disk: encode a synthetic uniform track then decode
     // it with the scanner and count sectors that round-trip with valid CRCs.
@@ -596,19 +674,20 @@ void gw_task() {
 
   else if (cmd == MZP_CMD_BUSDUMP) {
     // Per-port telemetry for ports 0xD8..0xDF:
-    // [cmd, ACK, last_raw[8], wr[8]*2 LE, rd[8]*2 LE].
+    // [cmd, ACK, last_raw[8], wr[8]*4 LE, rd[8]*4 LE, addr_low, addr_high,
+    //  dat_low, dat_high] -- 78 bytes.
     reply_buffer[i++] = GW_ACK_OK;
     for (int k = 0; k < 8; k++)
       reply_buffer[i++] = g_bus_hello.last_raw[k];
     for (int k = 0; k < 8; k++) {
-      uint16_t w = g_bus_hello.wr[k];
-      reply_buffer[i++] = w & 0xFF;
-      reply_buffer[i++] = (w >> 8) & 0xFF;
+      uint32_t w = g_bus_hello.wr[k];
+      for (int b = 0; b < 4; b++)
+        reply_buffer[i++] = (w >> (8 * b)) & 0xFF;
     }
     for (int k = 0; k < 8; k++) {
-      uint16_t r = g_bus_hello.rd[k];
-      reply_buffer[i++] = r & 0xFF;
-      reply_buffer[i++] = (r >> 8) & 0xFF;
+      uint32_t r = g_bus_hello.rd[k];
+      for (int b = 0; b < 4; b++)
+        reply_buffer[i++] = (r >> (8 * b)) & 0xFF;
     }
     reply_buffer[i++] = g_bus_hello.addr_low;
     reply_buffer[i++] = g_bus_hello.addr_high;
@@ -636,7 +715,12 @@ void gw_task() {
 
   else if (cmd == MZP_CMD_FDCDUMP) {
     // [cmd, ACK, status, track, sector, data, command, flags, drive,
-    //  at_track0, phys_track, op_seq, op_done].
+    //  at_track0, phys_track, op_seq, op_done,
+    //  rd_flags, rd_sector, xfer_pos(2 LE), xfer_len(2 LE), rd_seq, rd_done,
+    //  rd_elapsed_us(4 LE), cmd_gap_us(4 LE), verify_start_ok, verify_n(4 LE),
+    //  cmd_writes_total(2 LE), cmd_last_raw, cmd_last_decoded,
+    //  bt_active, bt_last_rx, bt_last_echo,
+    //  bt_rx_count(2 LE), bt_rd_count(2 LE), bt_err_count(2 LE)].
     FdcDebug d;
     fdc_debug_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -651,13 +735,47 @@ void gw_task() {
     reply_buffer[i++] = d.phys_track;
     reply_buffer[i++] = d.op_seq;
     reply_buffer[i++] = d.op_done;
+    reply_buffer[i++] = d.rd_flags;
+    reply_buffer[i++] = d.rd_sector;
+    reply_buffer[i++] = d.xfer_pos & 0xFF;
+    reply_buffer[i++] = (d.xfer_pos >> 8) & 0xFF;
+    reply_buffer[i++] = d.xfer_len & 0xFF;
+    reply_buffer[i++] = (d.xfer_len >> 8) & 0xFF;
+    reply_buffer[i++] = d.rd_seq;
+    reply_buffer[i++] = d.rd_done;
+    reply_buffer[i++] = d.rd_elapsed_us & 0xFF;
+    reply_buffer[i++] = (d.rd_elapsed_us >> 8) & 0xFF;
+    reply_buffer[i++] = (d.rd_elapsed_us >> 16) & 0xFF;
+    reply_buffer[i++] = (d.rd_elapsed_us >> 24) & 0xFF;
+    reply_buffer[i++] = d.cmd_gap_us & 0xFF;
+    reply_buffer[i++] = (d.cmd_gap_us >> 8) & 0xFF;
+    reply_buffer[i++] = (d.cmd_gap_us >> 16) & 0xFF;
+    reply_buffer[i++] = (d.cmd_gap_us >> 24) & 0xFF;
+    reply_buffer[i++] = d.verify_start_ok;
+    reply_buffer[i++] = d.verify_n & 0xFF;
+    reply_buffer[i++] = (d.verify_n >> 8) & 0xFF;
+    reply_buffer[i++] = (d.verify_n >> 16) & 0xFF;
+    reply_buffer[i++] = (d.verify_n >> 24) & 0xFF;
+    reply_buffer[i++] = d.cmd_writes_total & 0xFF;
+    reply_buffer[i++] = (d.cmd_writes_total >> 8) & 0xFF;
+    reply_buffer[i++] = d.cmd_last_raw;
+    reply_buffer[i++] = d.cmd_last_decoded;
+    reply_buffer[i++] = d.bt_active;
+    reply_buffer[i++] = d.bt_last_rx;
+    reply_buffer[i++] = d.bt_last_echo;
+    reply_buffer[i++] = d.bt_rx_count & 0xFF;
+    reply_buffer[i++] = (d.bt_rx_count >> 8) & 0xFF;
+    reply_buffer[i++] = d.bt_rd_count & 0xFF;
+    reply_buffer[i++] = (d.bt_rd_count >> 8) & 0xFF;
+    reply_buffer[i++] = d.bt_err_count & 0xFF;
+    reply_buffer[i++] = (d.bt_err_count >> 8) & 0xFF;
     cdc_write_all(reply_buffer, i);
   }
 
   else if (cmd == MZP_CMD_FDCSEEK) {
     // Bench (no MZ-800): synchronously select + motor + seek and report the
-    // result. cmd_buffer[2]=target, [3..4]=param ms (LE), [5]=mode. Same 11
-    // data bytes as FDCDUMP, so the probe reuses fdc_line().
+    // result. cmd_buffer[2]=target, [3..4]=param ms (LE), [5]=mode. Same
+    // layout as FDCDUMP, so the probe reuses fdc_line().
     uint8_t target = cmd_buffer[2];
     uint16_t param = (uint16_t)cmd_buffer[3] | ((uint16_t)cmd_buffer[4] << 8);
     uint8_t mode = cmd_buffer[5];
@@ -675,20 +793,182 @@ void gw_task() {
     reply_buffer[i++] = d.phys_track;
     reply_buffer[i++] = d.op_seq;
     reply_buffer[i++] = d.op_done;
+    reply_buffer[i++] = d.rd_flags;
+    reply_buffer[i++] = d.rd_sector;
+    reply_buffer[i++] = d.xfer_pos & 0xFF;
+    reply_buffer[i++] = (d.xfer_pos >> 8) & 0xFF;
+    reply_buffer[i++] = d.xfer_len & 0xFF;
+    reply_buffer[i++] = (d.xfer_len >> 8) & 0xFF;
+    reply_buffer[i++] = d.rd_seq;
+    reply_buffer[i++] = d.rd_done;
+    reply_buffer[i++] = d.rd_elapsed_us & 0xFF;
+    reply_buffer[i++] = (d.rd_elapsed_us >> 8) & 0xFF;
+    reply_buffer[i++] = (d.rd_elapsed_us >> 16) & 0xFF;
+    reply_buffer[i++] = (d.rd_elapsed_us >> 24) & 0xFF;
+    reply_buffer[i++] = d.cmd_gap_us & 0xFF;
+    reply_buffer[i++] = (d.cmd_gap_us >> 8) & 0xFF;
+    reply_buffer[i++] = (d.cmd_gap_us >> 16) & 0xFF;
+    reply_buffer[i++] = (d.cmd_gap_us >> 24) & 0xFF;
+    reply_buffer[i++] = d.verify_start_ok;
+    reply_buffer[i++] = d.verify_n & 0xFF;
+    reply_buffer[i++] = (d.verify_n >> 8) & 0xFF;
+    reply_buffer[i++] = (d.verify_n >> 16) & 0xFF;
+    reply_buffer[i++] = (d.verify_n >> 24) & 0xFF;
+    reply_buffer[i++] = d.cmd_writes_total & 0xFF;
+    reply_buffer[i++] = (d.cmd_writes_total >> 8) & 0xFF;
+    reply_buffer[i++] = d.cmd_last_raw;
+    reply_buffer[i++] = d.cmd_last_decoded;
+    reply_buffer[i++] = d.bt_active;
+    reply_buffer[i++] = d.bt_last_rx;
+    reply_buffer[i++] = d.bt_last_echo;
+    reply_buffer[i++] = d.bt_rx_count & 0xFF;
+    reply_buffer[i++] = (d.bt_rx_count >> 8) & 0xFF;
+    reply_buffer[i++] = d.bt_rd_count & 0xFF;
+    reply_buffer[i++] = (d.bt_rd_count >> 8) & 0xFF;
+    reply_buffer[i++] = d.bt_err_count & 0xFF;
+    reply_buffer[i++] = (d.bt_err_count >> 8) & 0xFF;
     cdc_write_all(reply_buffer, i);
   }
 
+  else if (cmd == MZP_CMD_RDDIAG) {
+    // [cmd, ACK, capture_ok, flux_n(4), capture_us(4), search_us(4),
+    //  rd_elapsed_us(4), want, result, ids_seen, ids[16],
+    //  status_polls(4), status_span_us(4)]  -- 46 bytes.
+    FdcDebug d;
+    fdc_debug_snapshot(&d);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = d.rd_capture_ok;
+    const uint32_t v32[] = {d.rd_flux_n, d.rd_capture_us, d.rd_search_us,
+                            d.rd_elapsed_us};
+    for (uint32_t v : v32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    reply_buffer[i++] = d.rd_want;
+    reply_buffer[i++] = d.rd_result;
+    reply_buffer[i++] = d.rd_ids_seen;
+    for (int k = 0; k < 16; k++)
+      reply_buffer[i++] = d.rd_ids[k];
+    const uint32_t p32[] = {d.status_polls, d.status_span_us};
+    for (uint32_t v : p32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_SIDESWAP) {
+    // cmd_buffer[2]: 0 = normal, 1 = invert, 2 = query only.
+    if (cmd_buffer[2] < 2)
+      fdc_set_side_invert(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_side_invert() ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_BUSTEST_RESET) {
+    fdc_bustest_reset();
+    reply_buffer[i++] = GW_ACK_OK;
+    cdc_write_all(reply_buffer, 2);
+  }
+
+  else if (cmd == MZP_CMD_BUSTEST) {
+    // [cmd, ACK, active, last_rx, last_echo, rx(4), rd(4), err(4), err_gap(4),
+    //  err_garbage(4), bits_want1, bits_want0, mm_n, mm_exp[8], mm_got[8],
+    //  wr_late_at_pop(4), wr_late_at_sample(4), rd_late_at_pop(4),
+    //  wr_backlog(4), rd_backlog(4), bit_high[8]*4, err_adjacent(4),
+    //  rd_reports(4), rd_err(4), rd_bits_want1, rd_bits_want0, rd_last_exp,
+    //  rd_last_got, rd_bit_high[8]*4]  -- 144 bytes total.
+    FdcBusTest b;
+    fdc_bustest_snapshot(&b);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = b.active;
+    reply_buffer[i++] = b.last_rx;
+    reply_buffer[i++] = b.last_echo;
+    const uint32_t w32[] = {b.rx_count, b.rd_count, b.err_count,
+                            b.err_gap,  b.err_garbage};
+    for (uint32_t v : w32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    reply_buffer[i++] = b.bits_want1;
+    reply_buffer[i++] = b.bits_want0;
+    reply_buffer[i++] = b.mm_n;
+    for (int k = 0; k < 8; k++)
+      reply_buffer[i++] = b.mm_exp[k];
+    for (int k = 0; k < 8; k++)
+      reply_buffer[i++] = b.mm_got[k];
+    const uint32_t d32[] = {
+        g_bus_diag.wr_late_at_pop, g_bus_diag.wr_late_at_sample,
+        g_bus_diag.rd_late_at_pop, g_bus_diag.wr_backlog,
+        g_bus_diag.rd_backlog};
+    for (uint32_t v : d32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    for (int j = 0; j < 8; j++)
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (b.bit_high[j] >> (8 * k)) & 0xFF;
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (b.err_adjacent >> (8 * k)) & 0xFF;
+    const uint32_t rd32[] = {b.rd_reports, b.rd_err};
+    for (uint32_t v : rd32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    reply_buffer[i++] = b.rd_bits_want1;
+    reply_buffer[i++] = b.rd_bits_want0;
+    reply_buffer[i++] = b.rd_last_exp;
+    reply_buffer[i++] = b.rd_last_got;
+    for (int j = 0; j < 8; j++)
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (b.rd_bit_high[j] >> (8 * k)) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FDCREAD) {
+    // Bench (no MZ-800): synchronously seek + capture + decode one sector and
+    // stream its data bytes. cmd_buffer[2]=track,[3]=sector,[4]=side,[5]=density.
+    // Reply header: [cmd, ACK, flags, size_lo, size_hi] then `size` data bytes.
+    // flags: b0 found b1 has_data b2 data_crc_ok b3 deleted.
+    uint8_t track = cmd_buffer[2];
+    uint8_t sector = cmd_buffer[3];
+    uint8_t side = cmd_buffer[4];
+    uint8_t density = cmd_buffer[5];
+    uint8_t flags = 0;
+    // Decode into g_scan_scratch (1024 B); the capture buffer is separate.
+    uint16_t n = fdc_bench_read_sector(track, sector, side, density,
+                                       g_scan_scratch, sizeof(g_scan_scratch),
+                                       &flags);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = flags;
+    reply_buffer[i++] = n & 0xFF;
+    reply_buffer[i++] = (n >> 8) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+    // Stream the sector payload in CDC-sized chunks (like READFLUX).
+    uint16_t sent = 0;
+    while (sent < n) {
+      uint16_t chunk = (uint16_t)tmin((uint32_t)(n - sent), (uint32_t)256);
+      cdc_write_all(g_scan_scratch + sent, chunk);
+      sent += chunk;
+    }
+  }
+
   else if (cmd == MZP_CMD_FDCLOG) {
-    // [cmd, ACK, count_lo, count_hi, n, opcodes[n]] (oldest->newest).
-    uint8_t log[16];
+    // [cmd, ACK, count_lo, count_hi, n, decoded[n], raw[n]]
+    // both oldest->newest, same slot order.
+    uint8_t dec[16];
+    uint8_t raw[16];
     uint16_t count = 0;
-    uint8_t n = fdc_debug_cmdlog(log, &count);
+    uint8_t n = fdc_debug_cmdlog(dec, raw, &count);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = count & 0xFF;
     reply_buffer[i++] = (count >> 8) & 0xFF;
     reply_buffer[i++] = n;
     for (uint8_t k = 0; k < n; k++)
-      reply_buffer[i++] = log[k];
+      reply_buffer[i++] = dec[k];
+    for (uint8_t k = 0; k < n; k++)
+      reply_buffer[i++] = raw[k];
     cdc_write_all(reply_buffer, i);
   }
 

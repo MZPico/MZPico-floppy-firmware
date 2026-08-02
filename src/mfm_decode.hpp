@@ -29,3 +29,31 @@ struct SectorInfo {
 int mfm_scan_track(const uint8_t *flux, size_t n_flux, float nominal_bit_time_us,
                    SectorInfo *out, int max_sectors, uint8_t *scratch,
                    size_t scratch_size);
+
+// Result of locating one sector by ID (the WD READ SECTOR operation).
+struct SectorRead {
+  bool found;        // an IDAM with sec == want_sec and a valid ID CRC was found
+  bool has_data;     // a data field (DAM/DDAM) followed the ID
+  bool data_crc_ok;  // data-field CRC valid
+  bool deleted;      // the data mark was a deleted-DAM (0xF8)
+  uint8_t cyl, head; // IDAM cylinder/head bytes of the matched sector (debug)
+  uint16_t size;     // data-field size actually decoded (128 << N)
+};
+
+// Locate the sector whose IDAM sector-id == `want_sec` (with a valid ID CRC) in
+// one track's `flux` and decode its data field into `out` (up to out_size). This
+// is the per-command READ SECTOR primitive: it re-scans the same captured flux
+// for each requested sector, so a multi-sector read needs only one capture.
+// Returns .found=false (→ RNF) if no matching good-ID sector exists.
+SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
+                           float nominal_bit_time_us, uint8_t want_sec,
+                           uint8_t *out, size_t out_size);
+
+// WD Type I SEEK VERIFY primitive: after a seek, a real WD1793 (with the
+// command's Verify bit set) reads back the *first* ID field it finds
+// (regardless of sector number) and checks its cylinder byte against the
+// track just sought to, setting Seek Error if it doesn't match (or none is
+// found). Returns true iff an IDAM with a valid CRC and cyl == want_cyl was
+// found anywhere in `flux`.
+bool mfm_verify_track(const uint8_t *flux, size_t n_flux,
+                      float nominal_bit_time_us, uint8_t want_cyl);

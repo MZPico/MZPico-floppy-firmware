@@ -14,6 +14,7 @@
 #define SM_WRITE 1
 
 BusHelloState g_bus_hello;
+BusDiag g_bus_diag;
 
 static void init_bus_gpio(void) {
   // Shared C0..C7 — inputs by default.
@@ -71,53 +72,115 @@ static inline bool port_is_ours(uint8_t addr) {
 // Listen loop: the PIO side-set only exposes the port address (EN0/address
 // buffer). core1 owns the data buffer (EN1/RD1) and enables it ONLY for ports we
 // own, so we never drive or load the MZ-800 data bus on other devices' I/O.
+//
+// Hard real-time: from the PIO push we have the rest of the Z80 I/O cycle
+// (~560 ns @3.55 MHz) to switch buffers and sample/drive. Everything that is not
+// strictly needed to hit that window -- bit-activity accumulators, per-port
+// counters -- runs AFTER the bus access, never before it.
 RAM_FUNC static void listen_loop(void) {
   while (true) {
-    if (!pio_sm_is_rx_fifo_empty(BUS_PIO, SM_READ)) {
-      uint8_t addr = pio_sm_get(BUS_PIO, SM_READ) >> 24;
-      g_bus_hello.addr_low |= (uint8_t)~addr; // bit-activity over ALL reads
-      g_bus_hello.addr_high |= addr;
-      if (port_is_ours(addr)) {
-        uint8_t idx = addr - FDC_PORT_BASE;
-        uint8_t bus_byte = fdc_reg_read(addr); // inversion handled by the FDC
-        set_exwait();
-        write_data_bus(bus_byte);
-        acquire_data_bus_for_writing();
-        data_dir_drive();
-        data_buffer_on();
-        for (volatile int k = 0; k < 4; ++k) { /* let the '245 output settle */
-        }
-        release_exwait(); // data is valid on the bus before we free the Z80
-        while (!iorq_is_high()) { /* hold until the Z80 finishes the cycle */
-        }
-        data_buffer_off();
-        release_data_bus();
-        data_dir_read();
-        g_bus_hello.reg[idx] = bus_byte;
-        g_bus_hello.rd[idx]++;
-      }
-    } else if (!pio_sm_is_rx_fifo_empty(BUS_PIO, SM_WRITE)) {
+    // Drain BOTH FIFOs each pass. Under a tight OUT/IN loop, handling only one
+    // entry per FIFO per iteration can still accumulate backlog and eventually
+    // overflow one FIFO.
+    bool first = true;
+    while (!pio_sm_is_rx_fifo_empty(BUS_PIO, SM_WRITE)) {
       uint8_t addr = pio_sm_get(BUS_PIO, SM_WRITE) >> 24;
-      g_bus_hello.addr_low |= (uint8_t)~addr; // bit-activity over ALL writes
-      g_bus_hello.addr_high |= addr;
+      if (!first)
+        g_bus_diag.wr_backlog++;
+      first = false;
       if (port_is_ours(addr)) {
         uint8_t idx = addr - FDC_PORT_BASE;
         set_exwait();
+        // Only put the data '245 on C0..C7 while the cycle is actually live.
+        // Once IORQ rises the write SM re-arms the address buffer, and enabling
+        // U2 then would drive U1's address onto C0..C7 at the same time -- we
+        // would sample a fight, not the Z80's data. Count it instead.
+        if (iorq_is_high()) {
+          release_exwait();
+          g_bus_diag.wr_late_at_pop++;
+          g_bus_hello.addr_low |= (uint8_t)~addr;
+          g_bus_hello.addr_high |= addr;
+          continue;
+        }
         data_dir_read();
         data_buffer_on();
-        for (volatile int k = 0; k < 4; ++k) { /* buffer/settle delay */
-        }
+        bus_settle();
         uint8_t raw = read_data_bus();
+        bool late = iorq_is_high(); // cycle ended under us mid-sample?
         data_buffer_off();
         release_exwait();
+        if (late)
+          g_bus_diag.wr_late_at_sample++;
         fdc_reg_write(addr, raw); // FDC applies per-port inversion + decode
+        // --- off the critical path from here ---
         g_bus_hello.dat_low |= (uint8_t)~raw; // write-data bit activity
         g_bus_hello.dat_high |= raw;
         g_bus_hello.last_raw[idx] = raw; // raw, un-inverted
         g_bus_hello.wr[idx]++;
       }
+      g_bus_hello.addr_low |= (uint8_t)~addr; // bit-activity over ALL writes
+      g_bus_hello.addr_high |= addr;
+    }
+
+    first = true;
+    while (!pio_sm_is_rx_fifo_empty(BUS_PIO, SM_READ)) {
+      uint8_t addr = pio_sm_get(BUS_PIO, SM_READ) >> 24;
+      if (!first)
+        g_bus_diag.rd_backlog++;
+      first = false;
+      if (port_is_ours(addr)) {
+        uint8_t idx = addr - FDC_PORT_BASE;
+        set_exwait();
+        // Same guard as the write path: if the cycle is already over, driving
+        // the data '245 would push a byte onto the MZ-800 data bus outside any
+        // I/O cycle. Never do that.
+        if (iorq_is_high()) {
+          release_exwait();
+          g_bus_diag.rd_late_at_pop++;
+          g_bus_hello.addr_low |= (uint8_t)~addr;
+          g_bus_hello.addr_high |= addr;
+          continue;
+        }
+        uint8_t bus_byte = fdc_reg_read(addr); // inversion handled by the FDC
+        write_data_bus(bus_byte);
+        acquire_data_bus_for_writing();
+        data_dir_drive();
+        data_buffer_on();
+        bus_settle();
+        release_exwait(); // data is valid on the bus before we free the Z80
+        while (!iorq_is_high()) { /* hold until the Z80 finishes the cycle */
+        }
+        // Drop our drive before the read SM's guard delay expires and it turns
+        // the address buffer back on (see bus.pio).
+        data_buffer_off();
+        release_data_bus();
+        data_dir_read();
+        // --- off the critical path from here ---
+        g_bus_hello.reg[idx] = bus_byte;
+        g_bus_hello.rd[idx]++;
+      }
+      g_bus_hello.addr_low |= (uint8_t)~addr; // bit-activity over ALL reads
+      g_bus_hello.addr_high |= addr;
     }
   }
+}
+
+void bus_diag_reset(void) {
+  for (int k = 0; k < 8; ++k) {
+    g_bus_hello.reg[k] = 0;
+    g_bus_hello.last_raw[k] = 0;
+    g_bus_hello.wr[k] = 0;
+    g_bus_hello.rd[k] = 0;
+  }
+  g_bus_hello.addr_low = 0;
+  g_bus_hello.addr_high = 0;
+  g_bus_hello.dat_low = 0;
+  g_bus_hello.dat_high = 0;
+  g_bus_diag.wr_late_at_pop = 0;
+  g_bus_diag.wr_late_at_sample = 0;
+  g_bus_diag.rd_late_at_pop = 0;
+  g_bus_diag.wr_backlog = 0;
+  g_bus_diag.rd_backlog = 0;
 }
 
 static void core1_entry(void) { listen_loop(); }

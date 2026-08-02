@@ -1,6 +1,9 @@
 /build/
 # Third-party copyrighted reference material — kept locally, not committed.
 MZ2Z046.ASM
+9Z_504M.ROM
+9Z_504M.dis.asm
+9Z_504M.dis.skool
 Sharp_MZ-800_ROM_Vypis_Odehnal-Veverka.pdf
 *.uf2
 *.elf
@@ -17,3 +20,4 @@ __pycache__/
 
 # Editor workspace files
 *.code-workspace
+.vscode/

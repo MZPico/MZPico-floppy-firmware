@@ -73,3 +73,86 @@ int mfm_scan_track(const uint8_t *flux, size_t n_flux, float nominal_bit_time_us
   }
   return n;
 }
+
+SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
+                           float nominal_bit_time_us, uint8_t want_sec,
+                           uint8_t *out, size_t out_size) {
+  SectorRead r;
+  memset(&r, 0, sizeof(r));
+
+  mfm_io_t io;
+  memset(&io, 0, sizeof(io));
+  io.pulses = const_cast<uint8_t *>(flux);
+  io.n_pulses = n_flux;
+  io.pos = 0;
+  io.T1_nom = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 1e-6f);
+  io.T2_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 2.5e-6f);
+  io.T3_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 3.5e-6f);
+
+  while (!mfm_io_eof(&io)) {
+    if (!skip_triple_sync_mark(&io))
+      break; // no more sync marks -> end of track
+
+    uint8_t mark = 0;
+    uint8_t idam[mfm_io_idam_size];
+    uint8_t crcbuf[mfm_io_crc_size];
+    uint16_t crc = receive_crc(&io, &mark, (size_t)1, idam, (size_t)sizeof(idam),
+                               crcbuf, (size_t)sizeof(crcbuf), (uint8_t *)NULL);
+    if (mark != MFM_IO_IDAM)
+      continue; // that sync wasn't an ID address mark
+
+    uint8_t sec = idam[2];
+    if (sec != want_sec || crc != 0)
+      continue; // not our sector (or its ID is corrupt) -> keep looking
+
+    // Matched a good ID for the requested sector. Decode its data field.
+    r.found = true;
+    r.cyl = idam[0];
+    r.head = idam[1];
+    uint8_t nsz = idam[3] & 7;
+    uint16_t size = (uint16_t)(128u << nsz);
+    r.size = size;
+
+    if (skip_triple_sync_mark(&io) && size <= out_size) {
+      uint8_t dmark = 0;
+      uint16_t dcrc = receive_crc(&io, &dmark, (size_t)1, out, size, crcbuf,
+                                  (size_t)sizeof(crcbuf), (uint8_t *)NULL);
+      if (dmark == MFM_IO_DAM || dmark == MFM_IO_DDAM) {
+        r.has_data = true;
+        r.deleted = (dmark == MFM_IO_DDAM);
+        r.data_crc_ok = (dcrc == 0);
+      }
+    }
+    return r;
+  }
+  return r; // .found == false -> Record Not Found
+}
+
+bool mfm_verify_track(const uint8_t *flux, size_t n_flux,
+                      float nominal_bit_time_us, uint8_t want_cyl) {
+  mfm_io_t io;
+  memset(&io, 0, sizeof(io));
+  io.pulses = const_cast<uint8_t *>(flux);
+  io.n_pulses = n_flux;
+  io.pos = 0;
+  io.T1_nom = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 1e-6f);
+  io.T2_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 2.5e-6f);
+  io.T3_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 3.5e-6f);
+
+  while (!mfm_io_eof(&io)) {
+    if (!skip_triple_sync_mark(&io))
+      break;
+
+    uint8_t mark = 0;
+    uint8_t idam[mfm_io_idam_size];
+    uint8_t crcbuf[mfm_io_crc_size];
+    uint16_t crc = receive_crc(&io, &mark, (size_t)1, idam, (size_t)sizeof(idam),
+                               crcbuf, (size_t)sizeof(crcbuf), (uint8_t *)NULL);
+    if (mark != MFM_IO_IDAM || crc != 0)
+      continue; // not an ID field, or its CRC is bad -> keep looking
+
+    if (idam[0] == want_cyl)
+      return true; // any sector's ID on the right cylinder verifies the seek
+  }
+  return false;
+}

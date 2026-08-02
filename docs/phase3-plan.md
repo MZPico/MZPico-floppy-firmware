@@ -82,44 +82,125 @@ BUSY-polling covers latency instead, per the ROM driver).
   with a 300 ms pre-sleep), and a motor-off delay keeps it spinning between the
   ROM's retries. `fdc.{cpp,hpp}`; probe cmds `fdcdump`/`fdclog`/`fdcseek`. No
   INTRQ yet — the ROM polls STATUS for Type I.
-- **3.2 — READ SECTOR (single + multiple) — the payoff.** On command: BUSY set,
-  core0 streaming-decodes the live flux, finds the sector by ID, streams data to
-  DATA with DRQ; core1 serves the software-polled transfer; INTRQ at end; CRC/RNF
-  status. Multi-sector + Force Interrupt. Test: **MZ-800 reads a directory / boots
-  CP/M from the physical disk.**
+- **3.2 — READ SECTOR (single + multiple). ✅ READ PATH hardware-verified — the
+  MZ-800 loads and starts CP/M from a physical disk.** Not "boots cleanly":
+  CP/M's own BIOS then reports `Read/Write Error (Abort/Retry/Ignore)` before
+  reaching the prompt. That is a *different client* — everything verified here
+  is the boot ROM's `RESTORE → SEEK → READ-SEC(M) → FORCE-INT` path; the BIOS
+  drives the FDC itself afterwards and exercises paths we have not implemented
+  (see 3.3/3.4). On a Type II read (0x8X/0x9X)
+  core1 sets BUSY at once and hands core0 a request; core0 captures a bounded
+  flux window and decodes the requested sector by ID via `mfm_read_sector()`,
+  publishing it to a one-sector transfer buffer and raising **DRQ**. core1
+  serves DATA reads from that buffer, auto-advancing the Sector register in
+  multi-record mode; Force Interrupt (0xD0/0xD8) terminates. Multi-record reuses
+  the captured window, so sectors 2..N cost only a decode (~2 ms).
+  - **Capture and decode must be strictly sequential.** The flux capture has no
+    DMA — the PIO RX FIFO holds 4 words × 2 half-samples = 8 transitions, about
+    **24 µs** at DD rates. Any work between drains longer than that silently
+    drops flux, MFM sync never holds, and no sector is ever found. An earlier
+    decode-while-capturing design failed exactly this way while `scan` /
+    `streamscan` / `fdcread` (all capture-then-decode) passed on the same disk.
+  - **No index sync, no pre-arm.** A ~1.05-revolution window contains every
+    sector wherever it starts, so index alignment buys nothing and pre-arming
+    reintroduced the interleaving hazard from the other side.
+  - **Host budget (measured, `rddiag`):** the boot ROM polls STATUS ~25,000
+    times over **~285 ms** after a READ before issuing Force Interrupt — one
+    poll every 11.4 µs, a ~40 T-state Z80 loop. Capture ~215 ms + decode ~2 ms
+    fits, but not by much; this is the constraint that sizes the window.
+  - Diagnostics: `rddiag` reports capture bytes/time, decode time, the sector
+    IDs actually present on the track when a read RNFs, and the host's poll
+    count and span.
 - **3.3 — WRITE SECTOR (in-place splice).** Locate the sector by ID (streaming
   decode), then WGATE + write the MFM-encoded data field in the ~22-byte Gap 2
   window (~700 µs slack). Test: MZ-800 writes a file; read back (host `gw`/scan).
+  **Currently a stub** that clears BUSY with no DRQ and no error bits. Its
+  comment ("the MZ-800 boot/directory path never writes, so completing benignly
+  is safe for now") was written when the boot ROM was the only client — CP/M's
+  BIOS is not bound by that, and a silent no-op write is a prime suspect for the
+  BIOS-level error above.
 - **3.4 — Type III / format / density / multi-drive.** READ ADDRESS, READ TRACK,
-  WRITE TRACK (format), density via `~DEN_RDY`, drive-select via `~DS0/DS1`,
-  decode `0xDC`–`0xDE` control bits.
+  WRITE TRACK (format), density via `~DEN_RDY`, drive-select via `~DS0/DS1`.
+  Also a stub today. **READ ADDRESS (0xC0) is the one to prioritise** — CP/M
+  BIOSes commonly use it to confirm head position or probe sector layout, and
+  the second suspect for the BIOS-level error.
 - **3.5 — Robustness.** Error/retry paths, write precomp if inner tracks are
   marginal, edge-case timing, soak testing.
 
 ## Primary risks / unknowns
 
-1. **Bus real-time response** (M3.0): detecting `~IORQ` + address and asserting
-   `~EXWAIT` fast enough, with the shared-bus buffer switching. Mitigated by
-   adapting the proven reference DELUXE PIO/loop. **Biggest risk.**
+1. ~~**Bus real-time response** (M3.0)~~ — ✅ **resolved.** The port-0xDF
+   loopback (`mzp_probe.py bustest`) runs >1M writes and >1M reads with zero
+   mismatches, zero late cycles and zero FIFO backlog, all eight C-lines at
+   exactly 50.00 % duty. The PIO re-arms the address buffer only after a ~122 ns
+   guard so it can never contend with core1's drive; core1 skips (and counts)
+   any cycle that ends before it can service it.
 2. **No `~M1` pin on this board.** The reference uses M1 to distinguish I/O from
    opcode-fetch/interrupt-acknowledge. We decode on `~IORQ`+address only →
    theoretical risk of responding during an IORQ-based INTA cycle. Assess against
-   the MZ-800's interrupt scheme; likely benign but confirm.
-3. **Streaming decode keeping bit-sync in real time** (M3.2): the disk engine must
-   maintain the data separator continuously off the live FIFO. New code, but built
-   on Adafruit's `mfm_io_sample_flux` primitive + `mfm_impl` logic.
-4. **`~EXWAIT` budget** to put a byte on C0..C7 within the Z80 cycle.
-5. **`0xDC`–`0xDE` control-bit meanings** (motor/drive-select/side/density) —
-   decode from `MZ2Z046.ASM` before M3.1/M3.4.
+   the MZ-800's interrupt scheme; likely benign but confirm. **Still open.**
+3. ~~**Streaming decode keeping bit-sync in real time** (M3.2)~~ — ✅ **moot.**
+   Decode does not run concurrently with capture (see 3.2 above); it runs once,
+   afterwards, over a complete window.
+4. ~~**`~EXWAIT` budget**~~ — ✅ **resolved,** and it turned out not to be the
+   binding constraint: core1 comfortably services a register access inside the
+   ~560 ns Z80 I/O window without needing wait states.
+5. ~~**`0xDC`–`0xDE` control-bit meanings**~~ — ✅ **decoded** (0xDC b7 motor,
+   b1..0 drive; 0xDD b0 side; 0xDE b0 density), with one correction below.
+6. **CP/M BIOS is an unserved client.** Everything verified to date is the boot
+   ROM's command repertoire. The BIOS issues its own sequence and currently
+   trips `Read/Write Error (Abort/Retry/Ignore)` during startup. Diagnose with
+   `fdclog` at the error prompt (names the opcode) plus `rddiag`; if the 16-deep
+   ring has already wrapped, a sticky first-failure latch is the next tool to
+   add. **Open — this is the blocker for a clean boot.**
+7. **Read latency headroom.** Capture (~215 ms) consumes most of the host's
+   ~285 ms patience. Comfortable margin needs DMA'd flux capture so decode can
+   run concurrently and a sector is found as soon as its ID passes the head
+   (~100 ms average). Not required today; required if WRITE SECTOR or a slower
+   host path proves tighter. **Open.**
 
-## Immediate next step
+## Machine quirks that cost real time (read this before debugging)
 
-**Milestone 3.2 — READ SECTOR (single + multiple).** M3.1 is done; the ROM now
-issues `READ-SEC(M)` (0x94) and errors ("FD Loading error") because Type II isn't
-implemented. Next: on a Read Sector command, core0 streaming-decodes the live
-flux (seek is already in place), finds the sector by ID (Track/Sector registers,
-side), and streams the data field to the DATA register with **DRQ** as the ROM
-polls STATUS; set BUSY during, RNF/CRC on error, and support multi-sector
-terminated by Force Interrupt (0xD0). Reuse the Phase-2 streaming MFM decoder.
-Test: **MZ-800 reads a directory / boots CP/M from the physical disk.** Keep the
-same discipline: one testable milestone at a time.
+- **Side-select is inverted.** The MZ-800's floppy card drives side-select the
+  opposite way round from the PC/Shugart convention `FloppyDrive::side()` uses:
+  **the ROM's side 0 is physical head 1.** The bridge inverts it by default
+  (`fdc_set_side_invert`, default *on*); `mzp_probe.py sideswap 0` restores the
+  raw mapping for A/B testing. Without the inversion the machine cannot boot.
+  This is why every MZ-800 CP/M image has its 16×256 IPL track at cyl0/**side1**
+  as a PC reads it, while the boot ROM reads logical track 0 = cyl0/side0.
+- **The boot ROM's disk geometry** (from `9Z_504M.dis.asm`): logical track =
+  `cylinder*2 + side` (`FD_PREPARE_TRACK_AND_SIDE`, E61B); block → track/sector
+  is `track = block/16`, `sector = block%16 + 1` (E696), i.e. **16 sectors of
+  256 bytes** per track, numbered 1..16 (`CP $11` wrap). The read loop is
+  `LD B,$00` + `INI` — exactly 256 bytes per sector, regardless of the sector's
+  actual size, then Force Interrupt.
+- **"FD:Not master"** is a 7-byte compare of the loaded block at `$CF00`
+  against E4CA = `03 49 50 4C 50 52 4F` (`0x03 "IPLPRO"`), stored complemented
+  on disk because `INI` keeps the raw inverted bus byte. It is a *content*
+  verdict, not an I/O error — a correct response to a non-master disk.
+
+## Post-mortem: what actually blocked 3.2 (superseding the 2026-07-24 notes)
+
+Three unrelated faults compounded, and each produced misleading evidence that
+justified the wrong fix. Recorded because the wrong conclusions were written
+into the code as "workarounds":
+
+1. **Data-bus bit7 (D7) was a marginal solder joint on U2.** Every WD command
+   whose *true* opcode has bit7 set lost that bit through the ROM's `CPL`:
+   `0x94` arrived as `0x14`, `0xD8` as `0x58`. This spawned the
+   `FDC_ALIAS_14_TO_94_AFTER_1B` / `FDC_ALIAS_58_TO_D8_AFTER_94` aliases, the
+   belief that "the ROM issues Verify seeks" (it does not — `0x14` *was* `0x94`,
+   and `mfm_verify_track()` was written for a command never sent), and the
+   "intermittent command sequence" (the joint was flaky, not the ROM). Found
+   with the port-0xDF loopback: 100 % of mismatches were one bit, one direction.
+2. **The ~10 ms host timeout never existed.** Measured at ~285 ms once commands
+   decoded correctly. The old figure timed a read that wasn't happening. Every
+   design decision derived from it — index sync, pre-arm, "batch capture can
+   never work" — was unnecessary, and all of it has been removed.
+3. **Reads returned RNF because decode ran between flux drains.** See 3.2 above.
+   The bench paths passed because none of them interleave.
+
+Method note: the bus-test counters were `uint16_t` and wrapped every 0.5 s under
+a tight `OUT` loop, fabricating a rate-dependent error curve that looked exactly
+like a latency problem. All cycle counters are 32-bit now. Prefer a *signature*
+(which bits, what xor, what delta) over a percentage.
