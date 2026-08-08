@@ -16,6 +16,8 @@ Usage:
     python mzp_probe.py PORT bustest                      # 0xDF loopback + I/O-cycle timing diagnostics
     python mzp_probe.py PORT rddiag                       # why the last Type II read succeeded / RNF'd
     python mzp_probe.py PORT sideswap [0|1]               # invert ROM side-select -> physical head (no arg = query)
+    python mzp_probe.py PORT intmode [0|1|2]              # ~INT drive: 0=off 1=follow EINT(0xDF) 2=force (no arg = query)
+    python mzp_probe.py PORT iotrace                      # ordered register accesses (reads+writes), newest last
 
   MZ-800 bus-test programs to run against `bustest` (Z80 machine code):
     write only : 3E 00 D3 DF 3C 18 FB
@@ -54,6 +56,66 @@ MZP_CMD_BUSTEST_RESET = 0x8B
 MZP_CMD_BUSTEST = 0x8C
 MZP_CMD_RDDIAG = 0x8D
 MZP_CMD_SIDESWAP = 0x8E
+MZP_CMD_INTMODE = 0x8F
+MZP_CMD_IOTRACE = 0x90
+
+
+REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
+             0xDC: "MOTOR/DRV", 0xDD: "PAGE/SIDE", 0xDE: "DENSITY",
+             0xDF: "EINT"}
+
+
+# Ports 0xD8..0xDB are complemented on the MZ-800 bus; the firmware traces the
+# raw bus byte, so undo it here -- one place, matching fdc.cpp's rule.
+def _true_val(port, raw):
+    return (~raw) & 0xFF if 0xD8 <= port <= 0xDB else raw
+
+
+def _status_str(v, type2):
+    bits = STATUS_BITS_T2 if type2 else STATUS_BITS_T1
+    on = [bits[k] for k in range(8) if v & (1 << k) and bits[k] != "-"]
+    return "[" + " ".join(on) + "]" if on else "[]"
+
+
+def do_iotrace(s):
+    s.write(bytes([MZP_CMD_IOTRACE, 2]))
+    s.flush()
+    hdr = read_exact(s, 7)  # cmd, ack, count, total(4 LE)
+    if len(hdr) < 7 or hdr[1] != 0:
+        print(f"bad reply: {hdr.hex()}")
+        return
+    n = hdr[2]
+    total = int.from_bytes(hdr[3:7], "little")
+    recs = []
+    for _ in range(n):
+        rec = read_exact(s, 5)
+        if len(rec) < 5:
+            break
+        recs.append(rec)
+    print(f"{total} register accesses total; last {len(recs)} shown "
+          f"(oldest -> newest), identical consecutive accesses coalesced as xN:")
+    print(f"  {'dir':<3} {'port':<5} {'reg':<10} {'raw':<5} {'true':<5} "
+          f"{'count':>6}  note")
+    # STATUS layout depends on the last command class, same as the WD.
+    type2 = False
+    for rec in recs:
+        port, val, is_rd = rec[0], rec[1], rec[2]
+        rep = int.from_bytes(rec[3:5], "little")
+        tv = _true_val(port, val)
+        note = ""
+        if port == 0xD8 and not is_rd:
+            note = decode_cmd(tv)
+            hi = tv >> 4
+            if 0x8 <= hi <= 0xB or hi == 0xC or hi == 0xE or hi == 0xF:
+                type2 = True
+            elif hi <= 0x7:
+                type2 = False
+        elif port == 0xD8 and is_rd:
+            note = _status_str(tv, type2)
+        rp = f"x{rep}" if rep > 1 else ""
+        print(f"  {'RD' if is_rd else 'WR':<3} 0x{port:02X}  "
+              f"{REG_NAMES.get(port, '?'):<10} 0x{val:02X}  0x{tv:02X}  "
+              f"{rp:>6}  {note}")
 
 
 def read_exact(s, n):
@@ -293,8 +355,8 @@ def fdc_line(r):
 def do_rddiag(s):
     s.write(bytes([MZP_CMD_RDDIAG, 2]))
     s.flush()
-    r = read_exact(s, 46)
-    if len(r) < 46 or r[1] != 0:
+    r = read_exact(s, 56)
+    if len(r) < 56 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
 
@@ -306,17 +368,28 @@ def do_rddiag(s):
     want, result, ids_seen = r[19], r[20], r[21]
     ids = list(r[22:38])
     status_polls, status_span_us = u32(38), u32(42)
+    int_flags, int_mode = r[46], r[47]
+    intrq_asserts, lost_data_events = u32(48), u32(52)
 
     found = bool(result & 1)
+    is_readaddr = bool(result & 0x10)
     flags = " ".join(n for b, n in
                      ((1, "found"), (2, "has_data"), (4, "crc_ok"),
                       (8, "deleted")) if result & b) or "-"
-    print(f"last Type II read: sector {want}  -> {'OK' if found else 'RNF'}  "
-          f"[{flags}]")
+    if is_readaddr:
+        print(f"last command: READ ADDRESS -> {'OK' if found else 'RNF'}")
+        if found:
+            t, h, r, n = ids[0], ids[1], ids[2], ids[3]
+            print(f"  ID field: track={t} side={h} sector={r} "
+                  f"size={128 << (n & 7)}B (N={n})  "
+                  f"CRC={ids[4]:02X}{ids[5]:02X}")
+    else:
+        print(f"last Type II read: sector {want}  -> "
+              f"{'OK' if found else 'RNF'}  [{flags}]")
     print(f"  capture : started={capture_ok}  {flux_n} flux bytes in "
           f"{capture_us / 1000:.1f} ms  (~{flux_n / 43500:.2f} revolutions)")
     print(f"  decode  : {search_us / 1000:.1f} ms")
-    if not found:
+    if not found and not is_readaddr:
         if ids_seen:
             shown = ids[:min(ids_seen, 16)]
             print(f"  track HAS {ids_seen} sector IDs: "
@@ -334,6 +407,19 @@ def do_rddiag(s):
               f"revolution is ~200 ms")
     if abort_us:
         print(f"  aborted by Force Interrupt after {abort_us / 1000:.1f} ms")
+
+    mode_name = {0: "off", 1: "EINT-gated", 2: "forced"}.get(int_mode, "?")
+    istate = " ".join(n for b, n in ((1, "EINT"), (2, "~INT-low"),
+                                     (4, "force-int-latched"))
+                      if int_flags & b) or "idle"
+    print(f"  ~INT    : mode={int_mode} ({mode_name})  state={istate}  "
+          f"{intrq_asserts} asserts")
+    if int_mode == 1 and not (int_flags & 1):
+        print("            ^ EINT never armed -> this host is polling, not "
+              "interrupt-driven (boot ROM / CP/M 2.3 do this)")
+    if lost_data_events:
+        print(f"  LOST DATA: {lost_data_events} sector(s) DRQ'd but never "
+              f"drained by the host")
 
 
 def do_bustest(s):
@@ -603,6 +689,22 @@ def main():
                                          "head 1)" if r[2] else
                                          "normal (ROM side 0 -> physical "
                                          "head 0)"))
+        elif cmd == "iotrace":
+            do_iotrace(s)
+        elif cmd == "intmode":
+            # no arg = query (0xFF), else 0 = off, 1 = INTRQ, 2 = INTRQ|DRQ
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 0xFF
+            s.write(bytes([MZP_CMD_INTMODE, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            if len(r) < 3 or r[1] != 0:
+                print(f"bad reply: {r.hex()}")
+            else:
+                names = {0: "OFF (~INT never driven)",
+                         1: "follow EINT (port 0xDF bit0) -- correct/default",
+                         2: "FORCE on, ignoring EINT (diagnostic; hangs a host "
+                            "with no floppy ISR)"}
+                print("~INT mode: " + names.get(r[2], f"? ({r[2]})"))
         elif cmd == "fdcread":
             track = int(sys.argv[3])
             sector = int(sys.argv[4])

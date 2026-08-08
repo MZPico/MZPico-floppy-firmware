@@ -33,8 +33,12 @@
 #define RD1_PIN 28 // data buffer direction
 
 // FDC register window this firmware answers.
+// The window is 8 ports wide: 0xD8..0xDB are the WD registers, 0xDC..0xDE the
+// card's control latches (motor/drive, page/side, density) and 0xDF is EINT,
+// the interrupt-enable latch. 0xDF is a real register, not padding -- CP/M 4.1
+// writes it before and after every data command.
 #define FDC_PORT_BASE 0xD8
-#define FDC_PORT_LAST 0xDE
+#define FDC_PORT_LAST 0xDF
 
 // Buffer-settle delay between switching a '245 gate and sampling/driving C0..C7.
 // An LVC245 propagates in ~5 ns; the RP2040 GPIO input synchroniser costs 2
@@ -52,6 +56,18 @@ ALWAYS_INLINE void write_data_bus(uint8_t value) {
   sio_hw->gpio_clr = DATA_BUS_MASK;
   sio_hw->gpio_set = ((uint32_t)value << DATA_BUS_BASE);
 }
+// ~INTRQ (GPIO12), active low, driven open-drain: pull low to assert, go Hi-Z to
+// release, so we never fight another device sharing the MZ-800's INT line. The
+// output latch is parked at 0 during init, so toggling the output-enable is all
+// that is needed. gpio_oe_set/clr are write-1-to-modify, hence safe to call from
+// either core without a read-modify-write race.
+ALWAYS_INLINE void assert_int_line(void) {
+  sio_hw->gpio_oe_set = (1u << INT_PIN);
+}
+ALWAYS_INLINE void release_int_line(void) {
+  sio_hw->gpio_oe_clr = (1u << INT_PIN);
+}
+
 ALWAYS_INLINE void acquire_data_bus_for_writing(void) {
   sio_hw->gpio_oe_set = DATA_BUS_MASK;
 }

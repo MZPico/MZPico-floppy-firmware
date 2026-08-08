@@ -24,18 +24,28 @@ static void init_bus_gpio(void) {
     gpio_set_slew_rate(DATA_BUS_BASE + i, GPIO_SLEW_RATE_FAST);
   }
   // Control inputs (active low), pulled up.
-  const int in_pins[] = {IORQ_PIN, RD_PIN, WR_PIN, RESET_PIN};
+  const int in_pins[] = {IORQ_PIN, RD_PIN, WR_PIN};
   for (int p : in_pins) {
     gpio_init(p);
     gpio_set_dir(p, GPIO_IN);
     gpio_pull_up(p);
   }
+  // RESET is the exception: active HIGH (the board's pin table names it `RESET`,
+  // not `~RESET`). Pull DOWN, so a board on the bench with no MZ-800 attached
+  // reads "not in reset" instead of sitting in permanent reset. See
+  // fdc_poll_bus_reset().
+  gpio_init(RESET_PIN);
+  gpio_set_dir(RESET_PIN, GPIO_IN);
+  gpio_pull_down(RESET_PIN);
   // EXWAIT / INT — released (input; bus pull-up). We only drive low to assert.
   gpio_init(EXWAIT_PIN);
   gpio_set_dir(EXWAIT_PIN, GPIO_IN);
   gpio_set_slew_rate(EXWAIT_PIN, GPIO_SLEW_RATE_FAST);
   gpio_init(INT_PIN);
+  gpio_put(INT_PIN, 0); // park the output latch low: asserting = enabling the
+                        // driver (see assert_int_line()), releasing = Hi-Z
   gpio_set_dir(INT_PIN, GPIO_IN);
+  gpio_set_slew_rate(INT_PIN, GPIO_SLEW_RATE_FAST);
 
   // Data buffer gate (core1-controlled, NOT the PIO): start OFF (EN1=1),
   // direction=read (RD1=1) so we never touch the MZ-800 data bus until we
@@ -66,7 +76,7 @@ static void setup_bus_pio(void) {
 }
 
 static inline bool port_is_ours(uint8_t addr) {
-  return addr >= FDC_PORT_BASE && addr <= 0xDF;
+  return addr >= FDC_PORT_BASE && addr <= FDC_PORT_LAST;
 }
 
 // Listen loop: the PIO side-set only exposes the port address (EN0/address

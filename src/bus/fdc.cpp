@@ -40,8 +40,14 @@ struct FdcState {
   // Seek handshake core1 -> core0.
   volatile uint32_t op_seq = 0;  // bumped by core1 to request a physical move
   volatile uint32_t op_done = 0; // set == op_seq by core0 when finished
-  volatile uint8_t op_target = 0;
+  // Signed *relative* step count, not an absolute cylinder. A real WD steps the
+  // head by pulses and keeps the Track register as a separate belief about where
+  // the head is; a host recalibrating (write Track, step, READ ADDRESS to resync)
+  // relies on those two being independent. Deriving the target from S.track
+  // instead made a single STEP OUT slam the head across the disk.
+  volatile int16_t op_steps = 0;
   volatile bool op_restore = false;
+  volatile bool step_in = true; // last direction, for the bare STEP (0x2X/0x3X)
   volatile bool op_verify = false; // WD Type I Verify (V) bit on this command
 
   // Physical status core0 -> core1.
@@ -58,6 +64,7 @@ struct FdcState {
   volatile uint32_t pending_force_since_us = 0;
   volatile uint32_t last_data_read_us = 0;
   volatile bool multi = false; // multi-record read (auto-advance sectors)
+  volatile bool read_addr = false; // Type III READ ADDRESS in flight
   // Error/status flags for the current/last Type II op.
   volatile bool err_rnf = false;
   volatile bool err_crc = false;
@@ -172,12 +179,52 @@ struct FdcState {
   volatile uint8_t cmd_raw_hist[16] = {0};
   volatile uint8_t cmd_pos = 0;  // next slot
   volatile uint16_t cmd_count = 0;
+
+  // Full I/O trace ring: every register access in order, reads included, so the
+  // host's actual intent is visible instead of inferred from command opcodes.
+  // Runs of identical consecutive accesses are coalesced into a repeat count --
+  // without that, one STATUS poll loop (48k reads seen) flushes all history.
+  static constexpr uint8_t IO_TRACE_N = 96;
+  volatile uint8_t io_port[IO_TRACE_N] = {0};
+  volatile uint8_t io_val[IO_TRACE_N] = {0};  // byte as it appears on the bus
+  volatile uint8_t io_rd[IO_TRACE_N] = {0};   // 1 = read, 0 = write
+  volatile uint16_t io_rep[IO_TRACE_N] = {0}; // consecutive identical accesses
+  volatile uint8_t io_pos = 0;                // next slot to write
+  volatile uint8_t io_n = 0;                  // slots used (<= IO_TRACE_N)
+  volatile uint32_t io_total = 0;
+
+  // EINT: port 0xDF bit0, the card's interrupt-enable latch. Software must arm
+  // it before ~INT is ever driven -- see fdc_refresh_int_line().
+  volatile bool eint = false;
+  volatile uint32_t intrq_asserts = 0; // diagnostics: ~INT low transitions
+  volatile bool int_asserted = false;
+  // Type IV Force Interrupt with I3 (interrupt immediately, e.g. 0xD8): a
+  // one-shot INTRQ that is independent of DRQ. Cleared by a STATUS read or the
+  // next command write, per the WD spec.
+  volatile bool force_int_latched = false;
+  volatile uint32_t lost_data_events = 0;
 };
 
 FdcState S;
 FloppyDrive *DRV = nullptr;
 
 } // namespace
+
+// How the ~INT line (GPIO12) is driven:
+//   0 = never (escape hatch if interrupts misbehave)
+//   1 = follow EINT, the card's own enable latch on port 0xDF -- correct, and
+//       the default
+//   2 = force on, ignoring EINT (diagnostic only)
+// Override at runtime with `mzp_probe.py intmode <n>`.
+//
+// Mode 1 is safe precisely because of the EINT gate. An earlier build asserted
+// ~INT unconditionally and hung the MZ-800 mid-boot: GPIO12 is a direct
+// connection to expansion pin 38 (no buffer) and the Z80's INT input is LEVEL
+// sensitive, so interrupting code that has no floppy ISR re-enters 0x0038
+// forever. Software that never arms EINT (the boot ROM, CP/M 2.3) is now never
+// interrupted, which is how the real card behaves. Mode 2 reproduces the hang
+// on purpose and should stay a diagnostic.
+volatile uint8_t g_int_mode = 1;
 
 // Side-select inversion (see the 0xDD case). ON by default: this is the
 // MZ-800's measured behaviour, not a workaround -- with it off the machine
@@ -186,6 +233,70 @@ FloppyDrive *DRV = nullptr;
 volatile bool g_invert_side = true;
 
 namespace {
+
+// Record one register access. Values are stored exactly as they appear on the
+// bus (still complemented for 0xD8..0xDB); the probe tool applies the inversion
+// so the rule lives in one place.
+ALWAYS_INLINE void fdc_trace_io(uint8_t port, uint8_t val, uint8_t is_rd) {
+  S.io_total++;
+  uint8_t last = (uint8_t)((S.io_pos + FdcState::IO_TRACE_N - 1) %
+                           FdcState::IO_TRACE_N);
+  if (S.io_n && S.io_port[last] == port && S.io_val[last] == val &&
+      S.io_rd[last] == is_rd) {
+    if (S.io_rep[last] < 0xFFFF)
+      S.io_rep[last]++;
+    return;
+  }
+  S.io_port[S.io_pos] = port;
+  S.io_val[S.io_pos] = val;
+  S.io_rd[S.io_pos] = is_rd;
+  S.io_rep[S.io_pos] = 1;
+  S.io_pos = (uint8_t)((S.io_pos + 1) % FdcState::IO_TRACE_N);
+  if (S.io_n < FdcState::IO_TRACE_N)
+    S.io_n++;
+}
+
+// Re-drive ~INT from the current state. Idempotent, so every site that can
+// change DRQ / EINT / transfer state just calls this. Callable from either core:
+// gpio_oe_set/clr are write-1-to-modify, so there is no read-modify-write race.
+//
+// The condition is taken from the reference firmware's FDCDevice::isInterrupt():
+// the interrupt is DRQ-driven and gated by EINT -- asserted while a data byte is
+// pending during a transfer command, released when the host takes the byte,
+// writes a new command, or clears EINT. It is NOT a WD-style "INTRQ at command
+// completion", and a STATUS read does NOT release it.
+//
+// The EINT gate is what makes this safe: the boot ROM and CP/M 2.3 never write
+// 0xDF, so they never get interrupted -- which is exactly how a real card
+// behaves, and why driving ~INT unconditionally hung the machine.
+//
+// The line is driven UNCONDITIONALLY to match `want` on every call -- there is
+// deliberately no "already in that state, return early" short-circuit. Both
+// cores call this, and `int_asserted` is a plain flag, so a compare-and-skip is
+// a read-modify-write race: core0 raising DRQ and core1 draining it can
+// interleave such that the cached flag says "asserted" while the pin is Hi-Z
+// (interrupt silently lost), or worse the reverse -- ~INT stuck low with nothing
+// pending, which on a level-sensitive Z80 INT is a hard machine hang. The
+// gpio_oe_set/clr writes are atomic and idempotent, so re-driving costs one
+// store and removes the race entirely. `int_asserted` survives only to make the
+// diagnostic counter count edges rather than calls.
+ALWAYS_INLINE void fdc_refresh_int_line(void) {
+  bool enabled = (g_int_mode == 2) || (g_int_mode == 1 && S.eint);
+  // DRQ during a data transfer is the normal source. The Force-Interrupt (I3)
+  // latch is the only other one; a Type I completion does NOT interrupt on this
+  // card. Add `|| (S.writing && S.drq)` here when WRITE SECTOR lands (3.3).
+  bool want = enabled && ((S.reading && S.drq) || S.force_int_latched);
+  if (want) {
+    if (!S.int_asserted) {
+      S.int_asserted = true;
+      S.intrq_asserts++;
+    }
+    assert_int_line();
+  } else {
+    S.int_asserted = false;
+    release_int_line();
+  }
+}
 
 // core0-only "last applied" shadow (no volatile needed — single core).
 bool g_applied_select = false;
@@ -196,6 +307,8 @@ uint32_t g_motor_off_at = 0; // deferred motor-stop deadline (ms; 0 = none)
 
 // core0-only decode scratch (one sector) + streaming-capture state.
 uint8_t g_secbuf[FDC_SECTOR_MAX];
+uint8_t g_readaddr_id[6];     // last ID field found by READ ADDRESS
+bool g_readaddr_found = false;
 size_t g_flux_n = 0;         // bytes drained into the shared flux buffer so far
 bool g_stream_active = false; // an incremental capture is currently running
 
@@ -233,6 +346,20 @@ static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
 // errors). Do not reintroduce them: an implausible opcode from the ROM is a
 // bus-integrity symptom, so measure the bus first.
 static constexpr uint32_t FDC_FORCE_INT_DEFER_IDLE_US = 2000;
+
+// How long a DRQ may go unserviced before we declare LOST DATA and complete the
+// command. A real WD allows one byte time (~32 us at DD); we buffer the sector
+// so we can afford to be far more patient. Sized well above the slowest host
+// drain seen so far (the boot ROM polls STATUS every ~11 us) but short enough
+// that a host which never reads DATA at all recovers promptly instead of
+// deadlocking.
+static constexpr uint32_t FDC_DRQ_STALL_TIMEOUT_US = 250000;
+
+// DRQ window for READ ADDRESS. Long enough that any polling host notices DRQ and
+// takes all six ID bytes (the boot ROM polls STATUS every ~11 us), short enough
+// that a host which only wants the Sector register is not left waiting. A real
+// WD finishes the ID field in ~200 us; 2 ms is ten times that.
+static constexpr uint32_t FDC_READADDR_DRQ_WINDOW_US = 2000;
 
 // Synchronous (blocking) Verify: after a seek, confirm the target track really
 // has a matching ID field recorded on it. Uses the same fast incremental
@@ -296,7 +423,21 @@ static bool fdc_verify_track(uint8_t track) {
 // after a READ is ~285 ms (25k STATUS polls, see `rddiag`) and a revolution is
 // ~200 ms, so this window has to stay tight -- 1.25 revolutions left only ~7 ms
 // of headroom.
+// Highest cylinder the head may be driven to. Relative stepping is clamped here
+// so a runaway host cannot walk the head into the end stop.
+static constexpr int FDC_MAX_CYLINDER = 79;
+
 static constexpr size_t FDC_READ_CAPTURE_BYTES = 45700;
+// READ ADDRESS is on a MUCH tighter budget than READ SECTOR: measured, the
+// CP/M BIOS polls STATUS for only ~52 ms before Force Interrupt (vs the boot
+// ROM's ~285 ms for a sector read). It also only needs the NEXT ID field, and
+// one passes the head every ~13-22 ms, so search in chunks and stop the moment
+// an ID turns up rather than filling a fixed window. At ~190 flux bytes/ms,
+// 5000 bytes is ~26 ms -- one full sector period on a 9-sector track, so the
+// first chunk almost always finds one.
+static constexpr size_t FDC_READADDR_CHUNK_BYTES = 5000;
+static constexpr size_t FDC_READADDR_MAX_BYTES = 12000;
+static constexpr uint32_t FDC_READADDR_TIMEOUT_US = 40000;
 // Safety bound on the capture window (a revolution is ~200 ms).
 static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
 
@@ -309,10 +450,10 @@ static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
 // found. That is exactly what the previous decode-while-capturing loop did,
 // which is why `scan`/`streamscan`/`fdcread` (all capture-then-decode) worked
 // while the live read path returned RNF on a perfectly good disk.
-static void fdc_capture_window(void) {
+static void fdc_capture_window(size_t want_bytes) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
-  size_t want = (cap < FDC_READ_CAPTURE_BYTES) ? cap : FDC_READ_CAPTURE_BYTES;
+  size_t want = (cap < want_bytes) ? cap : want_bytes;
 
   g_flux_n = 0;
   uint32_t t0 = time_us_32();
@@ -329,6 +470,45 @@ static void fdc_capture_window(void) {
   }
   S.rd_capture_us = time_us_32() - t0;
   S.rd_flux_n = g_flux_n;
+}
+
+// READ ADDRESS: capture and search in chunks, returning as soon as any ID field
+// turns up. Flux arriving during a decode pass is lost (no DMA -- see
+// fdc_capture_window), but unlike READ SECTOR that is harmless here: a gap
+// costs at most one ID field and we simply match the next one. Bounded by both
+// a byte limit and a 40 ms deadline so we always answer inside the host's
+// ~52 ms patience.
+static bool fdc_read_address_search(uint8_t *id_out) {
+  size_t cap = 0;
+  uint8_t *flux = mzp_flux_buffer(&cap);
+  size_t limit = (cap < FDC_READADDR_MAX_BYTES) ? cap : FDC_READADDR_MAX_BYTES;
+
+  g_flux_n = 0;
+  uint32_t t0 = time_us_32();
+  g_stream_active = rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA);
+  S.rd_capture_ok = g_stream_active;
+  bool found = false;
+
+  if (g_stream_active) {
+    while (!found && g_flux_n < limit &&
+           (time_us_32() - t0) < FDC_READADDR_TIMEOUT_US) {
+      size_t target = g_flux_n + FDC_READADDR_CHUNK_BYTES;
+      if (target > limit)
+        target = limit;
+      // Tight drain, nothing in between.
+      while (g_flux_n < target &&
+             (time_us_32() - t0) < FDC_READADDR_TIMEOUT_US) {
+        g_flux_n = rp2040_flux_capture_drain(flux, limit, g_flux_n,
+                                             /*store_greaseweazle=*/false);
+      }
+      found = mfm_read_address(flux, g_flux_n, FDC_DD_BIT_US, id_out);
+    }
+    rp2040_flux_capture_stop();
+    g_stream_active = false;
+  }
+  S.rd_capture_us = time_us_32() - t0;
+  S.rd_flux_n = g_flux_n;
+  return found;
 }
 
 // On failure, report what IS on the track. "decoded 9 IDs numbered 1..9, host
@@ -400,6 +580,7 @@ void fdc_init(FloppyDrive *drive) { DRV = drive; }
 // ---- core1 (bus) hot path -------------------------------------------------
 
 RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
+  fdc_trace_io(addr, raw, 0);
   switch (addr) {
   case 0xD8: { // COMMAND (CPL'd on the bus)
     uint8_t cmd = (uint8_t)~raw;
@@ -413,24 +594,53 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     S.cmd_pos++;
     S.cmd_count++;
     S.cmd_gap_us = time_us_32() - S.last_ready_us; // diagnostic: see last_ready_us
+    // A new command clears any latched Force-Interrupt INTRQ (WD spec) and
+    // re-evaluates ~INT. Done before the decode below so a Type IV can re-arm it.
+    S.force_int_latched = false;
+    fdc_refresh_int_line(); // a new command releases ~INT (reference behaviour)
     if ((cmd & 0x80) == 0) {
       // ---- Type I (seek family) ----
       S.type2 = false; // STATUS reverts to the Type I layout
+      S.read_addr = false;
+      // The Track register is the WD's *belief*; the head position is physical
+      // and separate. Compute a relative step count here and update the Track
+      // register per the WD rules — core0 applies the motion to wherever the
+      // head actually is.
       uint8_t hi = cmd >> 4;
-      uint8_t tgt = S.track;
+      bool update = (cmd & 0x10) != 0; // WD 'u' bit (STEP / STEP IN / STEP OUT)
+      int steps = 0;
       bool restore = false;
-      if (hi == 0x0) { // RESTORE
+      switch (hi) {
+      case 0x0: // RESTORE: step out to TRK00, Track := 0
         restore = true;
-        tgt = 0;
-      } else if (hi == 0x1) { // SEEK (to Data register)
-        tgt = S.data;
-      } else if (hi == 0x4 || hi == 0x5) { // STEP IN
-        tgt = (uint8_t)(S.track + 1);
-      } else if (hi == 0x6 || hi == 0x7) { // STEP OUT
-        tgt = S.track ? (uint8_t)(S.track - 1) : 0;
+        S.track = 0;
+        break;
+      case 0x1: // SEEK: step (Data - Track) cylinders, Track := Data
+        steps = (int)S.data - (int)S.track;
+        S.track = S.data;
+        break;
+      case 0x2:
+      case 0x3: // STEP: repeat the last direction
+        steps = S.step_in ? +1 : -1;
+        if (update)
+          S.track = (uint8_t)(S.track + steps);
+        break;
+      case 0x4:
+      case 0x5: // STEP IN
+        steps = +1;
+        S.step_in = true;
+        if (update)
+          S.track = (uint8_t)(S.track + 1);
+        break;
+      case 0x6:
+      case 0x7: // STEP OUT
+        steps = -1;
+        S.step_in = false;
+        if (update)
+          S.track = (uint8_t)(S.track - 1);
+        break;
       }
-      // (bare STEP 0x2X/0x3X keeps the current track — matches reference)
-      S.op_target = tgt;
+      S.op_steps = (int16_t)steps;
       S.op_restore = restore;
       S.op_verify = (cmd & 0x04) != 0; // WD Type I Verify (V) bit
       S.busy = true;
@@ -452,14 +662,38 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
           S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
         S.busy = false;
         S.reading = false;
+        S.read_addr = false;
         S.drq = false;
         S.pending_force_int = false;
         S.pending_force_since_us = 0;
-        S.op_done = S.op_seq;
+        // NOTE: deliberately do NOT cancel a pending Type I move here (i.e. no
+        // `S.op_done = S.op_seq`). On a real WD the step pulse is already out
+        // the door before the CPU can write the Force Interrupt byte, so the
+        // head has moved and the Track register has been updated regardless.
+        // The CP/M BIOS positions the head with STEP-IN immediately followed by
+        // FORCE-INT; cancelling the move meant the head never left track 0, so
+        // READ ADDRESS always answered track 0, the BIOS stepped forever, and
+        // every READ SECTOR silently returned track 0 data.
+        // Force Interrupt still drops host-visible BUSY at once (above); core0
+        // finishes the motion and clears BUSY again, which is idempotent.
+      }
+      // Type IV interrupt conditions. Bit3 (I3) = interrupt immediately; the
+      // MZ-800 boot ROM uses 0xD8, i.e. it has been asking for INTRQ all along
+      // and merely polls as well. 0xD0 (no condition bits) terminates silently.
+      if (cmd & 0x08) {
+        // I3 = "interrupt immediately". Latch it: `want` in
+        // fdc_refresh_int_line() is otherwise DRQ-driven, and by this point the
+        // abort above has already cleared reading/drq, so without the latch the
+        // refresh call below could never assert and 0xD8 was a no-op. Still
+        // gated by EINT, so the boot ROM (which issues 0xD8 with no ISR and
+        // never arms EINT) is unaffected.
+        S.force_int_latched = true;
+        fdc_refresh_int_line();
       }
     } else if ((cmd & 0xC0) == 0x80) {
       // ---- Type II (sector data): 0x80..0xBF ----
       S.type2 = true;
+      S.read_addr = false;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.multi = (cmd & 0x10) != 0;
       if ((cmd & 0x20) == 0) {
@@ -472,6 +706,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.xfer_len = 0;
         S.xfer_pos = 0;
         S.rd_sector = S.sector;
+        S.rd_result = 0; // clear now: an abort must not leave a stale success
+        S.rd_want = S.sector;
         S.rd_fresh = true; // first sector of the command -> (re)capture flux
         S.busy = true;     // BUSY must appear at once (ROM's pre-loop times out)
         S.rd_issue_us = time_us_32();
@@ -486,12 +722,40 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.reading = false;
         S.busy = false;
       }
+    } else if ((cmd & 0xF0) == 0xC0) {
+      // ---- Type III READ ADDRESS (0xCX) ----
+      // Hand back the next ID field to pass the head as six bytes over DRQ:
+      // track, side, sector, size code, CRC1, CRC2. The CP/M BIOS uses this to
+      // work out which cylinder the head is actually on (STEP-IN/OUT then
+      // READ ADDRESS); returning nothing makes it step blindly and give up.
+      S.type2 = true;
+      S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
+      S.reading = true;
+      S.read_addr = true;
+      S.multi = false;
+      S.pending_force_int = false;
+      S.pending_force_since_us = 0;
+      S.drq = false;
+      S.xfer_len = 0;
+      S.xfer_pos = 0;
+      S.rd_result = 0x10; // READ ADDRESS marker, "no result yet"
+      S.rd_want = 0;
+      S.rd_ids_seen = 0;
+      S.rd_fresh = true;
+      S.busy = true;
+      S.rd_issue_us = time_us_32();
+      S.status_polls = 0;
+      S.status_last_us = S.rd_issue_us;
+      S.last_data_read_us = S.rd_issue_us;
+      S.rd_elapsed_us = 0;
+      S.rd_seq++;
     } else {
-      // ---- Type III (Read Address/Track, Write Track): 0xC0/0xE0/0xF0 ----
+      // ---- Type III READ TRACK / WRITE TRACK (0xEX/0xFX) ----
       // Milestone 3.4. Use the Type II status layout (not Type I) and complete
-      // benignly so the ROM doesn't hang polling BUSY.
+      // benignly so the host doesn't hang polling BUSY.
       S.type2 = true;
       S.reading = false;
+      S.read_addr = false;
       S.busy = false;
     }
     break;
@@ -548,7 +812,18 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       }
     }
     break;
-  case 0xDF: { // BUS TEST DATA (not CPL'd)
+  case 0xDF: { // EINT -- interrupt enable (not CPL'd). bit0: 1 = arm, 0 = disarm.
+    // Confirmed against the reference firmware's fdcWrite() case 7. The MZ-800
+    // boot ROM and CP/M 2.3 never touch this port, so EINT stays 0 and they are
+    // never interrupted; CP/M 4.1 writes 0x01 before each data command and 0x00
+    // after, which is how it drives an interrupt-capable (community) card.
+    S.eint = (raw & 0x01) != 0;
+    if (!S.eint)
+      S.force_int_latched = false; // disarming drops any pending one-shot too
+    fdc_refresh_int_line();
+
+    // Bus-test loopback bookkeeping shares this port. Harmless for EINT: the
+    // test program is only ever run standalone, never under CP/M.
     uint8_t expect = S.bt_last_rx;
     if (!S.bt_active) {
       S.bt_active = true;
@@ -586,12 +861,32 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
   }
 }
 
+RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr);
+
+// Thin tracing wrapper: every read is recorded with the byte actually driven,
+// so the trace shows what the host saw, not what we intended.
 RAM_FUNC uint8_t fdc_reg_read(uint8_t addr) {
+  uint8_t v = fdc_reg_read_inner(addr);
+  fdc_trace_io(addr, v, 1);
+  return v;
+}
+
+RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
   switch (addr) {
   case 0xD8:
     if (S.reading) { // measure the host's real BUSY/DRQ patience
       S.status_polls++;
       S.status_last_us = time_us_32();
+    }
+    // Deliberately no *DRQ* interrupt release here: on this card that one is
+    // cleared by taking the DATA byte, not by polling STATUS. Releasing it on a
+    // STATUS read would drop the interrupt before the ISR ever reached the
+    // transfer. A latched Force-Interrupt INTRQ *is* cleared by a STATUS read,
+    // which is the WD rule and is what stops a one-shot 0xD8 from holding the
+    // level-sensitive ~INT low forever.
+    if (S.force_int_latched) {
+      S.force_int_latched = false;
+      fdc_refresh_int_line();
     }
     return (uint8_t)~compose_status(); // STATUS (driven CPL'd)
   case 0xD9:
@@ -616,6 +911,7 @@ RAM_FUNC uint8_t fdc_reg_read(uint8_t addr) {
           S.busy = false;
           S.pending_force_int = false;
           S.pending_force_since_us = 0;
+          fdc_refresh_int_line();
           return (uint8_t)~b;
         }
         if (S.multi) {
@@ -626,9 +922,15 @@ RAM_FUNC uint8_t fdc_reg_read(uint8_t addr) {
           S.rd_seq++;
         } else {
           S.reading = false;
-          S.busy = false; // single-sector read complete
+          S.read_addr = false;
+          S.busy = false; // single-sector / READ ADDRESS complete
+          fdc_refresh_int_line();
         }
       }
+      // Taking the DATA byte is what clears the interrupt on this card. DRQ is
+      // still set for the next byte, so this re-arms rather than releases --
+      // matching the reference, where the ISR is woken once per byte.
+      fdc_refresh_int_line();
       return (uint8_t)~b; // DATA is CPL'd on the bus like the other WD registers
     }
     return (uint8_t)~S.data;
@@ -653,6 +955,24 @@ uint8_t fdc_debug_cmdlog(uint8_t *out_decoded, uint8_t *out_raw,
   *count = S.cmd_count;
   return n;
 }
+
+uint8_t fdc_iotrace_get(uint8_t idx, uint8_t *port, uint8_t *val, uint8_t *is_rd,
+                        uint16_t *rep) {
+  if (idx >= S.io_n)
+    return 0;
+  // Walk oldest -> newest: the ring's oldest entry sits at io_pos once full.
+  uint8_t start =
+      (S.io_n < FdcState::IO_TRACE_N) ? 0 : S.io_pos;
+  uint8_t k = (uint8_t)((start + idx) % FdcState::IO_TRACE_N);
+  *port = S.io_port[k];
+  *val = S.io_val[k];
+  *is_rd = S.io_rd[k];
+  *rep = S.io_rep[k];
+  return 1;
+}
+
+uint8_t fdc_iotrace_count(void) { return S.io_n; }
+uint32_t fdc_iotrace_total(void) { return S.io_total; }
 
 void fdc_debug_snapshot(FdcDebug *o) {
   o->status = compose_status();
@@ -695,6 +1015,11 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->rd_result = S.rd_result;
   o->status_polls = S.status_polls;
   o->status_span_us = S.status_last_us - S.rd_issue_us;
+  o->int_flags = (uint8_t)((S.eint ? 1 : 0) | (S.int_asserted ? 2 : 0) |
+                           (S.force_int_latched ? 4 : 0));
+  o->int_mode = g_int_mode;
+  o->intrq_asserts = S.intrq_asserts;
+  o->lost_data_events = S.lost_data_events;
   o->bt_active = S.bt_active ? 1 : 0;
   o->bt_last_rx = S.bt_last_rx;
   o->bt_last_echo = S.bt_last_echo;
@@ -707,6 +1032,12 @@ void fdc_debug_snapshot(FdcDebug *o) {
 
 void fdc_set_side_invert(bool on) { g_invert_side = on; }
 bool fdc_get_side_invert(void) { return g_invert_side; }
+
+void fdc_set_int_mode(uint8_t mode) {
+  g_int_mode = (mode > 2) ? 2 : mode;
+  fdc_refresh_int_line(); // apply immediately, including releasing in mode 0
+}
+uint8_t fdc_get_int_mode(void) { return g_int_mode; }
 
 void fdc_bustest_reset(void) {
   S.bt_active = false;
@@ -840,7 +1171,62 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
 
 // ---- core0 (disk) ---------------------------------------------------------
 
+// DISABLED pending investigation -- see the polarity warning below. Set to 1 to
+// re-enable. This is the only behavioural difference between the current tree
+// and the build that booted CP/M 4.1, so it is compiled out rather than deleted
+// while we bisect: with it off, the firmware is functionally equivalent to that
+// build (the other changes since -- FDC_PORT_LAST, the ~DS1 parking, the docs --
+// all resolve to the same runtime behaviour).
+#define FDC_RESET_POLL_ENABLED 0
+
+#if FDC_RESET_POLL_ENABLED
+// Bus reset (GPIO29, reported active HIGH -- unlike every other control line on
+// this board, and unlike the Z80's own /RESET. The board's pin table names it
+// `RESET`, not `~RESET`; bus_init() pulls it DOWN so an unconnected board (USB
+// bench use) reads "not in reset" rather than resetting forever.
+//
+// !! UNVERIFIED: "active high" describes the asserted level of a reset PULSE. It
+// does NOT establish the line's IDLE level, which is what this poller actually
+// depends on. If GPIO29 rests high while the machine runs normally, this fires
+// continuously and holds EINT cleared, silently killing every interrupt for an
+// interrupt-driven host (CP/M 4.1). Measure the resting level before re-enabling.
+//
+// Without this, a reset while ~INT was asserted was unrecoverable: EINT is a
+// latch in OUR state, the resetting host cannot clear it, and ~INT is a level
+// input straight to the Z80 (no buffer). The machine would come out of reset
+// into an immediate, permanent interrupt at 0x0038 with no ISR installed --
+// exactly the hang documented in fdc_set_int_mode(), but triggered by the reset
+// button rather than by mode 2. Disarming EINT and releasing the line is enough;
+// the transfer state is rebuilt by the next command anyway.
+//
+// Debounced over consecutive polls rather than acted on from one sample: this
+// runs on the core0 task loop with no synchroniser guarantees, and a spurious
+// EINT clear mid-transfer would silently break an interrupt-driven host.
+static void fdc_poll_bus_reset(void) {
+  static uint8_t high_polls = 0;
+  static bool in_reset = false;
+
+  if (gpio_get(RESET_PIN)) {
+    if (high_polls < 3)
+      high_polls++;
+    if (high_polls >= 3 && !in_reset) {
+      in_reset = true;
+      S.eint = false;
+      S.force_int_latched = false;
+      fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
+    }
+  } else {
+    high_polls = 0;
+    in_reset = false;
+  }
+}
+#endif // FDC_RESET_POLL_ENABLED
+
 void fdc_disk_task(void) {
+#if FDC_RESET_POLL_ENABLED
+  fdc_poll_bus_reset();
+#endif
+
   if (!S.active || !DRV)
     return; // idle until the MZ-800 talks to us (don't fight USB/gw drive use)
 
@@ -895,17 +1281,27 @@ void fdc_disk_task(void) {
   // Execute a pending physical seek.
   if (S.op_done != S.op_seq) {
     uint32_t seq = S.op_seq;   // snapshot
-    uint8_t target = S.op_target;
+    int steps = S.op_steps;
     bool restore = S.op_restore;
     bool verify = S.op_verify;
 
-    if (restore)
-      DRV->goto_track(0);
-    else
-      DRV->goto_track(target);
+    // Move relative to where the head physically is. Do NOT write S.track back
+    // from the physical position: the Track register is the host's belief and
+    // core1 has already updated it per the WD rules. Overwriting it here forced
+    // belief == reality, which is precisely the state a recalibrating host is
+    // trying to establish for itself via READ ADDRESS.
+    if (restore) {
+      DRV->goto_track(0); // steps out until TRK00
+    } else if (steps) {
+      int cur = DRV->track(); // -1 while the position is still unknown
+      int tgt = (cur < 0) ? 0 : cur + steps;
+      if (tgt < 0)
+        tgt = 0;
+      if (tgt > FDC_MAX_CYLINDER)
+        tgt = FDC_MAX_CYLINDER;
+      DRV->goto_track(tgt);
+    }
 
-    int t = DRV->track();
-    S.track = (t < 0) ? 0 : (uint8_t)t; // WD updates Track reg after the move
     S.at_track0 = DRV->get_track0_sense();
     S.write_protect = DRV->get_write_protect();
 
@@ -924,10 +1320,16 @@ void fdc_disk_task(void) {
     S.seek_error = verify ? !fdc_verify_track(S.track) : false;
 
     S.op_done = seq;
-    if (S.op_seq == seq) {
-      S.busy = false; // clear BUSY only if no newer command queued
+    // Clear BUSY only if this seek is still the active command. A newer Type I
+    // bumps op_seq; a newer Type II sets `reading` without touching op_seq —
+    // that second case is reachable now that Force Interrupt no longer cancels
+    // a pending move, so the host can queue STEP-IN / FORCE-INT / READ-ADDRESS
+    // and have the read start while the step is still executing. BUSY belongs
+    // to the read at that point, not to us.
+    if (S.op_seq == seq && !S.reading) {
+      S.busy = false;
       S.last_ready_us = time_us_32(); // diagnostic: gap until the next command
-
+      fdc_refresh_int_line();              // Type I complete
     }
   }
 
@@ -945,6 +1347,43 @@ void fdc_disk_task(void) {
       S.drq = false;
       S.pending_force_int = false;
       S.pending_force_since_us = 0;
+      fdc_refresh_int_line();
+    }
+
+    // LOST DATA. A real WD clocks the data field off the disk in real time and
+    // cannot wait: if the host does not take a DRQ'd byte within a byte time it
+    // sets LOST DATA and finishes the command regardless. We buffer the sector
+    // instead, so without this a host that never reads DATA deadlocks us --
+    // BUSY and DRQ held forever while it polls STATUS (observed: CP/M 4.1 stuck
+    // on READ ADDRESS at xfer=0/6 for 21 s). The budget here is far more
+    // generous than a real WD's ~32 us so a slow polling host is never punished;
+    // it exists only to guarantee forward progress.
+    // READ ADDRESS gets a much shorter budget than a sector read, because a host
+    // is entitled to ignore the six ID bytes entirely: the WD also loads the ID's
+    // track byte into the Sector register, so the usual idiom is "issue READ
+    // ADDRESS, wait for BUSY to clear, read Sector". A real WD clocks the ID
+    // field out in ~6 byte times (~200 us) and drops BUSY whether or not anyone
+    // took the bytes. Holding BUSY until a drain that never comes deadlocks that
+    // host -- observed as CP/M 4.1 looping RESTORE / READ ADDRESS forever, 27031
+    // STATUS polls per attempt and xfer=0/6 every time.
+    uint32_t drq_budget =
+        S.read_addr ? FDC_READADDR_DRQ_WINDOW_US : FDC_DRQ_STALL_TIMEOUT_US;
+    if (S.reading && S.drq && !S.pending_force_int &&
+        (time_us_32() - S.last_data_read_us) > drq_budget) {
+      // Completing an undrained READ ADDRESS is normal, not an error: do not
+      // raise LOST DATA there or a host that only wants the Sector register
+      // sees a spurious failure. A sector read that goes unread IS a real
+      // overrun, so that one keeps the flag.
+      if (!S.read_addr) {
+        S.lost_data = true;
+        S.lost_data_events++;
+      }
+      S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
+      S.reading = false;
+      S.read_addr = false;
+      S.busy = false;
+      S.drq = false;
+      fdc_refresh_int_line();
     }
 
     // The block above (or a Force Interrupt on core1) may have ended the read.
@@ -958,7 +1397,10 @@ void fdc_disk_task(void) {
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
       // sync -- a 1.25-revolution window contains every sector regardless of
       // where it starts, so waiting for index only adds latency.
-      fdc_capture_window();
+      if (S.read_addr)
+        g_readaddr_found = fdc_read_address_search(g_readaddr_id);
+      else
+        fdc_capture_window(FDC_READ_CAPTURE_BYTES);
       S.rd_fresh = false;
       // core1 can have aborted us while we were blocked capturing.
       if (!S.reading)
@@ -973,13 +1415,33 @@ void fdc_disk_task(void) {
 
       uint32_t t0 = time_us_32();
       SectorRead sd{};
-      if (g_flux_n > 0)
+      if (S.read_addr) {
+        // READ ADDRESS: the first ID field found, as six bytes over DRQ.
+        if (g_readaddr_found) {
+          sd.found = sd.has_data = sd.data_crc_ok = true;
+          sd.size = 6;
+          sd.cyl = g_readaddr_id[0];
+          sd.head = g_readaddr_id[1];
+          for (int k = 0; k < 6; ++k) {
+            g_secbuf[k] = g_readaddr_id[k];
+            S.rd_ids[k] = g_readaddr_id[k]; // surfaced by `rddiag`
+          }
+          S.rd_ids_seen = 6;
+          // WD quirk: READ ADDRESS also loads the track address byte into the
+          // Sector register. A host probing head position may read it there
+          // rather than from the data stream.
+          S.sector = g_readaddr_id[0];
+        }
+      } else if (g_flux_n > 0) {
         sd = mfm_read_sector(flux, g_flux_n, FDC_DD_BIT_US, want, g_secbuf,
                              sizeof(g_secbuf));
+      }
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;
       S.rd_result = (uint8_t)((sd.found ? 1 : 0) | (sd.has_data ? 2 : 0) |
                               (sd.data_crc_ok ? 4 : 0) | (sd.deleted ? 8 : 0));
+      if (S.read_addr)
+        S.rd_result |= 0x10; // mark the diagnostic as a READ ADDRESS result
 
       if (sd.found && sd.has_data) {
         uint16_t n = (sd.size <= FDC_SECTOR_MAX) ? sd.size : FDC_SECTOR_MAX;
@@ -991,19 +1453,35 @@ void fdc_disk_task(void) {
         S.rec_deleted = sd.deleted;
         S.err_rnf = false;
         // Publish DRQ last: it is the ownership handoff of xfer[] to core1.
-        if (S.reading && S.rd_seq == seq)
+        if (S.reading && S.rd_seq == seq) {
+          // Start the LOST DATA clock here, not at command issue: the host has
+          // had nothing to read until this moment.
+          S.last_data_read_us = time_us_32();
           S.drq = true;
+          // The card ORs DRQ into ~INT. This must run in EVERY mode, not just
+          // the diagnostic force-on mode 2: this is the ONE place the first
+          // DRQ of a sector is raised, so gating it on mode 2 meant an
+          // EINT-armed host (CP/M 4.1) never got the interrupt that starts the
+          // transfer -- it armed EINT, issued READ, and waited for an edge that
+          // only arrived if some later unrelated event happened to call
+          // refresh. fdc_refresh_int_line() applies the mode/EINT gate itself.
+          fdc_refresh_int_line();
+        }
         S.rd_done = seq;
         // Multi-record keeps the captured window: every remaining sector of
         // this track is already in it, so no re-capture is needed.
       } else {
         // Not on this track (or undecodable). Record what IS there, then RNF.
-        fdc_note_track_ids(flux, g_flux_n);
+        if (!S.read_addr)
+          fdc_note_track_ids(flux, g_flux_n);
+        else
+          S.rd_ids_seen = 0;
         S.err_rnf = true;
         S.drq = false;
         if (S.rd_seq == seq) {
           S.reading = false;
           S.busy = false;
+          fdc_refresh_int_line(); // WD raises INTRQ on an errored completion too
         }
         S.rd_done = seq;
         g_flux_n = 0;

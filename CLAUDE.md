@@ -125,8 +125,9 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Build system:** ✅ Pico-SDK + CMake, pico-sdk 2.2.0 submodule (done, Phase 1).
 
 ### Still open
-- **Decode `0xDC`–`0xDE` bits** (motor / drive-select / side / density) from the
-  ROM.
+- **Apply density to the DENSEL pin.** `0xDC`–`0xDF` bits are all decoded now
+  (see the register map in the spec), but `0xDE` is only latched — it does not
+  yet drive floppy pin 2 or pick the bit time. Deferred: MZ-800 media is DD.
 - **`~EXWAIT` budget** for putting a byte on the shared C0..C7 bus in time on a
   register access.
 - **WRITE SECTOR** in-place splice details (chosen approach) — timing/gap
@@ -167,11 +168,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   **streaming** MFM data-separator (flux → sectors with ID/CRC + rotational
   position) and encoder (sectors → flux, incl. in-place write-splice). Validate
   over USB (dump/patch a sector) before any MZ-800. No cache.
-- **Phase 3 (WD FDC + MZ-800 bus):** real-time WD179x bridge per
-  [docs/wd-fidelity.md](docs/wd-fidelity.md) — core1 register/bus side (adapt the
-  DELUXE-style `bus.hpp` to the shared C0..C7 scheme; inverted bus; polled DRQ;
-  `~INT`/`~EXWAIT`), core0 disk side. Refactor the reference `fdc.cpp` WD state
-  machine onto the streaming disk engine. Testable on real MZ-800 (its ROM has
-  floppy support — no boot loader needed).
-- **Phase 4 (robustness):** write-precomp if needed, density/`0xDC`–`0xDE`
-  decode, multi-drive, error handling.
+- **Phase 3 (WD FDC + MZ-800 bus): READ PATH DONE — CP/M 4.1 boots to the prompt
+  from a physical disk.** Real-time WD179x bridge per
+  [docs/wd-fidelity.md](docs/wd-fidelity.md); core1 register/bus side, core0 disk
+  side. Milestone detail in [docs/phase3-plan.md](docs/phase3-plan.md):
+  - 3.0 shared-bus bring-up ✅, 3.1 Type I + STATUS ✅, 3.2 READ SECTOR
+    single+multiple ✅, READ ADDRESS ✅, DRQ-driven EINT-gated `~INT` ✅.
+  - **3.3 WRITE SECTOR is the next milestone and the one real gap.** It is
+    currently a stub that reports *success* without writing — harmless when the
+    boot ROM was the only client, a data-loss trap now that CP/M can reach it.
+  - 3.4 leftovers: READ TRACK, WRITE TRACK (format), density applied to
+    `~DEN_RDY`, drive-select via `~DS0/DS1`.
+- **Phase 4 (robustness):** write-precomp if needed, multi-drive, error handling,
+  soak testing.

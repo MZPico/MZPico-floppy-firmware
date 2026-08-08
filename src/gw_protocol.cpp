@@ -1,6 +1,7 @@
 // greaseweazle command loop — ported from Adafruit_Floppy's greaseweazle.ino.
 // Serial (USB CDC) -> TinyUSB tud_cdc_*; Serial1 debug -> DBG() no-op;
 // millis()/yield() -> Pico-SDK time / tud_task(); floppy-> -> FloppyDrive.
+#include "hardware/gpio.h"
 #include "gw_protocol.hpp"
 
 #include "board_config.h"
@@ -61,6 +62,8 @@
 #define MZP_CMD_BUSTEST 0x8C // port-0xDF loopback + cycle-timing diagnostics
 #define MZP_CMD_RDDIAG 0x8D  // why the last Type II read succeeded / RNF'd
 #define MZP_CMD_SIDESWAP 0x8E // invert ROM side-select -> physical head
+#define MZP_CMD_INTMODE 0x8F  // how ~INT is driven: 0=off 1=INTRQ 2=INTRQ|DRQ
+#define MZP_CMD_IOTRACE 0x90  // ordered register-access trace (reads + writes)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -77,9 +80,16 @@
   } while (0)
 
 // ---- state ----
+// The last argument is `readypin`, and it is -1 by design, not an oversight.
+// ~DEN_RDY (GPIO13) is a single shared net carrying density-out AND ready-in, so
+// it cannot be sampled as an input while we drive density; PC drives do not
+// supply READY anyway. get_ready_sense() returns true unconditionally for
+// readypin < 0, which is the right answer for a PC drive. (This used to be
+// PIN_DS1 -- GPIO25, a drive-select *output* -- so ready-sense was reading back
+// our own select line.)
 static FloppyDrive g_drive(PIN_DENSITY, PIN_INDEX, PIN_SELECT, PIN_MOTOR,
                            PIN_DIR, PIN_STEP, PIN_WDATA, PIN_WGATE, PIN_TRK00,
-                           PIN_WPT, PIN_RDATA, PIN_HDSEL, PIN_DS1);
+                           PIN_WPT, PIN_RDATA, PIN_HDSEL, -1);
 static FloppyDrive *floppy = nullptr;
 
 static uint8_t cmd_buffer[32];
@@ -169,6 +179,18 @@ void gw_init() {
   // Bring up the drive GPIOs and hand the drive to the FDC bridge. The FDC disk
   // task stays idle until the MZ-800 first touches an FDC port, so it doesn't
   // conflict with greaseweazle/USB drive control when no machine is attached.
+  // Park the unused second drive-select HIGH (= deselected; ~DS1 is active low)
+  // BEFORE bringing the drive up. Nothing else touches GPIO25: FloppyDrive only
+  // knows about PIN_SELECT (= ~DS0). RP2040 pads power up as inputs with a
+  // pull-DOWN, so leaving this pin alone asserts ~DS1 permanently and a second
+  // drive answers alongside (or instead of) drive 0. This used to happen by
+  // accident -- PIN_DS1 was passed as FloppyDrive's `readypin`, whose
+  // init_in_pullup() parked it high as a side effect. That slot is now -1 (see
+  // the constructor above), so the parking has to be explicit.
+  gpio_init(PIN_DS1);
+  gpio_put(PIN_DS1, 1);
+  gpio_set_dir(PIN_DS1, GPIO_OUT);
+
   g_drive.begin();
   fdc_init(&g_drive);
 }
@@ -833,7 +855,8 @@ void gw_task() {
   else if (cmd == MZP_CMD_RDDIAG) {
     // [cmd, ACK, capture_ok, flux_n(4), capture_us(4), search_us(4),
     //  rd_elapsed_us(4), want, result, ids_seen, ids[16],
-    //  status_polls(4), status_span_us(4)]  -- 46 bytes.
+    //  status_polls(4), status_span_us(4),
+    //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4)] -- 56 bytes.
     FdcDebug d;
     fdc_debug_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -854,6 +877,13 @@ void gw_task() {
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
     }
+    reply_buffer[i++] = d.int_flags;
+    reply_buffer[i++] = d.int_mode;
+    const uint32_t n32[] = {d.intrq_asserts, d.lost_data_events};
+    for (uint32_t v : n32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
     cdc_write_all(reply_buffer, i);
   }
 
@@ -863,6 +893,36 @@ void gw_task() {
       fdc_set_side_invert(cmd_buffer[2] != 0);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = fdc_get_side_invert() ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_IOTRACE) {
+    // Header: ack, count, total(4). Then `count` x 5 bytes:
+    // port, value, is_read, rep_lo, rep_hi -- oldest first.
+    uint8_t n = fdc_iotrace_count();
+    uint32_t total = fdc_iotrace_total();
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = n;
+    for (int k = 0; k < 4; ++k)
+      reply_buffer[i++] = (uint8_t)(total >> (8 * k));
+    cdc_write_all(reply_buffer, i);
+    for (uint8_t k = 0; k < n; ++k) {
+      uint8_t rec[5];
+      uint16_t rep = 0;
+      if (!fdc_iotrace_get(k, &rec[0], &rec[1], &rec[2], &rep))
+        break;
+      rec[3] = (uint8_t)(rep & 0xFF);
+      rec[4] = (uint8_t)(rep >> 8);
+      cdc_write_all(rec, 5);
+    }
+  }
+
+  else if (cmd == MZP_CMD_INTMODE) {
+    // cmd_buffer[2]: 0/1/2 = set the ~INT drive mode, 0xFF = query only.
+    if (cmd_buffer[2] <= 2)
+      fdc_set_int_mode(cmd_buffer[2]);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_int_mode();
     cdc_write_all(reply_buffer, i);
   }
 

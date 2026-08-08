@@ -57,3 +57,13 @@ SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
 // found anywhere in `flux`.
 bool mfm_verify_track(const uint8_t *flux, size_t n_flux,
                       float nominal_bit_time_us, uint8_t want_cyl);
+
+// WD Type III READ ADDRESS primitive: return the *first* ID field found in
+// `flux` (whatever sector it belongs to), as the six bytes a real WD179x hands
+// the host over DRQ -- track, side, sector, size code, CRC1, CRC2. The CRC
+// bytes are the ones actually recorded on the disk, not a recomputation, so a
+// host that checks them sees what the chip would have given it. `out` must have
+// room for 6 bytes. Returns false if no ID field with a valid CRC was found
+// (-> Record Not Found).
+bool mfm_read_address(const uint8_t *flux, size_t n_flux,
+                      float nominal_bit_time_us, uint8_t *out);

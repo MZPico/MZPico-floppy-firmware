@@ -82,13 +82,12 @@ BUSY-polling covers latency instead, per the ROM driver).
   with a 300 ms pre-sleep), and a motor-off delay keeps it spinning between the
   ROM's retries. `fdc.{cpp,hpp}`; probe cmds `fdcdump`/`fdclog`/`fdcseek`. No
   INTRQ yet — the ROM polls STATUS for Type I.
-- **3.2 — READ SECTOR (single + multiple). ✅ READ PATH hardware-verified — the
-  MZ-800 loads and starts CP/M from a physical disk.** Not "boots cleanly":
-  CP/M's own BIOS then reports `Read/Write Error (Abort/Retry/Ignore)` before
-  reaching the prompt. That is a *different client* — everything verified here
-  is the boot ROM's `RESTORE → SEEK → READ-SEC(M) → FORCE-INT` path; the BIOS
-  drives the FDC itself afterwards and exercises paths we have not implemented
-  (see 3.3/3.4). On a Type II read (0x8X/0x9X)
+- **3.2 — READ SECTOR (single + multiple). ✅ DONE (hardware-verified) — CP/M 4.1
+  boots to the prompt from a physical disk.** Getting there took three things
+  beyond the read engine itself: READ ADDRESS (3.4), the LOST DATA / undrained
+  DRQ timeouts below, and working interrupts (see "Interrupts" below) — the BIOS
+  is a different client from the boot ROM and exercises all three. On a Type II
+  read (0x8X/0x9X)
   core1 sets BUSY at once and hands core0 a request; core0 captures a bounded
   flux window and decodes the requested sector by ID via `mfm_read_sector()`,
   publishing it to a one-sector transfer buffer and raising **DRQ**. core1
@@ -108,22 +107,56 @@ BUSY-polling covers latency instead, per the ROM driver).
     times over **~285 ms** after a READ before issuing Force Interrupt — one
     poll every 11.4 µs, a ~40 T-state Z80 loop. Capture ~215 ms + decode ~2 ms
     fits, but not by much; this is the constraint that sizes the window.
+  - **Undrained DRQ must time out.** We buffer a whole sector, so unlike a real
+    WD we *can* wait forever — and a host that is entitled to ignore the bytes
+    then deadlocks us with BUSY+DRQ held. Two budgets: a sector read that goes
+    unread is a real overrun (raise LOST DATA), while an undrained READ ADDRESS
+    is normal and must complete silently — the WD also loads the ID's track byte
+    into the Sector register, so "issue READ ADDRESS, wait for BUSY, read Sector"
+    is a legitimate idiom. Observed before this: CP/M 4.1 looping RESTORE /
+    READ ADDRESS forever, 27031 STATUS polls per attempt, xfer=0/6 every time.
   - Diagnostics: `rddiag` reports capture bytes/time, decode time, the sector
-    IDs actually present on the track when a read RNFs, and the host's poll
-    count and span.
+    IDs actually present on the track when a read RNFs, the host's poll count
+    and span, `~INT` state (mode / EINT armed / line asserted / assert count),
+    and LOST DATA events.
+
+- **Interrupts. ✅ DONE (hardware-verified — this is what got CP/M 4.1 to the
+  prompt).** `~INT` is DRQ-driven and EINT-gated, not WD INTRQ-driven; the full
+  model, the clearing rules, and why the EINT gate is a safety requirement are
+  in [wd-fidelity.md](wd-fidelity.md#interrupts--drq-driven-not-intrq-driven).
+  Three things had to be right at once:
+  - The refresh call next to the **first DRQ of a sector** must run in every
+    mode. It was gated on the diagnostic force-on mode, so an EINT-armed host
+    armed, issued READ, and waited for an edge that never came.
+  - The refresh helper must **drive the line unconditionally**, with no
+    "already in that state" short-circuit. Both cores call it; a compare-and-skip
+    on a plain flag is a read-modify-write race whose bad direction is `~INT`
+    stuck low with nothing pending = hard machine hang.
+  - **Bus RESET** (GPIO29, active **high** — the one active-high control line)
+    must disarm EINT. It is a latch in our state; a resetting host cannot clear
+    it, so a reset mid-interrupt otherwise brought the machine back up into a
+    permanent one.
 - **3.3 — WRITE SECTOR (in-place splice).** Locate the sector by ID (streaming
   decode), then WGATE + write the MFM-encoded data field in the ~22-byte Gap 2
   window (~700 µs slack). Test: MZ-800 writes a file; read back (host `gw`/scan).
-  **Currently a stub** that clears BUSY with no DRQ and no error bits. Its
-  comment ("the MZ-800 boot/directory path never writes, so completing benignly
-  is safe for now") was written when the boot ROM was the only client — CP/M's
-  BIOS is not bound by that, and a silent no-op write is a prime suspect for the
-  BIOS-level error above.
-- **3.4 — Type III / format / density / multi-drive.** READ ADDRESS, READ TRACK,
-  WRITE TRACK (format), density via `~DEN_RDY`, drive-select via `~DS0/DS1`.
-  Also a stub today. **READ ADDRESS (0xC0) is the one to prioritise** — CP/M
-  BIOSes commonly use it to confirm head position or probe sector layout, and
-  the second suspect for the BIOS-level error.
+  **Currently a stub, and now the top priority.** It clears BUSY with no DRQ and
+  no error bits — i.e. it reports *success*. That was defensible when the boot
+  ROM was the only client (it never writes), but CP/M 4.1 now boots to a prompt
+  and can write: every file write silently does nothing while the host believes
+  it worked. Until the real splice lands, the stub should **fail honestly**
+  (set WRITE PROTECT in STATUS for Type II writes) so CP/M reports an error
+  instead of corrupting its in-RAM view of the disk.
+- **3.4 — Type III / format / density / multi-drive.**
+  - **READ ADDRESS (0xCX). ✅ DONE (hardware-verified).** Returns the first ID
+    field in the captured flux as the six bytes a real WD hands over DRQ —
+    track, side, sector, size code, CRC1, CRC2 — using the CRC bytes actually
+    recorded on the disk, not a recomputation, so a host that checks them sees
+    what the chip would have given it. Also loads the ID's track byte into the
+    Sector register (WD quirk; the CP/M BIOS reads head position from there).
+    This is what stopped the BIOS stepping blindly and giving up.
+  - **Still to do:** READ TRACK, WRITE TRACK (format), density applied to
+    `~DEN_RDY` (decoded already — see wd-fidelity.md), drive-select via
+    `~DS0/DS1`.
 - **3.5 — Robustness.** Error/retry paths, write precomp if inner tracks are
   marginal, edge-case timing, soak testing.
 

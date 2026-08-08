@@ -128,6 +128,40 @@ SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
   return r; // .found == false -> Record Not Found
 }
 
+bool mfm_read_address(const uint8_t *flux, size_t n_flux,
+                      float nominal_bit_time_us, uint8_t *out) {
+  mfm_io_t io;
+  memset(&io, 0, sizeof(io));
+  io.pulses = const_cast<uint8_t *>(flux);
+  io.n_pulses = n_flux;
+  io.pos = 0;
+  io.T1_nom = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 1e-6f);
+  io.T2_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 2.5e-6f);
+  io.T3_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 3.5e-6f);
+
+  while (!mfm_io_eof(&io)) {
+    if (!skip_triple_sync_mark(&io))
+      break;
+
+    uint8_t mark = 0;
+    uint8_t idam[mfm_io_idam_size];
+    uint8_t crcbuf[mfm_io_crc_size];
+    uint16_t crc = receive_crc(&io, &mark, (size_t)1, idam, (size_t)sizeof(idam),
+                               crcbuf, (size_t)sizeof(crcbuf), (uint8_t *)NULL);
+    if (mark != MFM_IO_IDAM || crc != 0)
+      continue; // not an ID field, or its CRC is bad -> keep looking
+
+    out[0] = idam[0]; // track
+    out[1] = idam[1]; // side
+    out[2] = idam[2]; // sector
+    out[3] = idam[3]; // size code N
+    out[4] = crcbuf[0];
+    out[5] = crcbuf[1];
+    return true;
+  }
+  return false;
+}
+
 bool mfm_verify_track(const uint8_t *flux, size_t n_flux,
                       float nominal_bit_time_us, uint8_t want_cyl) {
   mfm_io_t io;

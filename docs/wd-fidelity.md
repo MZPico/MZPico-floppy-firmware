@@ -39,12 +39,50 @@ Ports (see `MZ2Z046.ASM` ~line 258):
 | `0xD9` | Track | Track | |
 | `0xDA` | Sector | Sector | |
 | `0xDB` | Data | Data | sector data streams here |
-| `0xDC` | — | Motor | motor on/off (`OUT (MO_REG),A`, ~line 7626) |
-| `0xDD` | — | Page | FD-I/F control — **bit meaning TBD** |
-| `0xDE` | — | Density | single/double density select — **bits TBD** |
+| `0xDC` | — | Motor/Drive | b7 = motor on, b1..0 = drive select |
+| `0xDD` | — | Page/Side | b0 = side (see the inversion note below) |
+| `0xDE` | — | Density | b0: 1 = HD, 0 = DD; drives floppy pin 2 (DENSEL) |
+| `0xDF` | — | EINT | b0 = 1 arms the card's interrupt, 0 disarms |
 
-**Drive-select / side-select / motor bit assignments in `0xDC`–`0xDE` still need
-bit-level decode from the ROM** (a Phase-3 detail). The core WD is `0xD8`–`0xDB`.
+`0xD8`–`0xDB` are the WD registers proper and are bus-inverted (see below);
+`0xDC`–`0xDF` are the card's own latches and are **not** inverted.
+
+**Side-select is inverted.** The ROM's side 0 is physical head 1. The ROM writes
+`0xFF`/`0xFE` after a `CPL`, so bit0 *low* is its side 1; on top of that the
+card drives HDSEL inverted relative to the PC/Shugart convention. Confirmed by
+booting CP/M: every MZ-800 CP/M image carries its 16×256 IPL track on
+cyl0/head1 as a PC reads it. Runtime-togglable for A/B testing via
+`mzp_probe.py sideswap`.
+
+**Density is decoded but not yet applied** — `0xDE` is latched and reported, but
+not wired to the DENSEL pin and not used to pick the bit time. MZ-800 media is
+DD throughout, so nothing depends on it today.
+
+## Interrupts — DRQ-driven, not INTRQ-driven
+
+This card does **not** follow the WD "INTRQ at command completion" model. `~INT`
+(GPIO12) is driven from **DRQ**, gated by the EINT latch on `0xDF`:
+
+- Asserted while a data byte is pending during a transfer command.
+- Cleared by the host **reading DATA** (`0xDB`) — *not* by polling STATUS.
+  Releasing on a STATUS read would drop the interrupt before the ISR ever
+  reached the transfer.
+- Also released by a new command write, or by EINT going to 0.
+- Type IV Force Interrupt with **I3** (`0xD8`) latches a separate one-shot
+  INTRQ, cleared by a STATUS read or the next command — the one place the WD
+  rule does apply.
+
+The EINT gate is what makes this safe. `~INT` goes straight to expansion pin 38
+with no buffer, and the Z80's INT input is **level** sensitive: asserting it for
+a host with no floppy ISR re-enters `0x0038` forever and hangs the machine. The
+boot ROM and CP/M 2.3 never write `0xDF`, so they are never interrupted; CP/M
+4.1 writes `0x01` before each data command and `0x00` after, and boots.
+
+`~INT` is driven **open-drain** (pull low to assert, Hi-Z to release) so we never
+fight another device on the shared INT line. Bus RESET (GPIO29, **active high**)
+disarms EINT and releases the line — EINT is a latch in our state that a
+resetting host cannot clear, so without that a reset during an interrupt brought
+the machine back up into a permanent one.
 
 ## Inverted data bus — mandatory
 
@@ -139,8 +177,9 @@ IRQ only on core0, so core1 keeps servicing the MZ-800 during a read.
 
 ## Open items
 
-- Decode `0xDC`–`0xDE` bit assignments (motor/drive-select/side/density) from the
-  ROM.
+- ~~Decode `0xDC`–`0xDE` bit assignments~~ — ✅ done, see the register map above.
+  `0xDE` is decoded but not yet applied to the DENSEL pin (deferred: MZ-800
+  media is DD).
 - Confirm whether any bus wait is inserted on register access by the FD-I/F, and
   the exact `~EXWAIT` timing budget for putting a byte on the shared C0..C7 bus.
 - Write-back for WRITE SECTOR: in-place splice (chosen) vs. any fallback.

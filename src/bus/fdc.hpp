@@ -9,9 +9,15 @@
 //                  BUSY. This is the async model: long physical latency never
 //                  stalls the Z80 (~EXWAIT covers only the µs register access).
 //
-// Type I only here (RESTORE/SEEK/STEP/STEP-IN/STEP-OUT) + Force Interrupt. The
-// ROM paces Type I by polling STATUS (waits `status & 0x81 == 0` = ready & not
-// busy), so no INTRQ is needed yet. Type II/III (sector data) arrive in 3.2.
+// Type I (RESTORE/SEEK/STEP/STEP-IN/STEP-OUT), Type II (READ SECTOR), Type III
+// (READ ADDRESS) and Type IV (Force Interrupt).
+//
+// The boot ROM and CP/M 2.3 pace everything by polling STATUS (waiting for
+// `status & 0x81 == 0` = ready & not busy), which is why this worked for a long
+// time with ~INT left undriven. It is not enough in general: CP/M 4.1 waits on
+// the interrupt and freezes without it, and even the boot ROM's Force Interrupt
+// is 0xD8 -- bit3 (I3) set, i.e. "interrupt immediately". INTRQ is now driven;
+// see fdc_set_int_mode() for the wiring question it leaves open.
 #pragma once
 #include <cstdint>
 
@@ -72,6 +78,13 @@ struct FdcDebug {
   // The host's measured BUSY/DRQ patience after a READ command.
   uint32_t status_polls;    // STATUS reads since the READ was issued
   uint32_t status_span_us;  // READ command -> most recent STATUS read
+  // ~INT state. Without these an interrupt-driven host that hangs is a dead
+  // end: you cannot tell "EINT never armed" from "armed but we never asserted"
+  // from "asserted and the host never came back for the byte".
+  uint8_t int_flags;        // b0 eint b1 line asserted b2 force-int latched
+  uint8_t int_mode;         // the active fdc_set_int_mode() setting
+  uint32_t intrq_asserts;   // ~INT Hi-Z -> low transitions this session
+  uint32_t lost_data_events; // DRQ'd sectors the host never drained
   // Bus test on port 0xDF: write incrementing bytes, read transformed echo.
   uint8_t bt_active;
   uint8_t bt_last_rx;
@@ -81,6 +94,15 @@ struct FdcDebug {
   uint16_t bt_err_count;
 };
 void fdc_debug_snapshot(FdcDebug *out);
+
+// Ordered I/O trace (see the io_* ring in fdc.cpp). Entries run oldest ->
+// newest; `rep` counts coalesced consecutive identical accesses, so a STATUS
+// poll loop shows up as one entry with a large repeat rather than flooding the
+// ring. Values are raw bus bytes -- still complemented for 0xD8..0xDB.
+uint8_t fdc_iotrace_count(void);
+uint32_t fdc_iotrace_total(void);
+uint8_t fdc_iotrace_get(uint8_t idx, uint8_t *port, uint8_t *val,
+                        uint8_t *is_rd, uint16_t *rep);
 
 // Detailed port-0xDF loopback diagnostics. `err_gap` vs `err_garbage` is the
 // key split: a gap means whole I/O cycles were lost (the bytes we did capture
@@ -127,6 +149,13 @@ void fdc_bustest_snapshot(FdcBusTest *out);
 // reflash. Takes effect on the ROM's next write to port 0xDD.
 void fdc_set_side_invert(bool on);
 bool fdc_get_side_invert(void);
+
+// How ~INT (GPIO12) is driven: 0 = never, 1 = INTRQ at command completion (WD
+// default), 2 = INTRQ | DRQ for a card that ORs both onto the Z80 interrupt.
+// Switchable because the MZ-800 floppy card's wiring of the WD's two separate
+// INTRQ/DRQ pins is not known from the ROM alone.
+void fdc_set_int_mode(uint8_t mode);
+uint8_t fdc_get_int_mode(void);
 
 // Reset bus-test counters/state (port 0xDF loopback test). Also clears the
 // bus-level per-port counters and cycle telemetry (bus_diag_reset).
