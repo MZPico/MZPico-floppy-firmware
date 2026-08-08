@@ -355,8 +355,8 @@ def fdc_line(r):
 def do_rddiag(s):
     s.write(bytes([MZP_CMD_RDDIAG, 2]))
     s.flush()
-    r = read_exact(s, 60)
-    if len(r) < 60 or r[1] != 0:
+    r = read_exact(s, 66)
+    if len(r) < 66 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
 
@@ -371,6 +371,7 @@ def do_rddiag(s):
     int_flags, int_mode = r[46], r[47]
     intrq_asserts, lost_data_events = u32(48), u32(52)
     write_attempts = u32(56)
+    verify_start_ok, verify_n, seek_error = r[60], u32(61), r[65]
 
     found = bool(result & 1)
     is_readaddr = bool(result & 0x10)
@@ -425,6 +426,13 @@ def do_rddiag(s):
               "polls (the boot ROM and CP/M 2.3 never write 0xDF), or the "
               "interrupt path is broken. 'now=idle' alone proves neither -- "
               "CP/M 4.1 clears EINT after each command.")
+    print(f"  verify  : last Type I Verify started={verify_start_ok}  "
+          f"{verify_n} flux bytes  (~{verify_n / 43500:.2f} revolutions)  "
+          f"seek_error={seek_error}")
+    if seek_error:
+        print("            ^ SEEK ERROR is latched: Verify found no ID field "
+              "matching the target cylinder. The boot ROM stops here and "
+              "reports a loading error WITHOUT ever issuing a READ.")
     if write_attempts:
         print(f"  WRITES  : {write_attempts} WRITE SECTOR command(s) REFUSED "
               f"with WRITE PROTECT -- 3.3 is not implemented yet")

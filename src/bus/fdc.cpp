@@ -338,6 +338,16 @@ static bool wait_for_index_falling_edge_ms(uint32_t timeout_ms) {
 }
 
 // Type-I Verify can tolerate a longer pre-capture wait.
+// One disk revolution is ~43.5k flux transitions at DD (measured with `scan`).
+// Capture ~1.05 revolutions: enough that every sector passes the head once,
+// with a small margin for spindle-speed variation. The host's measured patience
+// after a READ is ~285 ms (25k STATUS polls, see `rddiag`) and a revolution is
+// ~200 ms, so this window has to stay tight -- 1.25 revolutions left only ~7 ms
+// of headroom. Used by both the Type II read window and the Type I Verify pass.
+static constexpr size_t FDC_READ_CAPTURE_BYTES = 45700;
+// Safety bound on any capture window (a revolution is ~200 ms).
+static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
+
 static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
 // NOTE: a set of "ROM bring-up workarounds" used to live here -- command
 // aliases 0x14->0x94 and 0x58->0xD8, a relaxed Verify seek-error gate, an
@@ -386,19 +396,33 @@ static bool fdc_verify_track(uint8_t track) {
     S.verify_n = 0;
     return false;
   }
+  // Capture a bounded window with NOTHING between drains, then decode once.
+  //
+  // This loop used to call mfm_verify_track() after every drain, i.e. it
+  // decoded *while* capturing -- the exact anti-pattern fdc_capture_window()
+  // exists to prevent. The PIO FIFO holds ~24 us of flux and has no DMA, so any
+  // decode between drains drops transitions, MFM sync never re-locks, and the
+  // rest of the window is unusable. It was also O(n^2): every drain re-decoded
+  // the whole buffer from the start, so the passes got longer as the buffer
+  // grew and the flux loss got worse the longer it ran.
+  //
+  // That made Verify a coin flip -- it only succeeded when a matching ID landed
+  // in the first drain or two, before the decode passes got long enough to
+  // corrupt the stream. Failing Verify sets SEEK ERROR, and the boot ROM stops
+  // there and reports a loading error without ever issuing a READ.
+  //
+  // The old loop also had no timeout: its only exit was `n < cap`, so a drive
+  // producing no transitions at all (motor not up to speed, no disk) left it
+  // spinning forever with BUSY held.
+  size_t want = (cap < FDC_READ_CAPTURE_BYTES) ? cap : FDC_READ_CAPTURE_BYTES;
   size_t n = 0;
-  bool ok = false;
-  while (n < cap) {
-    size_t new_n = rp2040_flux_capture_drain(flux, cap, n, false);
-    if (new_n > n) {
-      n = new_n;
-      if (mfm_verify_track(flux, n, FDC_DD_BIT_US, track)) {
-        ok = true;
-        break;
-      }
-    }
-  }
+  uint32_t t0 = time_us_32();
+  while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US)
+    n = rp2040_flux_capture_drain(flux, want, n, /*store_greaseweazle=*/false);
+  rp2040_flux_capture_stop();
+
   S.verify_n = (uint32_t)n;
+  bool ok = (n > 0) && mfm_verify_track(flux, n, FDC_DD_BIT_US, track);
 
   if (!ok && n > 0) {
     // Compatibility fallback for ROM bring-up: some media/boot tracks can carry
@@ -417,21 +441,12 @@ static bool fdc_verify_track(uint8_t track) {
     }
   }
 
-  rp2040_flux_capture_stop();
-  return ok;
+  return ok; // capture already stopped above, before the decode
 }
 
-// One disk revolution is ~43.5k flux transitions at DD (measured with `scan`).
-// Capture ~1.05 revolutions: enough that every sector passes the head once,
-// with a small margin for spindle-speed variation. The host's measured patience
-// after a READ is ~285 ms (25k STATUS polls, see `rddiag`) and a revolution is
-// ~200 ms, so this window has to stay tight -- 1.25 revolutions left only ~7 ms
-// of headroom.
 // Highest cylinder the head may be driven to. Relative stepping is clamped here
 // so a runaway host cannot walk the head into the end stop.
 static constexpr int FDC_MAX_CYLINDER = 79;
-
-static constexpr size_t FDC_READ_CAPTURE_BYTES = 45700;
 // READ ADDRESS is on a MUCH tighter budget than READ SECTOR: measured, the
 // CP/M BIOS polls STATUS for only ~52 ms before Force Interrupt (vs the boot
 // ROM's ~285 ms for a sector read). It also only needs the NEXT ID field, and
@@ -442,8 +457,6 @@ static constexpr size_t FDC_READ_CAPTURE_BYTES = 45700;
 static constexpr size_t FDC_READADDR_CHUNK_BYTES = 5000;
 static constexpr size_t FDC_READADDR_MAX_BYTES = 12000;
 static constexpr uint32_t FDC_READADDR_TIMEOUT_US = 40000;
-// Safety bound on the capture window (a revolution is ~200 ms).
-static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
 
 // Capture a bounded flux window with NOTHING between drains, then stop.
 //

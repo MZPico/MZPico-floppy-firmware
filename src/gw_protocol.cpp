@@ -857,7 +857,7 @@ void gw_task() {
     //  rd_elapsed_us(4), want, result, ids_seen, ids[16],
     //  status_polls(4), status_span_us(4),
     //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4),
-    //  write_attempts(4)] -- 60 bytes.
+    //  write_attempts(4), verify_start_ok, verify_n(4), seek_error] -- 66 bytes.
     FdcDebug d;
     fdc_debug_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -886,6 +886,14 @@ void gw_task() {
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
     }
+    // Type I Verify: a failed Verify sets SEEK ERROR and the boot ROM stops
+    // there without ever issuing a READ, so a read-only diagnostic cannot see
+    // why. start_ok/n separate "capture never started" from "captured plenty
+    // and genuinely found no matching ID".
+    reply_buffer[i++] = d.verify_start_ok;
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.verify_n >> (8 * k)) & 0xFF;
+    reply_buffer[i++] = (uint8_t)((d.status & 0x10) ? 1 : 0); // SEEK ERROR
     cdc_write_all(reply_buffer, i);
   }
 
