@@ -409,15 +409,22 @@ def do_rddiag(s):
     if abort_us:
         print(f"  aborted by Force Interrupt after {abort_us / 1000:.1f} ms")
 
+    # `state` is a SNAPSHOT of this instant; `asserts` is cumulative since the
+    # Pico powered up. Do not read "EINT clear" as "this host never arms it":
+    # CP/M 4.1 writes 0x01 to 0xDF before each data command and 0x00 after, so
+    # any sample taken between commands sees it clear. The assert count is the
+    # only trustworthy evidence of whether interrupts are actually happening.
     mode_name = {0: "off", 1: "EINT-gated", 2: "forced"}.get(int_mode, "?")
-    istate = " ".join(n for b, n in ((1, "EINT"), (2, "~INT-low"),
+    istate = " ".join(n for b, n in ((1, "EINT-armed"), (2, "~INT-low"),
                                      (4, "force-int-latched"))
                       if int_flags & b) or "idle"
-    print(f"  ~INT    : mode={int_mode} ({mode_name})  state={istate}  "
-          f"{intrq_asserts} asserts")
-    if int_mode == 1 and not (int_flags & 1):
-        print("            ^ EINT never armed -> this host is polling, not "
-              "interrupt-driven (boot ROM / CP/M 2.3 do this)")
+    print(f"  ~INT    : mode={int_mode} ({mode_name})  now={istate}  "
+          f"{intrq_asserts} asserts since power-up")
+    if int_mode == 1 and intrq_asserts == 0:
+        print("            ^ ~INT has NEVER asserted. Either every host so far "
+              "polls (the boot ROM and CP/M 2.3 never write 0xDF), or the "
+              "interrupt path is broken. 'now=idle' alone proves neither -- "
+              "CP/M 4.1 clears EINT after each command.")
     if write_attempts:
         print(f"  WRITES  : {write_attempts} WRITE SECTOR command(s) REFUSED "
               f"with WRITE PROTECT -- 3.3 is not implemented yet")
