@@ -70,6 +70,10 @@ struct FdcState {
   volatile bool err_crc = false;
   volatile bool lost_data = false;
   volatile bool rec_deleted = false; // matched a deleted-DAM (0xF8)
+  // Set by the WRITE SECTOR stub so a write fails visibly instead of silently
+  // doing nothing. Remove with the stub in 3.3.
+  volatile bool err_write_protect = false;
+  volatile uint32_t write_attempts = 0; // diagnostics: writes we refused
   // One-sector transfer buffer. core0 fills it and raises `drq`; core1 hands the
   // bytes to the host on DATA reads and lowers `drq` when the sector is drained.
   // Ownership passes via `drq`: core0 writes xfer[]/xfer_len only while drq==0.
@@ -553,6 +557,9 @@ inline uint8_t compose_status() {
       st |= 0x10;
     if (S.rec_deleted)
       st |= 0x20;
+    if (S.err_write_protect)
+      st |= 0x40; // WRITE PROTECT (b6 in the Type II layout, write commands
+                  // only). Set only by the WRITE SECTOR stub -- see 3.3.
   } else {
     // Type I layout: b2 Track00, b6 WriteProtect. Index (b1) intentionally left
     // at 0 — tried tying it live to the physical ~INDEX pin, but the pulse is
@@ -695,6 +702,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       S.type2 = true;
       S.read_addr = false;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
+      S.err_write_protect = false; // cleared by the next Type II/III command
       S.multi = (cmd & 0x10) != 0;
       if ((cmd & 0x20) == 0) {
         // READ SECTOR — single (0x8X) or multiple (0x9X). Ask core0 to decode
@@ -717,10 +725,25 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.rd_elapsed_us = 0; // cleared until an abort (or drain) records a real value
         S.rd_seq++;
       } else {
-        // WRITE SECTOR — Milestone 3.3. The MZ-800 boot/directory path never
-        // writes, so completing benignly (not busy) is safe for now.
+        // WRITE SECTOR — not implemented until Milestone 3.3. Fail the command
+        // with WRITE PROTECT rather than completing benignly.
+        //
+        // The old stub cleared BUSY with no DRQ and no error bits, i.e. it told
+        // the host the write SUCCEEDED. That was defensible while the boot ROM
+        // was the only client (it never writes), but CP/M 4.1 now boots to a
+        // prompt and can. A silent no-op write is the worst possible failure
+        // mode: the host's in-RAM directory and buffers diverge from what is
+        // actually on the disk, and the damage is only discovered later, on a
+        // disk the user believes is good. WRITE PROTECT is the honest answer --
+        // it is a real WD status bit for a write command, every DOS/BIOS already
+        // has a path for it, and it says "this did not happen" unambiguously.
+        //
+        // Delete this whole branch when the real splice lands; the flag is
+        // cleared on the next Type II command, so nothing else has to change.
         S.reading = false;
         S.busy = false;
+        S.err_write_protect = true;
+        S.write_attempts++;
       }
     } else if ((cmd & 0xF0) == 0xC0) {
       // ---- Type III READ ADDRESS (0xCX) ----
@@ -730,6 +753,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // READ ADDRESS); returning nothing makes it step blindly and give up.
       S.type2 = true;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
+      S.err_write_protect = false; // cleared by the next Type II/III command
       S.reading = true;
       S.read_addr = true;
       S.multi = false;
@@ -1020,6 +1044,7 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->int_mode = g_int_mode;
   o->intrq_asserts = S.intrq_asserts;
   o->lost_data_events = S.lost_data_events;
+  o->write_attempts = S.write_attempts;
   o->bt_active = S.bt_active ? 1 : 0;
   o->bt_last_rx = S.bt_last_rx;
   o->bt_last_echo = S.bt_last_echo;

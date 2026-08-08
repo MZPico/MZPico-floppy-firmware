@@ -139,13 +139,14 @@ BUSY-polling covers latency instead, per the ROM driver).
 - **3.3 — WRITE SECTOR (in-place splice).** Locate the sector by ID (streaming
   decode), then WGATE + write the MFM-encoded data field in the ~22-byte Gap 2
   window (~700 µs slack). Test: MZ-800 writes a file; read back (host `gw`/scan).
-  **Currently a stub, and now the top priority.** It clears BUSY with no DRQ and
-  no error bits — i.e. it reports *success*. That was defensible when the boot
-  ROM was the only client (it never writes), but CP/M 4.1 now boots to a prompt
-  and can write: every file write silently does nothing while the host believes
-  it worked. Until the real splice lands, the stub should **fail honestly**
-  (set WRITE PROTECT in STATUS for Type II writes) so CP/M reports an error
-  instead of corrupting its in-RAM view of the disk.
+  **Not implemented — now the top priority.** The stub **fails honestly**: a
+  Type II write completes immediately with **WRITE PROTECT** (b6) set in the
+  Type II STATUS layout, so the host sees an unambiguous error. It previously
+  cleared BUSY with no error bits, i.e. reported *success* — defensible when the
+  boot ROM was the only client (it never writes), but a data-loss trap now that
+  CP/M 4.1 boots to a prompt and can: the host's in-RAM directory and buffers
+  would diverge from the disk, and the damage would surface later on a disk the
+  user believes is good. `rddiag` counts refused writes.
 - **3.4 — Type III / format / density / multi-drive.**
   - **READ ADDRESS (0xCX). ✅ DONE (hardware-verified).** Returns the first ID
     field in the captured flux as the six bytes a real WD hands over DRQ —

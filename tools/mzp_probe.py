@@ -355,8 +355,8 @@ def fdc_line(r):
 def do_rddiag(s):
     s.write(bytes([MZP_CMD_RDDIAG, 2]))
     s.flush()
-    r = read_exact(s, 56)
-    if len(r) < 56 or r[1] != 0:
+    r = read_exact(s, 60)
+    if len(r) < 60 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
 
@@ -370,6 +370,7 @@ def do_rddiag(s):
     status_polls, status_span_us = u32(38), u32(42)
     int_flags, int_mode = r[46], r[47]
     intrq_asserts, lost_data_events = u32(48), u32(52)
+    write_attempts = u32(56)
 
     found = bool(result & 1)
     is_readaddr = bool(result & 0x10)
@@ -417,6 +418,9 @@ def do_rddiag(s):
     if int_mode == 1 and not (int_flags & 1):
         print("            ^ EINT never armed -> this host is polling, not "
               "interrupt-driven (boot ROM / CP/M 2.3 do this)")
+    if write_attempts:
+        print(f"  WRITES  : {write_attempts} WRITE SECTOR command(s) REFUSED "
+              f"with WRITE PROTECT -- 3.3 is not implemented yet")
     if lost_data_events:
         print(f"  LOST DATA: {lost_data_events} sector(s) DRQ'd but never "
               f"drained by the host")

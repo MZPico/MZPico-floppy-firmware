@@ -856,7 +856,8 @@ void gw_task() {
     // [cmd, ACK, capture_ok, flux_n(4), capture_us(4), search_us(4),
     //  rd_elapsed_us(4), want, result, ids_seen, ids[16],
     //  status_polls(4), status_span_us(4),
-    //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4)] -- 56 bytes.
+    //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4),
+    //  write_attempts(4)] -- 60 bytes.
     FdcDebug d;
     fdc_debug_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -879,7 +880,8 @@ void gw_task() {
     }
     reply_buffer[i++] = d.int_flags;
     reply_buffer[i++] = d.int_mode;
-    const uint32_t n32[] = {d.intrq_asserts, d.lost_data_events};
+    const uint32_t n32[] = {d.intrq_asserts, d.lost_data_events,
+                            d.write_attempts};
     for (uint32_t v : n32) {
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;

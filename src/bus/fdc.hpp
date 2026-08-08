@@ -85,6 +85,7 @@ struct FdcDebug {
   uint8_t int_mode;         // the active fdc_set_int_mode() setting
   uint32_t intrq_asserts;   // ~INT Hi-Z -> low transitions this session
   uint32_t lost_data_events; // DRQ'd sectors the host never drained
+  uint32_t write_attempts;   // WRITE SECTOR commands refused by the 3.3 stub
   // Bus test on port 0xDF: write incrementing bytes, read transformed echo.
   uint8_t bt_active;
   uint8_t bt_last_rx;
