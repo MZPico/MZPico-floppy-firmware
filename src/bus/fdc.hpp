@@ -63,6 +63,8 @@ struct FdcDebug {
                        // most recent command being issued (0 if no seek yet)
   uint8_t verify_start_ok; // did the last Verify's capture start successfully?
   uint32_t verify_n;       // flux bytes drained by the last Verify attempt
+  uint32_t verify_attempts; // Verify passes run this session (0 = none, so
+                            // verify_start_ok/verify_n are meaningless)
   uint16_t cmd_writes_total;
   uint8_t cmd_last_raw;     // last raw byte written to D8
   uint8_t cmd_last_decoded; // last decoded command (~raw)

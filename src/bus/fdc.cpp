@@ -125,6 +125,11 @@ struct FdcState {
   // "captured plenty but genuinely found no matching ID."
   volatile bool verify_start_ok = false;
   volatile uint32_t verify_n = 0;
+  // Distinguishes "no Verify has run yet" from "a Verify ran and failed".
+  // Without it, verify_start_ok reads as a definite negative when it is really
+  // just uninitialised -- and a failed Verify is exactly what produces a silent
+  // FD:Loading error, so that is the worst possible moment to be ambiguous.
+  volatile uint32_t verify_attempts = 0;
 
   volatile bool active = false; // set once the MZ-800 first talks to us
 
@@ -385,6 +390,7 @@ static constexpr uint32_t FDC_READADDR_DRQ_WINDOW_US = 2000;
 static bool fdc_verify_track(uint8_t track) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
+  S.verify_attempts++; // counted at entry, so an early return still shows up
 
   // Start verify capture at an index edge when possible, to reduce rotational
   // alignment misses on media where the expected IDs are index-relative.
@@ -1038,6 +1044,7 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->cmd_gap_us = S.cmd_gap_us;
   o->verify_start_ok = S.verify_start_ok ? 1 : 0;
   o->verify_n = S.verify_n;
+  o->verify_attempts = S.verify_attempts;
   o->cmd_writes_total = S.cmd_writes_total;
   o->cmd_last_raw = S.cmd_last_raw;
   o->cmd_last_decoded = S.cmd_last_decoded;

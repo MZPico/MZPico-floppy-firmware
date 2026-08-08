@@ -857,7 +857,8 @@ void gw_task() {
     //  rd_elapsed_us(4), want, result, ids_seen, ids[16],
     //  status_polls(4), status_span_us(4),
     //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4),
-    //  write_attempts(4), verify_start_ok, verify_n(4), seek_error] -- 66 bytes.
+    //  write_attempts(4), verify_start_ok, verify_n(4), seek_error,
+    //  verify_attempts(4)] -- 70 bytes.
     FdcDebug d;
     fdc_debug_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -894,6 +895,8 @@ void gw_task() {
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (d.verify_n >> (8 * k)) & 0xFF;
     reply_buffer[i++] = (uint8_t)((d.status & 0x10) ? 1 : 0); // SEEK ERROR
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.verify_attempts >> (8 * k)) & 0xFF;
     cdc_write_all(reply_buffer, i);
   }
 
