@@ -38,6 +38,12 @@ struct SectorRead {
   bool deleted;      // the data mark was a deleted-DAM (0xF8)
   uint8_t cyl, head; // IDAM cylinder/head bytes of the matched sector (debug)
   uint16_t size;     // data-field size actually decoded (128 << N)
+  // Set when the requested sector number WAS on the track but every copy of it
+  // carried a different cylinder byte -- i.e. the head is on the wrong track.
+  // Reported separately from a plain "not found" because the two call for
+  // different responses: this one is a positioning failure, not missing media.
+  bool cyl_mismatch;
+  uint8_t seen_cyl; // the cylinder byte that was there instead
 };
 
 // Locate the sector whose IDAM sector-id == `want_sec` (with a valid ID CRC) in
@@ -45,9 +51,18 @@ struct SectorRead {
 // is the per-command READ SECTOR primitive: it re-scans the same captured flux
 // for each requested sector, so a multi-sector read needs only one capture.
 // Returns .found=false (→ RNF) if no matching good-ID sector exists.
+//
+// `want_cyl` is the WD's ID-field TRACK COMPARE: a real WD179x matches an ID
+// only when BOTH its sector byte and its cylinder byte agree with the Sector and
+// Track registers, and reports RNF otherwise. That compare is what tells a host
+// its head is not where it thinks it is. Matching on the sector number alone
+// returns CRC-clean data from whatever cylinder the head happens to be over --
+// an undetectable corruption, since every error bit says the read was perfect.
+// Pass MFM_ANY_CYL to skip the compare (bench/diagnostic reads only).
+static const uint8_t MFM_ANY_CYL = 0xFF;
 SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
                            float nominal_bit_time_us, uint8_t want_sec,
-                           uint8_t *out, size_t out_size);
+                           uint8_t want_cyl, uint8_t *out, size_t out_size);
 
 // WD Type I SEEK VERIFY primitive: after a seek, a real WD1793 (with the
 // command's Verify bit set) reads back the *first* ID field it finds

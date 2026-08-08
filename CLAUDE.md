@@ -113,6 +113,24 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   must present/accept **bit-complemented** values on `0xD8`–`0xDB`.
 - **Multi-sector + Force Interrupt:** ✅ the ROM uses Read/Write **Multiple**
   (`0x90`/`0xB4`) terminated by **Force Interrupt** (`0xD0`) — must be supported.
+- **Head position is ours, the Track register is the host's:** ✅ core1 folds each
+  Type I step into a **clamped absolute** `head_target` (our model of the head);
+  core0 drives the head there. The two must be free to disagree — that is the
+  basis of the recalibrate-via-READ-ADDRESS idiom. Three rules fall out of how
+  the host actually behaves (CP/M 4.1 fires STEP/`FORCE-INT`/READ bursts µs
+  apart and never waits for BUSY, while our steps take ms):
+  1. never drop a queued Type I — several arrive while core0 is blocked in a
+     ~235 ms capture;
+  2. clamp **per command**, so surplus STEP-OUTs past TRK00 are absorbed as a
+     real drive absorbs them, not summed against later STEP-INs;
+  3. never start a capture while `op_done != op_seq` — the read must wait for
+     the pending move or it answers from the previous cylinder.
+- **WD ID track compare:** ✅ a read matches an ID only when **both** its sector
+  and its cylinder byte agree with the Sector/Track registers; a sector-number
+  match on the wrong cylinder is RNF, not data. This is real WD179x behaviour and
+  it is the only thing that makes a positioning bug visible — without it the host
+  silently receives CRC-clean data from wherever the head happens to be, and
+  every status bit reports a perfect read.
 - **On-device MFM (streaming):** ✅ required from Phase 2 (Phase 1 was flux-only,
   host-side MFM). Vendor Adafruit's `mfm_impl.h` and make the decode/encode
   **streaming** (rotational-position tracking), not batch-to-buffer.
@@ -132,6 +150,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   register access.
 - **WRITE SECTOR** in-place splice details (chosen approach) — timing/gap
   handling; add write-precomp only if inner-track writes prove marginal.
+- **Rare `FD:Loading error` on boot** (~1 in 20; everything else reads clean).
+  `rddiag` only shows the *last* read, so later retries overwrite the evidence —
+  chasing it wants a **first-failure latch** holding the first RNF since
+  power-up. Suspects: a capture taken before the spindle is stable, or the 5 ms
+  `settle_delay_ms` being marginal right after a seek.
+- **`goto_track()` assumes the head arrived** — `_track = track_num` is set
+  unconditionally, and it early-returns when `_track` already matches, so one
+  genuinely lost STEP pulse becomes permanent until a seek to 0 resyncs via the
+  TRK00 sense. Not currently biting, but it silently defeats the ID track
+  compare's ability to self-correct.
 
 ## Conventions (inherited from the reference firmware)
 
@@ -174,9 +202,18 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   side. Milestone detail in [docs/phase3-plan.md](docs/phase3-plan.md):
   - 3.0 shared-bus bring-up ✅, 3.1 Type I + STATUS ✅, 3.2 READ SECTOR
     single+multiple ✅, READ ADDRESS ✅, DRQ-driven EINT-gated `~INT` ✅.
+  - **Read-path fidelity pass ✅** (CP/M 4.1 was reading whole directories off
+    the wrong cylinder — see the head-position decision above). Three fixes:
+    the seek handshake no longer drops queued Type I commands, a Type II no
+    longer captures while a move is still pending, and `mfm_read_sector`
+    enforces the WD ID **track compare**. `mzp_probe.py rddiag` now reports the
+    whole position chain (Track reg → head_target → drive belief → disk cyl)
+    plus cumulative `sec_ok`/`sec_crc_err`/`sec_rnf`/`sec_cyl_mismatch`.
   - **3.3 WRITE SECTOR is the next milestone and the one real gap.** It is
-    currently a stub that reports *success* without writing — harmless when the
-    boot ROM was the only client, a data-loss trap now that CP/M can reach it.
+    currently a stub that fails the command with WRITE PROTECT — honest, but it
+    means CP/M cannot write at all. Note the host's positioning style (see the
+    head-position decision) matters far more here: a splice at the wrong
+    cylinder destroys data instead of merely returning garbage.
   - 3.4 leftovers: READ TRACK, WRITE TRACK (format), density applied to
     `~DEN_RDY`, drive-select via `~DS0/DS1`.
 - **Phase 4 (robustness):** write-precomp if needed, multi-drive, error handling,

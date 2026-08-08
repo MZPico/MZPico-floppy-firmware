@@ -858,7 +858,9 @@ void gw_task() {
     //  status_polls(4), status_span_us(4),
     //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4),
     //  write_attempts(4), verify_start_ok, verify_n(4), seek_error,
-    //  verify_attempts(4)] -- 70 bytes.
+    //  verify_attempts(4), sec_ok(4), sec_crc_err(4), sec_rnf(4),
+    //  last_id_cyl, last_id_head, sec_cyl_mismatch(4), last_trk_reg,
+    //  last_want_side, last_head_target, last_phys_track] -- 92 bytes.
     FdcDebug d;
     fdc_debug_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -897,6 +899,21 @@ void gw_task() {
     reply_buffer[i++] = (uint8_t)((d.status & 0x10) ? 1 : 0); // SEEK ERROR
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (d.verify_attempts >> (8 * k)) & 0xFF;
+    // Cumulative read quality. The fields above all describe the LAST read;
+    // a directory that lists garbage is a question about every read before it.
+    const uint32_t q32[] = {d.sec_ok, d.sec_crc_err, d.sec_rnf};
+    for (uint32_t v : q32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    reply_buffer[i++] = d.last_id_cyl;
+    reply_buffer[i++] = d.last_id_head;
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.sec_cyl_mismatch >> (8 * k)) & 0xFF;
+    reply_buffer[i++] = d.last_trk_reg;
+    reply_buffer[i++] = d.last_want_side;
+    reply_buffer[i++] = d.last_head_target;
+    reply_buffer[i++] = d.last_phys_track;
     cdc_write_all(reply_buffer, i);
   }
 

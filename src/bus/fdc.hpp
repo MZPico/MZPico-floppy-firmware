@@ -88,6 +88,18 @@ struct FdcDebug {
   uint32_t intrq_asserts;   // ~INT Hi-Z -> low transitions this session
   uint32_t lost_data_events; // DRQ'd sectors the host never drained
   uint32_t write_attempts;   // WRITE SECTOR commands refused by the 3.3 stub
+  // Cumulative read quality (see the sec_* counters in fdc.cpp). A snapshot of
+  // the *last* read cannot show a corrupt sector the host already consumed.
+  uint32_t sec_ok;           // sectors delivered with a good data CRC
+  uint32_t sec_crc_err;      // sectors delivered with a BAD data CRC
+  uint32_t sec_rnf;          // sector reads that found no matching ID
+  uint8_t last_id_cyl;       // ID field of the last delivered sector (0xFF=none)
+  uint8_t last_id_head;
+  uint32_t sec_cyl_mismatch; // sectors whose ID cylinder != the Track register
+  uint8_t last_trk_reg;      // Track register when last_id_cyl was sampled
+  uint8_t last_head_target;  // our model of the head position at that read
+  uint8_t last_phys_track;   // FloppyDrive's _track belief (0xFE = unknown)
+  uint8_t last_want_side;    // physical head selected at that moment
   // Bus test on port 0xDF: write incrementing bytes, read transformed echo.
   uint8_t bt_active;
   uint8_t bt_last_rx;

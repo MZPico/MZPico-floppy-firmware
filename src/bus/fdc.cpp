@@ -45,8 +45,33 @@ struct FdcState {
   // the head is; a host recalibrating (write Track, step, READ ADDRESS to resync)
   // relies on those two being independent. Deriving the target from S.track
   // instead made a single STEP OUT slam the head across the disk.
-  volatile int16_t op_steps = 0;
-  volatile bool op_restore = false;
+  //
+  // Why a target and not a step count: core0 blocks for ~235 ms in
+  // fdc_capture_window() on every fresh read, and CP/M 4.1 positions the head
+  // with rapid STEP/Force-Interrupt bursts, so many Type I commands land while
+  // core0 is unavailable. Whatever holds them must lose none of them AND must
+  // absorb surplus pulses at the end stops exactly as the drive does.
+  // core1 folds each step into a CLAMPED ABSOLUTE target cylinder; core0 just
+  // drives the head there. Single writer (core1), so no shared read-modify-write
+  // and no lost commands however many arrive while core0 is blocked.
+  //
+  // This is deliberately NOT the Track register -- that is the host's belief and
+  // must stay independent (a host recalibrating via READ ADDRESS depends on the
+  // two being able to disagree). This is our own model of where the head is.
+  //
+  // Two earlier shapes both failed. A single "steps for the next move" slot was
+  // overwritten, so commands arriving during core0's ~235 ms capture window were
+  // dropped outright. Replacing it with a step ACCUMULATOR fixed that but broke
+  // end-stop absorption: at_track0 only refreshes once core0 runs, so the host
+  // -- which polls STATUS microseconds after each FORCE-INT -- issues several
+  // surplus STEP-OUTs past track 0. Summing them with the following STEP-INs
+  // (-7 + 2 = -5) let the debt cancel real motion, leaving the head one cylinder
+  // short. A physical drive absorbs each surplus pulse AS IT ARRIVES, so the
+  // clamp has to be applied per command. Folding into a clamped absolute target
+  // does exactly that.
+  volatile int16_t head_target = 0;
+  volatile uint32_t restore_req = 0;  // core1 only: bumped per RESTORE
+  volatile uint32_t restore_done = 0; // core0 only
   volatile bool step_in = true; // last direction, for the bare STEP (0x2X/0x3X)
   volatile bool op_verify = false; // WD Type I Verify (V) bit on this command
 
@@ -109,6 +134,38 @@ struct FdcState {
   // all: one revolution is ~200 ms, so if the host gives up in single-digit ms
   // no amount of decode tuning helps and the capture must run ahead of the
   // command (which needs lossless/DMA flux). Measured, not assumed.
+  // Cumulative read-quality counters. A single-snapshot diagnostic cannot see a
+  // sector that decoded with a bad CRC three sectors ago -- the host has long
+  // since taken the bytes and moved on. These are the only way to tell "the
+  // bridge is handing over corrupt data" apart from "the host is misreading
+  // good data", which is exactly the question a garbled directory listing asks.
+  // last_id_cyl/head are the ID field of the most recently DELIVERED sector: if
+  // they disagree with the Track register the host is being fed another track.
+  volatile uint32_t sec_ok = 0;      // sectors delivered, data CRC good
+  volatile uint32_t sec_crc_err = 0; // sectors delivered, data CRC BAD
+  volatile uint32_t sec_rnf = 0;     // reads that found no matching sector
+  volatile uint8_t last_id_cyl = 0xFF;
+  volatile uint8_t last_id_head = 0xFF;
+  // A real WD compares the ID field's track byte against the Track register and
+  // raises RNF when they disagree; mfm_read_sector() matches on the sector
+  // NUMBER ALONE, so if the head is not where the host believes it is we return
+  // perfectly valid, CRC-clean data from the wrong cylinder. That failure is
+  // invisible to every other counter here -- it looks like a flawless read.
+  // Sampled at delivery time together with the Track register so the pair is
+  // self-consistent rather than two unrelated snapshots.
+  volatile uint32_t sec_cyl_mismatch = 0;
+  volatile uint8_t last_trk_reg = 0xFF;  // Track register when that ID was read
+  // Sampled at the moment the read decodes, so all four can be compared as one
+  // consistent set. They separate the three ways a read can land on the wrong
+  // cylinder, which no other counter can tell apart:
+  //   head_target != Track reg -> core1 folded the steps wrong
+  //   phys_track  != head_target -> core0 never drove the head there
+  //   both agree but ID cyl differs -> the head did not physically arrive
+  //     (a dropped step pulse; goto_track() believes it did regardless)
+  volatile uint8_t last_head_target = 0xFF;
+  volatile uint8_t last_phys_track = 0xFF;
+  volatile uint8_t last_want_side = 0xFF; // physical head we were on
+
   volatile uint32_t status_polls = 0;
   volatile uint32_t status_last_us = 0;
 
@@ -666,8 +723,21 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
           S.track = (uint8_t)(S.track - 1);
         break;
       }
-      S.op_steps = (int16_t)steps;
-      S.op_restore = restore;
+      // Fold into the target. A second Type I arriving before core0 has run the
+      // first must combine with it, never replace it -- see head_target.
+      if (restore) {
+        S.head_target = 0;
+        S.restore_req++; // force a physical TRK00 seek even if we think we're there
+      } else {
+        // Clamp HERE, per command -- this is the end-stop absorption a real
+        // drive performs on every surplus pulse. See head_target.
+        int t = (int)S.head_target + steps;
+        if (t < 0)
+          t = 0;
+        if (t > FDC_MAX_CYLINDER)
+          t = FDC_MAX_CYLINDER;
+        S.head_target = (int16_t)t;
+      }
       S.op_verify = (cmd & 0x04) != 0; // WD Type I Verify (V) bit
       S.busy = true;
       S.op_seq++;
@@ -1065,6 +1135,16 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->intrq_asserts = S.intrq_asserts;
   o->lost_data_events = S.lost_data_events;
   o->write_attempts = S.write_attempts;
+  o->sec_ok = S.sec_ok;
+  o->sec_crc_err = S.sec_crc_err;
+  o->sec_rnf = S.sec_rnf;
+  o->last_id_cyl = S.last_id_cyl;
+  o->last_id_head = S.last_id_head;
+  o->sec_cyl_mismatch = S.sec_cyl_mismatch;
+  o->last_trk_reg = S.last_trk_reg;
+  o->last_head_target = S.last_head_target;
+  o->last_phys_track = S.last_phys_track;
+  o->last_want_side = S.last_want_side;
   o->bt_active = S.bt_active ? 1 : 0;
   o->bt_last_rx = S.bt_last_rx;
   o->bt_last_echo = S.bt_last_echo;
@@ -1200,7 +1280,8 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
 
   float bt = density ? 1.0f : FDC_DD_BIT_US;
   SectorRead sd =
-      mfm_read_sector(flux, nflux, bt, sector, g_secbuf, sizeof(g_secbuf));
+      mfm_read_sector(flux, nflux, bt, sector, MFM_ANY_CYL, g_secbuf,
+                      sizeof(g_secbuf));
 
   if (flags)
     *flags = (uint8_t)((sd.found ? 0x01 : 0) | (sd.has_data ? 0x02 : 0) |
@@ -1326,25 +1407,26 @@ void fdc_disk_task(void) {
   // Execute a pending physical seek.
   if (S.op_done != S.op_seq) {
     uint32_t seq = S.op_seq;   // snapshot
-    int steps = S.op_steps;
-    bool restore = S.op_restore;
+    bool restore = (S.restore_done != S.restore_req);
+    uint32_t rseq = S.restore_req;
     bool verify = S.op_verify;
 
-    // Move relative to where the head physically is. Do NOT write S.track back
-    // from the physical position: the Track register is the host's belief and
+    // Do NOT write S.track back from the physical position: the Track register
+    // is the host's belief and
     // core1 has already updated it per the WD rules. Overwriting it here forced
     // belief == reality, which is precisely the state a recalibrating host is
     // trying to establish for itself via READ ADDRESS.
     if (restore) {
       DRV->goto_track(0); // steps out until TRK00
-    } else if (steps) {
-      int cur = DRV->track(); // -1 while the position is still unknown
-      int tgt = (cur < 0) ? 0 : cur + steps;
-      if (tgt < 0)
-        tgt = 0;
-      if (tgt > FDC_MAX_CYLINDER)
-        tgt = FDC_MAX_CYLINDER;
-      DRV->goto_track(tgt);
+      S.restore_done = rseq;
+    }
+    // Drive the head to whatever core1 has folded into head_target. Read once:
+    // core1 may move it again while we step, which just leaves op_seq != op_done
+    // and brings us straight back here.
+    {
+      int tgt = S.head_target;
+      if (DRV->track() != tgt)
+        DRV->goto_track(tgt);
     }
 
     S.at_track0 = DRV->get_track0_sense();
@@ -1437,6 +1519,24 @@ void fdc_disk_task(void) {
     if (!S.reading)
       return;
 
+    // A physical move is still outstanding: do not capture or decode yet.
+    //
+    // The seek block above runs earlier in this same pass, so without this we
+    // fall straight through into the capture the instant it finishes -- using
+    // whatever cylinder that seek happened to reach, while a NEWER step is still
+    // queued. The host issues STEP-IN / FORCE-INT / READ-SEC back-to-back in
+    // microseconds, but our steps take milliseconds, so this is the common case,
+    // not a rare race: measured, the head sat on cylinder 1 while the host had
+    // already asked for 2, and the read was answered from the wrong track before
+    // the second step was ever applied.
+    //
+    // A real WD never needs this -- its step pulse completes in microseconds, so
+    // a Type II arriving behind a Type I finds the head in place. Returning here
+    // just lets the next pass finish the move first; BUSY stays set, which is
+    // exactly what the host is polling on.
+    if (S.op_done != S.op_seq)
+      return;
+
     if (S.rd_fresh) {
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
@@ -1478,11 +1578,17 @@ void fdc_disk_task(void) {
           S.sector = g_readaddr_id[0];
         }
       } else if (g_flux_n > 0) {
-        sd = mfm_read_sector(flux, g_flux_n, FDC_DD_BIT_US, want, g_secbuf,
-                             sizeof(g_secbuf));
+        // WD ID track compare against the Track register -- see MFM_ANY_CYL.
+        sd = mfm_read_sector(flux, g_flux_n, FDC_DD_BIT_US, want, S.track,
+                             g_secbuf, sizeof(g_secbuf));
       }
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;
+      S.last_head_target = (uint8_t)S.head_target;
+      {
+        int pt = DRV->track();
+        S.last_phys_track = (pt < 0) ? 0xFE : (uint8_t)pt;
+      }
       S.rd_result = (uint8_t)((sd.found ? 1 : 0) | (sd.has_data ? 2 : 0) |
                               (sd.data_crc_ok ? 4 : 0) | (sd.deleted ? 8 : 0));
       if (S.read_addr)
@@ -1494,7 +1600,31 @@ void fdc_disk_task(void) {
           S.xfer[k] = g_secbuf[k];
         S.xfer_len = n;
         S.xfer_pos = 0;
-        S.err_crc = !sd.data_crc_ok;
+        // CRC is STICKY across a multi-record command, and a bad one ENDS it.
+        //
+        // This used to be a plain assignment. In a Read Multiple (0x9X, which is
+        // how both the ROM and CP/M read) the host only inspects STATUS after the
+        // terminating Force Interrupt, so a CRC failure on sector 3 was wiped out
+        // by sector 4 decoding cleanly -- the host was handed a sector of corrupt
+        // bytes and told the whole transfer succeeded. Single-sector readers never
+        // saw it because there is no later sector to overwrite the flag.
+        //
+        // Clearing S.multi also matches the WD: a data-field CRC error terminates
+        // the command (the record is still transferred, then INTRQ/BUSY-off with
+        // CRC ERROR set) instead of auto-advancing to the next record.
+        if (!sd.data_crc_ok) {
+          S.err_crc = true;
+          S.multi = false;
+          S.sec_crc_err++;
+        } else if (!S.read_addr) {
+          S.sec_ok++;
+        }
+        if (!S.read_addr) {
+          S.last_id_cyl = sd.cyl;
+          S.last_id_head = sd.head;
+          S.last_trk_reg = S.track;
+          S.last_want_side = S.side1 ? 1 : 0;
+        }
         S.rec_deleted = sd.deleted;
         S.err_rnf = false;
         // Publish DRQ last: it is the ownership handoff of xfer[] to core1.
@@ -1522,6 +1652,17 @@ void fdc_disk_task(void) {
         else
           S.rd_ids_seen = 0;
         S.err_rnf = true;
+        if (!S.read_addr) {
+          S.sec_rnf++;
+          // Separate the two RNF causes: "that sector is not on this track" vs
+          // "it IS here but on the wrong cylinder" (a positioning failure).
+          if (sd.cyl_mismatch) {
+            S.sec_cyl_mismatch++;
+            S.last_id_cyl = sd.seen_cyl;
+            S.last_trk_reg = S.track;
+            S.last_want_side = S.side1 ? 1 : 0;
+          }
+        }
         S.drq = false;
         if (S.rd_seq == seq) {
           S.reading = false;

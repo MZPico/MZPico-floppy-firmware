@@ -355,8 +355,8 @@ def fdc_line(r):
 def do_rddiag(s):
     s.write(bytes([MZP_CMD_RDDIAG, 2]))
     s.flush()
-    r = read_exact(s, 70)
-    if len(r) < 70 or r[1] != 0:
+    r = read_exact(s, 92)
+    if len(r) < 92 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
 
@@ -373,6 +373,13 @@ def do_rddiag(s):
     write_attempts = u32(56)
     verify_start_ok, verify_n, seek_error = r[60], u32(61), r[65]
     verify_attempts = u32(66)
+    # Parsed here, with everything else, because the READ ADDRESS branch below
+    # rebinds `r` to a size code and destroys the reply buffer.
+    sec_ok, sec_crc_err, sec_rnf = u32(70), u32(74), u32(78)
+    last_id_cyl, last_id_head = r[82], r[83]
+    sec_cyl_mismatch = u32(84)
+    last_trk_reg, last_want_side = r[88], r[89]
+    last_head_target, last_phys_track = r[90], r[91]
 
     found = bool(result & 1)
     is_readaddr = bool(result & 0x10)
@@ -451,6 +458,38 @@ def do_rddiag(s):
     if lost_data_events:
         print(f"  LOST DATA: {lost_data_events} sector(s) DRQ'd but never "
               f"drained by the host")
+    total = sec_ok + sec_crc_err
+    if total or sec_rnf:
+        print(f"  sectors : {sec_ok} delivered clean, {sec_crc_err} delivered "
+              f"with a BAD data CRC, {sec_rnf} RNF")
+        if sec_crc_err:
+            print("            ^ every one of those handed the host corrupt "
+                  "bytes. If a listing is garbled, this is why.")
+        if last_id_cyl != 0xFF:
+            print(f"            last delivered: ID cyl={last_id_cyl} "
+                  f"head={last_id_head}  vs  Track reg={last_trk_reg} "
+                  f"phys head={last_want_side}")
+            print(f"            position chain: Track reg={last_trk_reg} -> "
+                  f"head_target={last_head_target} -> drive believes "
+                  f"{last_phys_track} -> disk says cyl={last_id_cyl}")
+            if last_head_target != last_trk_reg:
+                print("            ^ head_target != Track reg: core1 folded "
+                      "the step commands wrong")
+            elif last_phys_track != last_head_target:
+                print("            ^ drive belief != head_target: core0 never "
+                      "drove the head there")
+            elif last_id_cyl != last_phys_track:
+                print("            ^ every belief agrees and the DISK "
+                      "disagrees: the head did not physically arrive -- a "
+                      "dropped STEP pulse (goto_track assumes it arrived)")
+        if sec_cyl_mismatch:
+            print(f"            {sec_cyl_mismatch} sector(s) came from a "
+                  f"cylinder the host did NOT ask for -- rejected with RNF "
+                  f"(WD ID track compare). Nonzero means the head is not "
+                  f"where the host believes it is.")
+        elif total:
+            print("            every delivered sector's ID cylinder matched "
+                  "the Track register -- the host got the track it asked for")
 
 
 def do_bustest(s):

@@ -76,7 +76,7 @@ int mfm_scan_track(const uint8_t *flux, size_t n_flux, float nominal_bit_time_us
 
 SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
                            float nominal_bit_time_us, uint8_t want_sec,
-                           uint8_t *out, size_t out_size) {
+                           uint8_t want_cyl, uint8_t *out, size_t out_size) {
   SectorRead r;
   memset(&r, 0, sizeof(r));
 
@@ -101,9 +101,18 @@ SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
     if (mark != MFM_IO_IDAM)
       continue; // that sync wasn't an ID address mark
 
-    uint8_t sec = idam[2];
-    if (sec != want_sec || crc != 0)
-      continue; // not our sector (or its ID is corrupt) -> keep looking
+    if (crc != 0)
+      continue; // corrupt ID field -> keep looking
+    if (idam[2] != want_sec)
+      continue; // not our sector
+    if (want_cyl != MFM_ANY_CYL && idam[0] != want_cyl) {
+      // Right sector number, WRONG cylinder: the head is not where the host
+      // believes. A real WD reports RNF here rather than handing over another
+      // track's data, which is what lets the host notice and re-seek.
+      r.cyl_mismatch = true;
+      r.seen_cyl = idam[0];
+      continue;
+    }
 
     // Matched a good ID for the requested sector. Decode its data field.
     r.found = true;
