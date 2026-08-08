@@ -1615,7 +1615,12 @@ void fdc_disk_task(void) {
         if (!sd.data_crc_ok) {
           S.err_crc = true;
           S.multi = false;
-          S.sec_crc_err++;
+          // Guarded like sec_ok below: this counter is what rddiag prints as
+          // "handed the host corrupt bytes", so a READ ADDRESS must never reach
+          // it. Unreachable today (the read_addr branch synthesises
+          // data_crc_ok = true) but the asymmetry is a trap for later edits.
+          if (!S.read_addr)
+            S.sec_crc_err++;
         } else if (!S.read_addr) {
           S.sec_ok++;
         }
@@ -1659,6 +1664,7 @@ void fdc_disk_task(void) {
           if (sd.cyl_mismatch) {
             S.sec_cyl_mismatch++;
             S.last_id_cyl = sd.seen_cyl;
+            S.last_id_head = sd.seen_head; // else it pairs with a stale head
             S.last_trk_reg = S.track;
             S.last_want_side = S.side1 ? 1 : 0;
           }

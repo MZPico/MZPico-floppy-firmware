@@ -43,7 +43,7 @@ struct SectorRead {
   // Reported separately from a plain "not found" because the two call for
   // different responses: this one is a positioning failure, not missing media.
   bool cyl_mismatch;
-  uint8_t seen_cyl; // the cylinder byte that was there instead
+  uint8_t seen_cyl, seen_head; // the ID bytes that were there instead
 };
 
 // Locate the sector whose IDAM sector-id == `want_sec` (with a valid ID CRC) in
@@ -58,11 +58,15 @@ struct SectorRead {
 // its head is not where it thinks it is. Matching on the sector number alone
 // returns CRC-clean data from whatever cylinder the head happens to be over --
 // an undetectable corruption, since every error bit says the read was perfect.
-// Pass MFM_ANY_CYL to skip the compare (bench/diagnostic reads only).
-static const uint8_t MFM_ANY_CYL = 0xFF;
+// Pass MFM_ANY_CYL to skip the compare (bench/diagnostic reads only). It is
+// deliberately -1 and `want_cyl` an int: every 8-bit value including 0xFF is a
+// legal IDAM cylinder byte, so an in-range sentinel would silently disable the
+// compare for one real cylinder. Out of reach at today's FDC_MAX_CYLINDER, but
+// the sentinel should not depend on that clamp to stay correct.
+static const int MFM_ANY_CYL = -1;
 SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
                            float nominal_bit_time_us, uint8_t want_sec,
-                           uint8_t want_cyl, uint8_t *out, size_t out_size);
+                           int want_cyl, uint8_t *out, size_t out_size);
 
 // WD Type I SEEK VERIFY primitive: after a seek, a real WD1793 (with the
 // command's Verify bit set) reads back the *first* ID field it finds
