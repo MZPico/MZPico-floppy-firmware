@@ -50,6 +50,18 @@ void fdc_bus_reset_poll(void);
 void fdc_set_reset_poll(bool on);
 bool fdc_get_reset_poll(void);
 
+// Host-initiated WRITE TRACK (formatting). DEFAULT OFF -- a raw 0x00 on the
+// bus-inverted command port decodes to 0xFF = WRITE TRACK, so one glitched byte
+// could otherwise reformat a track. The bench format path is unaffected.
+void fdc_set_format_enable(bool on);
+bool fdc_get_format_enable(void);
+
+// Head-position self-correction (goto_track's TRK00 cross-check and the
+// adopt-the-disk's-cylinder resync). On by default; off restores the seek
+// behaviour from before those were added.
+void fdc_set_posfix(bool on);
+bool fdc_get_posfix(void);
+
 // core0: run any pending physical operation (motor/select/side/seek). Poll from
 // the main loop. No-op until the MZ-800 first accesses an FDC port, so it never
 // fights the greaseweazle/USB drive control when no machine is attached.

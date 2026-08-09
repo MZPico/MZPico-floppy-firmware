@@ -51,6 +51,10 @@ static constexpr uint16_t FDC_TRACK_IMAGE_MAX = 7200;
 // "that is the whole image". A Z80 feeding a DRQ'd byte takes tens of us, so a
 // few ms of silence is unambiguous.
 static constexpr uint32_t FDC_TRACK_IDLE_US = 4000;
+// Shortest byte stream that could be a real track image. A DD track is ~6250
+// bytes and even a minimal one-sector format runs far longer; this bound exists
+// to reject glitches, not to validate geometry.
+static constexpr uint16_t FDC_TRACK_IMAGE_MIN = 256;
 // Flux budget for one formatted track. A revolution is ~43.5k transitions
 // (measured); 48k leaves the write with flux still queued when the terminating
 // index pulse arrives, which is what stops it running out early.
@@ -174,6 +178,7 @@ struct FdcState {
   volatile uint32_t trk_done = 0;
   volatile uint16_t trk_pos = 0;  // host's position within track_buf
   volatile uint16_t trk_len = 0;  // bytes valid / expected
+  volatile uint32_t trk_implausible = 0; // images refused as not-a-format
   volatile uint32_t trk_ok = 0;      // tracks formatted / read
   volatile uint32_t trk_fail = 0;    // ...that failed to reach the media
   volatile uint32_t trk_last_us = 0; // last operation's disk time
@@ -470,6 +475,22 @@ volatile bool g_write_enable = true;
 // without a reflash -- reflashing to bisect a timing regression means changing
 // two things at once.
 volatile bool g_reset_poll_enabled = true;
+
+// Host-initiated WRITE TRACK (formatting), DEFAULT OFF -- unlike WRITE SECTOR.
+// The command register is bus-inverted, so a raw 0x00 on port 0xD8 decodes to
+// 0xFF: WRITE TRACK. Every other opcode a stray byte can land on is survivable
+// -- a spurious READ returns data nobody wanted, a spurious SEEK moves the head
+// and the ID track compare catches it -- but this one reformats a whole track,
+// and one glitched byte during a power-up transient would be enough. The bench
+// path (fdc_bench_format) is unaffected and is what the milestone is verified
+// with, so the default costs nothing. Enable with `mzp_probe.py fmten 1`.
+volatile bool g_format_enable = false;
+
+// Runtime disable for the head-position self-correction (goto_track's TRK00
+// cross-check and fdc_resync_head). Both act on their own initiative -- one can
+// force a full recalibrate, the other moves the head mid-command -- so they
+// have to be removable without a reflash when the seek path is under suspicion.
+volatile bool g_posfix_enabled = true;
 
 namespace {
 
@@ -867,7 +888,7 @@ static void fdc_note_failure(uint8_t kind, uint8_t want_sec, uint8_t seen_cyl,
 // itself is the only position reference a floppy has, and this is the one
 // moment it speaks: use it.
 static void fdc_resync_head(uint8_t seen_cyl) {
-  if (!DRV)
+  if (!DRV || !g_posfix_enabled)
     return;
   S.pos_resyncs++;
   S.last_resync_from = seen_cyl;
@@ -1985,6 +2006,14 @@ const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
 void fdc_set_write_enable(bool on) { g_write_enable = on; }
 void fdc_set_reset_poll(bool on) { g_reset_poll_enabled = on; }
 bool fdc_get_reset_poll(void) { return g_reset_poll_enabled; }
+void fdc_set_format_enable(bool on) { g_format_enable = on; }
+bool fdc_get_format_enable(void) { return g_format_enable; }
+void fdc_set_posfix(bool on) {
+  g_posfix_enabled = on;
+  if (DRV)
+    DRV->set_track0_crosscheck(on);
+}
+bool fdc_get_posfix(void) { return g_posfix_enabled; }
 bool fdc_get_write_enable(void) { return g_write_enable; }
 
 // ---- core0 (disk) ---------------------------------------------------------
@@ -2186,9 +2215,31 @@ void fdc_disk_task(void) {
     g_flux_n = 0; // the captured window describes the track we are replacing
 
     S.write_protect = DRV->get_write_protect();
+
+    // Refuse an image that cannot be a format. A real track image is thousands
+    // of bytes and necessarily carries the write-channel commands for a sync
+    // mark (0xF5) and an ID address mark (0xFE) -- without them there would be
+    // no ID fields at all and the track would be unreadable by anything. A
+    // short or markless stream is a glitch, a truncated transfer, or a host
+    // that never meant to format, and writing it destroys the track just as
+    // thoroughly as a real format would.
+    bool plausible = S.trk_len >= FDC_TRACK_IMAGE_MIN;
+    if (plausible) {
+      bool has_sync = false, has_idam = false;
+      for (uint16_t k = 0; k < S.trk_len; ++k) {
+        if (S.track_buf[k] == 0xF5)
+          has_sync = true;
+        else if (S.track_buf[k] == 0xFE)
+          has_idam = true;
+      }
+      plausible = has_sync && has_idam;
+    }
+
     bool ok = false;
     uint32_t t0 = time_us_32();
-    if (!S.write_protect) {
+    if (!plausible) {
+      S.trk_implausible++;
+    } else if (!S.write_protect) {
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
       // Cap the flux at a bit over one revolution: the write is terminated by

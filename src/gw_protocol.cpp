@@ -72,6 +72,8 @@
 #define MZP_CMD_READTRACK 0x96 // bench: READ TRACK -- raw decoded byte stream
 #define MZP_CMD_RESETDIAG 0x97 // raw bus-RESET line telemetry (no assumptions)
 #define MZP_CMD_RESETPOLL 0x98 // enable/disable the core1 bus-RESET poller
+#define MZP_CMD_POSFIX 0x99    // enable/disable head-position self-correction
+#define MZP_CMD_FMTEN 0x9A     // enable/disable host-initiated WRITE TRACK
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1163,6 +1165,26 @@ void gw_task() {
       fdc_set_reset_poll(cmd_buffer[2] != 0);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = fdc_get_reset_poll() ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_POSFIX) {
+    // cmd_buffer[2]: 0 = off, 1 = on, 2 = query. Off restores the seek path to
+    // what it was before the head-position self-correction was added, so a
+    // seek-timing regression can be bisected without a reflash.
+    if (cmd_buffer[2] < 2)
+      fdc_set_posfix(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_posfix() ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FMTEN) {
+    // cmd_buffer[2]: 0 = off (default), 1 = on, 2 = query.
+    if (cmd_buffer[2] < 2)
+      fdc_set_format_enable(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_format_enable() ? 1 : 0;
     cdc_write_all(reply_buffer, i);
   }
 

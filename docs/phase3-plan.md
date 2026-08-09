@@ -238,7 +238,9 @@ BUSY-polling covers latency instead, per the ROM driver).
     what the chip would have given it. Also loads the ID's track byte into the
     Sector register (WD quirk; the CP/M BIOS reads head position from there).
     This is what stopped the BIOS stepping blindly and giving up.
-  - **WRITE TRACK (0xFX) — format. ✅ DONE (hardware-verified).** Formatting
+  - **WRITE TRACK (0xFX) — format. Bench path ✅ hardware-verified; the HOST
+    command path is NOT WIRED YET** (an edit was lost and the 0xEX/0xFX branch
+    still completes benignly — see the note at the end of this milestone).** Formatting
     track 70 as 9x512 interleave 2 and scanning it back returns all nine
     sectors, in the interleaved physical order 1,6,2,7,3,8,4,9,5, every one
     with a valid ID **and** data CRC — which is the proof that the missing-clock
@@ -302,6 +304,16 @@ BUSY-polling covers latency instead, per the ROM driver).
     bit's polarity from and the two documented readings disagree; driving
     DENSEL on a guess risks a machine that currently boots, for media this
     platform does not have. See wd-fidelity.md.
+  - **Host command path for 0xEX/0xFX still to wire.** The encoders, the
+    core0 track-op block, the state and the bench commands all landed and are
+    verified; the *command decode* that sets `trk_op` from a host 0xEX/0xFX did
+    not, so from the MZ-800's point of view both commands still complete
+    benignly as they did in 3.2. When it is wired, note that
+    `g_format_enable` (`mzp_probe.py fmten`, default **OFF**) must stay the
+    gate: the command register is bus-inverted, so a raw 0x00 on port 0xD8
+    decodes to 0xFF = WRITE TRACK, and one glitched byte during a power-up
+    transient would otherwise reformat a track. Every other opcode a stray byte
+    can land on is survivable; this one is not.
   - **Still to do:** drive-select via `~DS0`/`~DS1` and real multi-drive. Left
     alone deliberately: it needs per-drive head positions, and with one drive
     attached there is no way to test that a second select line does not simply

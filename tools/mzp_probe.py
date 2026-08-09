@@ -26,6 +26,8 @@ Usage:
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
+    python mzp_probe.py PORT posfix [0|1]                 # head-position self-correction on/off (no arg = query)
+    python mzp_probe.py PORT fmten [0|1]                  # allow WRITE TRACK from the MZ-800 (default OFF)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -96,6 +98,8 @@ MZP_CMD_FDCFORMAT = 0x95
 MZP_CMD_READTRACK = 0x96
 MZP_CMD_RESETDIAG = 0x97
 MZP_CMD_RESETPOLL = 0x98
+MZP_CMD_POSFIX = 0x99
+MZP_CMD_FMTEN = 0x9A
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -1265,6 +1269,23 @@ def main():
             side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
             limit = int(sys.argv[5]) if len(sys.argv) > 5 else 256
             do_readtrack(s, track, side, limit)
+        elif cmd == "posfix":
+            # no arg = query (2), else 0 = off, 1 = on
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            s.write(bytes([MZP_CMD_POSFIX, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            print("head-position self-correction: "
+                  + ("ON" if len(r) == 3 and r[2] else
+                     "OFF (seek path as it was before it was added)"))
+        elif cmd == "fmten":
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            s.write(bytes([MZP_CMD_FMTEN, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            print("host WRITE TRACK (format): "
+                  + ("ENABLED -- a stray command byte can reformat a track"
+                     if len(r) == 3 and r[2] else "disabled (default)"))
         elif cmd == "resetpoll":
             # no arg = query (2), else 0 = off, 1 = on
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2

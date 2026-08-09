@@ -219,7 +219,7 @@ bool FloppyDrive::goto_track(int track_num) {
   // turned a mispositioned head into an RNF and the host retried. A write
   // cannot be retried after the fact, so relying on the last line of defence
   // for a condition the first line should prevent is no longer acceptable.
-  if (_track >= 0 && _track0pin >= 0) {
+  if (_track0_crosscheck && _track >= 0 && _track0pin >= 0) {
     bool at_zero = !read_pin(_track0pin);
     if (at_zero != (_track == 0)) {
       _track = -1; // belief is provably wrong -> force the TRK00 recalibrate

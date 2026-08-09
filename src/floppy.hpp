@@ -35,6 +35,11 @@ public:
   // way back to reality after a lost step except a seek to TRK00. Pass -1 to
   // mean "unknown", which forces the next goto_track() to recalibrate.
   void set_track_belief(int t) { _track = t; }
+  // Cross-check the cached position against the TRK00 sense on every seek (see
+  // goto_track). Runtime-disableable: it can force a full recalibrate on its
+  // own initiative, which is exactly the kind of behaviour that must be
+  // removable without a reflash when seek timing is under suspicion.
+  void set_track0_crosscheck(bool on) { _track0_crosscheck = on; }
   int get_side() const { return _side; }
 
   bool read_index();
@@ -70,4 +75,5 @@ private:
   bool _is_drive_selected = false;
   bool _is_motor_spinning = false;
   bool _is_index_seen = false;
+  bool _track0_crosscheck = true;
 };
