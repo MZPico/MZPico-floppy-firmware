@@ -229,6 +229,16 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
   mfm_state_t state = mfm_io_even;
   uint32_t mark = 0;
   bool resync = false; // the next symbol is the one after a sync mark
+  // KNOWN COSMETIC QUIRK: data-field sync runs are still reported as five
+  // 0xA1s on real media where the disk has three; ID fields report three. Two
+  // fixes were tried on hardware and neither moved the data-field case -- so
+  // the extra pair is neither a decoded byte (the swallow below fixed exactly
+  // that, and fixed the ID fields) nor a second match on the same run (the
+  // since_fire guard covers that). Left alone deliberately: everything either
+  // side of the run decodes correctly, and READ TRACK is a diagnostic whose
+  // consumers care about the address mark and the field behind it. Anyone
+  // resuming this should instrument the symbol stream rather than guess again.
+  //
   // The detector does not always fire on the last 0xA1 of a run: it works on a
   // sliding window of symbols that, unlike the sector decoder's, is primed by
   // whatever preceded the sync, so it can match a byte or two early. When it

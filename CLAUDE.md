@@ -250,7 +250,10 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     run of sector writes. It runs index-to-index, which makes it *safer* than
     the sector splice despite replacing the whole track: there is no timing
     window to hit. Verify with `mzp_probe.py PORT fmtverify <track>` on a
-    scratch disk. READ TRACK returns every byte uninterpreted (`readtrack`).
+    scratch disk. READ TRACK returns every byte uninterpreted (`readtrack`) and
+    is verified on real media — ID fields, 22-byte Gap 2, presync and data all
+    decode correctly; one cosmetic quirk remains (data-field sync runs print as
+    five 0xA1s rather than three) and is deliberately left.
     Density→DENSEL is closed as "not to be done" (the ROM never writes the
     port, so its polarity is unknowable and nothing needs it); drive-select via
     `~DS0/DS1` + multi-drive is deliberately left, needing per-drive head

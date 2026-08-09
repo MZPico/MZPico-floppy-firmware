@@ -244,13 +244,18 @@ BUSY-polling covers latency instead, per the ROM driver).
        TRACK is entitled to — and no address mark was recognisable. Fixed;
        ID fields now read `A1 A1 A1 FE <c> <h> <r> <n> <crc> <crc>` and data
        fields decode to their real contents.
-    2. Sync runs were reported as five 0xA1s instead of three. The mark
-       detector runs on a sliding window primed by whatever preceded the sync
-       (unlike the sector decoder's, which restarts per search), so it can
-       fire a byte or two early, leaving the rest of the same physical run to
-       decode again as ordinary bytes. Decoded 0xA1s are now swallowed until
-       the first byte that is not one — which is the address mark, the thing
-       the caller is looking for. Returns every
+    2. Sync runs were reported as five 0xA1s instead of three. Swallowing
+       decoded 0xA1s after a mark fixed the ID fields; suppressing a second
+       detector match on the same run did not move the data fields, and
+       neither did anything else tried. **Left as a known cosmetic quirk** —
+       the extra pair is provably neither a decoded byte nor a re-fire, and
+       chasing it further wants the symbol stream instrumented on hardware,
+       which is more than a display detail is worth. Everything either side of
+       the run decodes correctly.
+    Verified on a real track: `A1 A1 A1 FE 01 00 01 02 BC DB`, Gap 2 as exactly
+    22×0x4E, 12×0x00 presync, and data fields decoding to their real contents.
+    That 22-byte Gap 2 is also independent confirmation of the layout the write
+    splice's timing assumes (see mfm_splice.hpp). Returns every
     byte on the track — gaps, address marks, CRC bytes — uninterpreted, via
     `mfm_read_track_raw()`. It is the one decode here that cannot anchor itself
     to a sync mark, since the point is to see what lies between them, so it
