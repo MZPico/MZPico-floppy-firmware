@@ -204,7 +204,12 @@ BUSY-polling covers latency instead, per the ROM driver).
     what the chip would have given it. Also loads the ID's track byte into the
     Sector register (WD quirk; the CP/M BIOS reads head position from there).
     This is what stopped the BIOS stepping blindly and giving up.
-  - **WRITE TRACK (0xFX) — format. IMPLEMENTED, not yet hardware-verified.**
+  - **WRITE TRACK (0xFX) — format. ✅ DONE (hardware-verified).** Formatting
+    track 70 as 9x512 interleave 2 and scanning it back returns all nine
+    sectors, in the interleaved physical order 1,6,2,7,3,8,4,9,5, every one
+    with a valid ID **and** data CRC — which is the proof that the missing-clock
+    sync marks, the once-per-run CRC preset and the `F7` CRC emission are all
+    right, since any of the three being wrong makes the ID field unreadable.
     The host shifts in a whole track image and `mfm_encode_format_image()`
     obeys the four write-channel commands in it: `F5` writes 0xA1 with a
     missing clock bit and presets the CRC, `F6` writes 0xC2 the same way, `F7`
@@ -229,7 +234,12 @@ BUSY-polling covers latency instead, per the ROM driver).
       both checked before anything is destroyed. Test with
       `mzp_probe.py PORT fmtverify <track>` (format, then read the sectors
       back) on a scratch disk.
-  - **READ TRACK (0xEX). IMPLEMENTED, not yet hardware-verified.** Returns every
+  - **READ TRACK (0xEX). IMPLEMENTED; first hardware run found a bug, fixed,
+    awaiting re-test.** The first version dropped the rule governing the symbol
+    immediately after a sync mark and so latched *clock* bits as data: gaps came
+    back as 0x84 rather than 0x4E — not even a rotation of it, which is what
+    identified the fault as a parity error rather than an arbitrary byte
+    boundary — and no address mark was ever recognisable. Returns every
     byte on the track — gaps, address marks, CRC bytes — uninterpreted, via
     `mfm_read_track_raw()`. It is the one decode here that cannot anchor itself
     to a sync mark, since the point is to see what lies between them, so it

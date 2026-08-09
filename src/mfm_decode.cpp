@@ -220,29 +220,54 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
   io.T3_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 3.5e-6f);
 
   size_t n = 0;
-  // Bit assembly, same rules as receive_crc() but free-running: `state` tracks
-  // whether the next symbol carries data or clock bits, `tmp`/`weight` shift a
-  // byte together. The sync-mark detector runs in parallel so a mark can force
-  // both the phase and the byte boundary back into agreement with the disk.
+  // Bit assembly, same rules as receive_crc() but free-running: `state` says
+  // whether the next symbol carries the data bit or the clock bit, `tmp`/
+  // `weight` shift a byte together. The sync-mark detector runs in parallel so
+  // a mark can force both the phase and the byte boundary back into agreement
+  // with what is actually on the disk.
   unsigned tmp = 0, weight = 0x8000;
   mfm_state_t state = mfm_io_even;
   uint32_t mark = 0;
+  bool resync = false; // the next symbol is the one after a sync mark
 
   while (!mfm_io_eof(&io) && n < out_size) {
     mfm_io_symbol_t s = mfm_io_read_symbol(&io);
 
     mark = ((mark << 2) | (uint32_t)s) & mfm_io_triple_mark_mask;
     if (mark == mfm_io_triple_mark_magic) {
-      // An 0xA1 sync just went past. Whatever phase we had drifted into, the
-      // disk says the next data bit starts here -- take it, and start a fresh
-      // byte. This is the only correction available in a stream with no other
-      // structure, and it is what keeps the interesting parts (the address
-      // marks and the fields behind them) byte-aligned in the output.
+      // Three 0xA1s with missing clock bits just went past. They are really on
+      // the disk, so emit all three -- and more importantly, take the phase.
+      for (int k = 0; k < 3 && n < out_size; ++k)
+        out[n++] = 0xA1;
       tmp = 0;
       weight = 0x8000;
-      state = mfm_io_even;
-      if (n < out_size)
-        out[n++] = 0xA1; // the mark itself, which no data pattern can produce
+      resync = true;
+      continue;
+    }
+
+    if (resync) {
+      // Exactly receive_crc()'s rule for the first symbol after a mark: on
+      // arrival we are still waiting to parse the final '1' data bit of the
+      // sync, so this symbol sets the parity and may carry a leading 0 -- it
+      // does NOT contribute a bit under the normal rule.
+      //
+      // Skipping this is what made the decoder latch clock bits as data: the
+      // gaps came back as 0x84 instead of 0x4E, which is not even a rotation
+      // of it, and no address mark was ever recognisable.
+      resync = false;
+      switch (s) {
+      case mfm_io_pulse_100:
+        state = mfm_io_odd;
+        weight >>= 1; // a leading 0 data bit
+        break;
+      case mfm_io_pulse_1000:
+        state = mfm_io_even;
+        weight >>= 1; // likewise
+        break;
+      default:
+        state = mfm_io_even;
+        break;
+      }
       continue;
     }
 
