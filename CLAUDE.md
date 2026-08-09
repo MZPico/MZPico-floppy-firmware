@@ -288,9 +288,12 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     wire each, so the incoming drive's beliefs about them are stale by
     definition). Units 2/3 report NOT READY. Bench: `mzp_probe.py drive [0|1]`,
     escape hatch `drvlock 1`. An absent/empty unit reports NOT READY (from the
-    index sighting, which was previously discarded). **Verified single-drive on
-    hardware:** `drive 1` RNFs with 0 flux while `drive 0` reads clean, one
-    select line asserted at a time. Nothing here has met a *second* drive — see
+    index sighting, which was previously discarded). **Verified on two physical
+    drives:** each unit reads its own media; `drvstat` shows the heads parked on
+    different cylinders across selects (40 and 0) and drive 0 reads cylinder 40
+    afterwards without re-stepping; `wp` follows the write-protected disk across
+    selects. Only the catch-up seek on select is unproven — it needs host Type I
+    commands to create the divergence. See
     [docs/phase3-plan.md](docs/phase3-plan.md).
     - `~MOTOR_ON` reaches every drive on the cable (J3 wires it to floppy pins
       10 *and* 16), so it is **not** gated by drive select: selecting an absent

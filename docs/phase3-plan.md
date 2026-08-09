@@ -391,11 +391,33 @@ BUSY-polling covers latency instead, per the ROM driver).
       independent and that asserting `~DS1` does not deselect the working drive.
       (The `drive` query reports the *previous* select until the next actuating
       command runs; the select is applied lazily by core0.)
-    - **What has NOT been shown:** anything with two drives physically
-      attached. Every claim above is a design property, not a measurement. The
-      first test is a bench one on a single drive — `drive 1` must fail to find
-      the disk that `drive 0` finds — because that alone proves the select
-      lines are independent and that neither one deselects the working drive.
+    - **Two-drive bench result (hardware).** With both drives on the cable, as
+      wired, no strap or twist change needed:
+      1. each unit reads its own media (CP/M data from drive 0, a test pattern
+         from drive 1 — same track and sector);
+      2. `drive 0` + `fdcseek 40`, then `drive 1` + `fdcseek 0`, then one
+         `drvstat`: unit 0 head **40**, unit 1 head **0**. A shared head model
+         shows both at 0. This is the check the whole design rests on;
+      3. straight after (2), `drive 0` + `fdcread 40` reads clean without
+         re-stepping — drive 0's head never left cylinder 40 while drive 1
+         restored;
+      4. with only drive 1's disk write-protected, `wp` follows the protected
+         disk across selects (`ST=04` vs `ST=44[WP]`). That is the
+         refresh-`~WPT`-on-select path, and it is what stands between a WRITE
+         SECTOR and a protected disk in the other drive.
+    - **Still unproven: the catch-up seek on select.** It only fires when
+      `head_target` diverges from the head, and only core1 sets `head_target` —
+      from real host Type I commands. Bench seeks drive the head directly and
+      never create that divergence, so this first gets exercised under CP/M.
+    - **Diagnostics must name the drive they describe.** `fdcdump` renders the
+      drive core0 is *driving*, while the select is applied lazily by the next
+      actuating command — so a dump taken right after `drive 1` reported drive
+      0's head position with nothing on the line to say so. It now prints
+      `drv=N`, or `drv=N(driving M)` when they disagree, and shows `wp`/`t0` as
+      `?` while nothing is driven rather than rendering their initial values as
+      senses. `wp=0` is the dangerous one to invent: it decides whether a write
+      is refused. `drvstat` was unaffected — it reads each drive object
+      directly — which is the argument for it existing.
 - **3.5 — Robustness.** Error/retry paths, edge-case timing, soak testing.
   - **Write precomp: not needed so far.** `wrsoak` verified 200/200 writes over
     tracks 0–76 (both sides, 5 passes, pseudo-random patterns), covering the
