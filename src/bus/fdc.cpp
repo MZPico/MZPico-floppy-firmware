@@ -218,6 +218,40 @@ struct FdcState {
   volatile uint8_t last_phys_track = 0xFF;
   volatile uint8_t last_want_side = 0xFF; // physical head we were on
 
+  // Head-position resyncs: times an ID field proved the head was not where we
+  // believed, and we adopted the disk's answer (see fdc_resync_head).
+  volatile uint32_t pos_resyncs = 0;
+  volatile uint8_t last_resync_from = 0xFF; // cylinder we were actually on
+  volatile uint8_t last_resync_to = 0xFF;   // cylinder we meant to be on
+
+  // ---- First-failure latch -----------------------------------------------
+  // Every other diagnostic here describes the LAST operation, which is exactly
+  // the wrong one when a host retries: the retry that succeeds overwrites the
+  // evidence of the failure that caused the visible symptom. The rare
+  // `FD:Loading error` on boot (~1 in 20) has survived precisely because of
+  // this -- by the time anyone can run `rddiag`, the ROM has retried and the
+  // snapshot shows a clean read.
+  //
+  // So: capture the FIRST failure since power-up in full, and never overwrite
+  // it. Cleared only by an explicit probe command.
+  volatile bool ff_valid = false;
+  volatile uint32_t ff_count = 0;   // failures seen since power-up (all of them)
+  volatile uint32_t ff_at_ms = 0;   // ms since boot -- how early it happened
+  volatile uint8_t ff_kind = 0;     // 1 RNF, 2 data CRC, 3 wrong cylinder,
+                                    // 4 Verify/seek error
+  volatile uint8_t ff_want_sec = 0; // what was asked for
+  volatile uint8_t ff_trk_reg = 0;  // ...and the whole position chain, sampled
+  volatile uint8_t ff_head_target = 0; //    together so it is self-consistent
+  volatile uint8_t ff_phys_track = 0;
+  volatile uint8_t ff_side = 0;
+  volatile uint8_t ff_seen_cyl = 0xFF; // what the disk said instead
+  volatile uint8_t ff_seen_head = 0xFF;
+  volatile uint8_t ff_capture_ok = 0;
+  volatile uint32_t ff_flux_n = 0;
+  volatile uint32_t ff_capture_us = 0;
+  volatile uint8_t ff_ids_seen = 0;
+  volatile uint8_t ff_ids[16] = {0}; // the sector numbers really on the track
+
   volatile uint32_t status_polls = 0;
   volatile uint32_t status_last_us = 0;
 
@@ -697,6 +731,57 @@ inline uint32_t now_ms() { return to_ms_since_boot(get_absolute_time()); }
 // (or failed to put) flux on the disk -- the bench command is the tool the
 // write path is brought up with, so leaving it out of the counters made the
 // diagnostic read "no write yet" straight after a successful write.
+// Latch the first failure since power-up, in full. Every field is sampled here,
+// at the moment of the failure, so the position chain in the report is one
+// consistent set rather than four values read at four different times.
+// `seen_cyl`/`seen_head` are 0xFF when the disk said nothing.
+static void fdc_note_failure(uint8_t kind, uint8_t want_sec, uint8_t seen_cyl,
+                             uint8_t seen_head) {
+  S.ff_count++;
+  if (S.ff_valid)
+    return; // first one wins, forever -- that is the whole point
+  S.ff_valid = true;
+  S.ff_at_ms = to_ms_since_boot(get_absolute_time());
+  S.ff_kind = kind;
+  S.ff_want_sec = want_sec;
+  S.ff_trk_reg = S.track;
+  S.ff_head_target = (uint8_t)S.head_target;
+  int pt = DRV ? DRV->track() : -1;
+  S.ff_phys_track = (pt < 0) ? 0xFE : (uint8_t)pt;
+  S.ff_side = S.side1 ? 1 : 0;
+  S.ff_seen_cyl = seen_cyl;
+  S.ff_seen_head = seen_head;
+  S.ff_capture_ok = S.rd_capture_ok ? 1 : 0;
+  S.ff_flux_n = S.rd_flux_n;
+  S.ff_capture_us = S.rd_capture_us;
+  S.ff_ids_seen = S.rd_ids_seen;
+  for (int k = 0; k < 16; ++k)
+    S.ff_ids[k] = S.rd_ids[k];
+}
+
+// The head is provably on `seen_cyl`: an ID field read off the disk said so,
+// while we believed something else. Adopt the observed position and drive back
+// to where we meant to be.
+//
+// This is what turns the WD ID track compare from a detector into a repair. The
+// compare already stops us handing over (or overwriting) another cylinder's
+// data, but on its own it produces an RNF from a head that is still in the
+// wrong place, so the host's retry fails identically and forever. The disk
+// itself is the only position reference a floppy has, and this is the one
+// moment it speaks: use it.
+static void fdc_resync_head(uint8_t seen_cyl) {
+  if (!DRV)
+    return;
+  S.pos_resyncs++;
+  S.last_resync_from = seen_cyl;
+  S.last_resync_to = (uint8_t)S.head_target;
+  DRV->set_track_belief((int)seen_cyl);
+  int tgt = S.head_target;
+  if ((int)seen_cyl != tgt)
+    DRV->goto_track(tgt);
+  S.at_track0 = DRV->get_track0_sense();
+}
+
 inline void fdc_record_splice(const SpliceResult &sr) {
   S.wr_ids_seen = sr.ids_seen;
   S.wr_splice_us = sr.search_us;
@@ -1337,6 +1422,39 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->bt_err_count = (uint16_t)S.bt_err_count;
 }
 
+void fdc_firstfail_snapshot(FdcFirstFail *o) {
+  o->valid = S.ff_valid ? 1 : 0;
+  o->kind = S.ff_kind;
+  o->count = S.ff_count;
+  o->at_ms = S.ff_at_ms;
+  o->want_sec = S.ff_want_sec;
+  o->trk_reg = S.ff_trk_reg;
+  o->head_target = S.ff_head_target;
+  o->phys_track = S.ff_phys_track;
+  o->side = S.ff_side;
+  o->seen_cyl = S.ff_seen_cyl;
+  o->seen_head = S.ff_seen_head;
+  o->capture_ok = S.ff_capture_ok;
+  o->flux_n = S.ff_flux_n;
+  o->capture_us = S.ff_capture_us;
+  o->ids_seen = S.ff_ids_seen;
+  for (int k = 0; k < 16; ++k)
+    o->ids[k] = S.ff_ids[k];
+  o->pos_resyncs = S.pos_resyncs;
+  o->last_resync_from = S.last_resync_from;
+  o->last_resync_to = S.last_resync_to;
+}
+
+void fdc_firstfail_reset(void) {
+  S.ff_valid = false;
+  S.ff_count = 0;
+  S.ff_kind = 0;
+  S.ff_at_ms = 0;
+  S.ff_seen_cyl = S.ff_seen_head = 0xFF;
+  S.pos_resyncs = 0;
+  S.last_resync_from = S.last_resync_to = 0xFF;
+}
+
 void fdc_set_side_invert(bool on) { g_invert_side = on; }
 bool fdc_get_side_invert(void) { return g_invert_side; }
 
@@ -1671,6 +1789,8 @@ void fdc_disk_task(void) {
     // field before reporting success. Real WD1793 behavior -- see
     // mfm_verify_track().
     S.seek_error = verify ? !fdc_verify_track(S.track) : false;
+    if (S.seek_error)
+      fdc_note_failure(4, 0, 0xFF, 0xFF);
 
     S.op_done = seq;
     // Clear BUSY only if this seek is still the active command. A newer Type I
@@ -1781,6 +1901,10 @@ void fdc_disk_task(void) {
         S.sec_cyl_mismatch++;
         S.last_id_cyl = sr.seen_cyl;
         S.last_id_head = sr.seen_head;
+        fdc_note_failure(3, want, sr.seen_cyl, sr.seen_head);
+        fdc_resync_head(sr.seen_cyl);
+      } else {
+        fdc_note_failure(1, want, 0xFF, 0xFF);
       }
     }
 
@@ -1973,6 +2097,8 @@ void fdc_disk_task(void) {
         if (!sd.data_crc_ok) {
           S.err_crc = true;
           S.multi = false;
+          if (!S.read_addr)
+            fdc_note_failure(2, want, sd.cyl, sd.head);
           // Guarded like sec_ok below: this counter is what rddiag prints as
           // "handed the host corrupt bytes", so a READ ADDRESS must never reach
           // it. Unreachable today (the read_addr branch synthesises
@@ -2029,6 +2155,13 @@ void fdc_disk_task(void) {
             S.last_id_head = sd.seen_head; // else it pairs with a stale head
             S.last_trk_reg = S.track;
             S.last_want_side = S.side1 ? 1 : 0;
+            fdc_note_failure(3, want, sd.seen_cyl, sd.seen_head);
+            // The disk just told us where the head really is. Take it: without
+            // this the host's retry repeats from the same wrong cylinder and
+            // fails identically, forever.
+            fdc_resync_head(sd.seen_cyl);
+          } else {
+            fdc_note_failure(1, want, 0xFF, 0xFF);
           }
         }
         S.drq = false;

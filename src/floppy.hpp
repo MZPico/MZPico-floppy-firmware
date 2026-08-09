@@ -29,6 +29,12 @@ public:
   void step(bool dir, uint8_t times);
   bool side(int head);
   int track() const { return _track; }
+  // Overwrite the cached head position with one that has been OBSERVED rather
+  // than assumed -- the cylinder byte of an ID field actually read off the
+  // disk. _track is otherwise derived from the moves we asked for, so it has no
+  // way back to reality after a lost step except a seek to TRK00. Pass -1 to
+  // mean "unknown", which forces the next goto_track() to recalibrate.
+  void set_track_belief(int t) { _track = t; }
   int get_side() const { return _side; }
 
   bool read_index();

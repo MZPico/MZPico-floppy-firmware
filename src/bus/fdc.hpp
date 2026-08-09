@@ -122,6 +122,37 @@ struct FdcDebug {
 };
 void fdc_debug_snapshot(FdcDebug *out);
 
+// First-failure latch. Every other diagnostic describes the LAST operation,
+// which is the wrong one as soon as a host retries: the successful retry
+// overwrites the evidence of the failure that caused the visible symptom. This
+// holds the FIRST failure since power-up, in full and unaltered, plus a running
+// count of all of them. `valid` is 0 until something has actually failed.
+struct FdcFirstFail {
+  uint8_t valid;
+  uint8_t kind;        // 1 RNF, 2 data CRC, 3 wrong cylinder, 4 Verify/seek
+  uint32_t count;      // failures since power-up (not just the latched one)
+  uint32_t at_ms;      // ms since boot -- says whether it was a cold-start
+  uint8_t want_sec;
+  uint8_t trk_reg;     // the position chain, all sampled at the failure
+  uint8_t head_target;
+  uint8_t phys_track;
+  uint8_t side;
+  uint8_t seen_cyl;    // what the disk said instead (0xFF = it said nothing)
+  uint8_t seen_head;
+  uint8_t capture_ok;
+  uint32_t flux_n;
+  uint32_t capture_us;
+  uint8_t ids_seen;
+  uint8_t ids[16];     // the sector numbers really on the track
+  // Head-position resyncs: an ID field proved the head was elsewhere and we
+  // adopted the disk's answer (fdc_resync_head).
+  uint32_t pos_resyncs;
+  uint8_t last_resync_from;
+  uint8_t last_resync_to;
+};
+void fdc_firstfail_snapshot(FdcFirstFail *out);
+void fdc_firstfail_reset(void);
+
 // Ordered I/O trace (see the io_* ring in fdc.cpp). Entries run oldest ->
 // newest; `rep` counts coalesced consecutive identical accesses, so a STATUS
 // poll loop shows up as one entry with a large repeat rather than flooding the

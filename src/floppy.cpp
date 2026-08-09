@@ -206,6 +206,27 @@ bool FloppyDrive::goto_track(int track_num) {
 
   if (track_num > FLOPPY_MAX_TRACK - 1)
     track_num = FLOPPY_MAX_TRACK - 1;
+
+  // Cross-check the belief against the one position the drive can actually
+  // report. _track is otherwise pure bookkeeping -- it is set from the number
+  // we *asked* for, so a single lost STEP pulse (or a step the head could not
+  // make) becomes a permanent off-by-one, and the early return below then keeps
+  // us from ever re-issuing the move that would fix it. TRK00 disagreeing with
+  // the belief is proof the belief is wrong, and re-seeking to 0 is the only
+  // resync a floppy offers.
+  //
+  // This mattered less when the bridge was read-only: the WD ID track compare
+  // turned a mispositioned head into an RNF and the host retried. A write
+  // cannot be retried after the fact, so relying on the last line of defence
+  // for a condition the first line should prevent is no longer acceptable.
+  if (_track >= 0 && _track0pin >= 0) {
+    bool at_zero = !read_pin(_track0pin);
+    if (at_zero != (_track == 0)) {
+      _track = -1; // belief is provably wrong -> force the TRK00 recalibrate
+      return goto_track(track_num);
+    }
+  }
+
   if (_track == track_num)
     return true;
 

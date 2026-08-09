@@ -151,17 +151,29 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Write soak + inner tracks.** WRITE SECTOR is verified (3.3) but only over
   tens of writes on outer tracks. Still open: whether inner tracks need
   write-precomp, and whether the +2-byte splice bias holds across drives and
-  media with more spindle-speed spread.
+  media with more spindle-speed spread. The tool for it now exists —
+  `mzp_probe.py PORT wrsoak` writes and verifies across the whole surface with a
+  fresh pattern each pass; failures clustering on high track numbers would be
+  the precomp question answering itself. **Needs running.**
 - **Rare `FD:Loading error` on boot** (~1 in 20; everything else reads clean).
-  `rddiag` only shows the *last* read, so later retries overwrite the evidence —
-  chasing it wants a **first-failure latch** holding the first RNF since
-  power-up. Suspects: a capture taken before the spindle is stable, or the 5 ms
-  `settle_delay_ms` being marginal right after a seek.
-- **`goto_track()` assumes the head arrived** — `_track = track_num` is set
-  unconditionally, and it early-returns when `_track` already matches, so one
-  genuinely lost STEP pulse becomes permanent until a seek to 0 resyncs via the
-  TRK00 sense. Not currently biting, but it silently defeats the ID track
-  compare's ability to self-correct.
+  The **first-failure latch** it needed now exists (`mzp_probe.py firstfail`):
+  it holds the first RNF/CRC/wrong-cylinder/Verify failure since power-up in
+  full, with the whole position chain sampled at that instant, so a host's
+  successful retry can no longer erase the evidence. Still to do: catch one.
+  `at_ms` is the discriminator — under ~3 s points at a capture taken before the
+  spindle was stable rather than at the decode path; the suspects otherwise are
+  the 5 ms `settle_delay_ms` right after a seek.
+- ~~**`goto_track()` assumes the head arrived**~~ — ✅ addressed, two ways.
+  `goto_track()` now cross-checks its belief against the TRK00 sense on every
+  call and forces a recalibrate when they disagree (the belief is derived from
+  moves we *asked* for, so a lost STEP pulse used to become a permanent
+  off-by-one that the early return then prevented us from ever fixing). And the
+  FDC now treats a wrong-cylinder ID as a **position fix, not just an error**:
+  `fdc_resync_head()` adopts the cylinder the disk reported and drives back to
+  `head_target`, so the host's retry no longer repeats from the same wrong
+  place forever. Counted as `pos_resyncs` in `firstfail`. This turns the WD ID
+  track compare from a detector into a repair — which matters much more now
+  that a mispositioned head can destroy data rather than just garble a read.
 
 ## Conventions (inherited from the reference firmware)
 

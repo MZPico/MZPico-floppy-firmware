@@ -22,6 +22,8 @@ Usage:
     python mzp_probe.py PORT wrdiag                       # why the last WRITE SECTOR wrote / was refused
     python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
+    python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
+    python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
 
   MZ-800 bus-test programs to run against `bustest` (Z80 machine code):
     write only : 3E 00 D3 DF 3C 18 FB
@@ -41,6 +43,12 @@ Usage:
   scan    - seek a real track, capture flux, decode its sectors on-device.
   enctest - encode a synthetic track then decode it (no disk); validates the
             MFM encoder + CRC generation via a round-trip.
+  firstfail - the diagnostic for faults that RETRY away. Every other command
+            here shows the last operation, so a host's successful retry erases
+            the failure that caused the symptom; this latches the first one.
+  wrsoak  - the test that answers "does this need write precompensation on
+            inner tracks": enough writes, spread over the surface, for a rare
+            fault to show up. Overwrites one sector per track. Scratch disk.
   fdcwrite/wrverify - the Milestone 3.3 write splice. These OVERWRITE one
             sector's data field on the disk in the drive; use a scratch disk.
             wrverify is the one to run: it writes a pattern, reads it back
@@ -71,6 +79,7 @@ MZP_CMD_IOTRACE = 0x90
 MZP_CMD_FDCWRITE = 0x91
 MZP_CMD_WRDIAG = 0x92
 MZP_CMD_WREN = 0x93
+MZP_CMD_FIRSTFAIL = 0x94
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -798,6 +807,128 @@ def do_wrdiag(s):
               "the splice was skipped rather than risk the next ID field")
 
 
+FF_KINDS = {0: "(none)", 1: "RNF -- sector not on this track",
+            2: "data CRC error", 3: "WRONG CYLINDER",
+            4: "Verify/seek error"}
+
+
+def do_firstfail(s, clear=False):
+    """The first failure since power-up, held unaltered.
+
+    Everything else here reports the LAST operation, which is the wrong one the
+    moment a host retries -- the retry that succeeds erases the evidence. That
+    is why the rare boot-time `FD:Loading error` has never been diagnosable.
+    """
+    s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
+    s.flush()
+    r = read_exact(s, 51)
+    if len(r) < 51 or r[1] != 0:
+        print(f"bad/short reply: {r.hex()}")
+        return
+    valid, kind = r[2], r[3]
+    count = int.from_bytes(r[4:8], "little")
+    at_ms = int.from_bytes(r[8:12], "little")
+    (want, trk, tgt, phys, side, seen_c, seen_h, cap_ok) = r[12:20]
+    flux_n = int.from_bytes(r[20:24], "little")
+    cap_us = int.from_bytes(r[24:28], "little")
+    ids_seen = r[28]
+    ids = list(r[29:45])
+    resyncs = int.from_bytes(r[45:49], "little")
+    rs_from, rs_to = r[49], r[50]
+
+    print(f"failures since power-up: {count}")
+    print(f"head-position resyncs:   {resyncs}"
+          + (f"  (last: disk said {rs_from}, we wanted {rs_to})"
+             if resyncs else ""))
+    if not valid:
+        print("no failure latched yet -- nothing has gone wrong since boot")
+        return
+    print(f"\nFIRST failure, at {at_ms / 1000:.1f} s after boot:")
+    print(f"  kind      : {FF_KINDS.get(kind, kind)}")
+    print(f"  wanted    : sector {want} on track-reg {trk}, side {side}")
+    print(f"  position  : head_target={tgt} phys_track="
+          f"{'?' if phys == 0xFE else phys}"
+          + (f"  disk said cyl={seen_c} head={seen_h}"
+             if seen_c != 0xFF else ""))
+    print(f"  capture   : {'started' if cap_ok else 'DID NOT START'}, "
+          f"{flux_n} flux bytes in {cap_us / 1000:.1f} ms")
+    print(f"  ids on trk: {ids[:ids_seen] if ids_seen else '(none decoded)'}")
+    # The point of latching this is to separate the causes, so say which.
+    if at_ms < 3000:
+        print("  -> happened within 3 s of boot: suspect the spindle was not "
+              "yet stable, not the decode path")
+    if cap_ok and flux_n == 0:
+        print("  -> capture started but produced no flux: no disk, or the "
+              "motor was not running")
+    if kind == 3:
+        print("  -> the head was on the wrong cylinder; compare head_target "
+              "vs phys_track vs what the disk said to place the blame")
+    elif kind == 1 and ids_seen:
+        print("  -> the track decoded fine, it simply does not carry that "
+              "sector number")
+
+
+def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
+    """Write/verify soak across many tracks and sides.
+
+    16 writes on one outer track is a demo. This is the test that answers the
+    questions still open on the write path -- whether inner tracks need write
+    precompensation, and whether the splice bias holds over a whole disk -- by
+    doing enough of them, in the places most likely to fail, to make a rare
+    fault show up. Every pass uses a different seed so a stale-buffer bug cannot
+    masquerade as a successful write.
+    """
+    ok = bad = 0
+    failures = []
+    seed = start_seed
+    for p in range(passes):
+        for t in tracks:
+            for sd in sides:
+                seed = (seed + 37) & 0xFF
+                n = 128 << (sizecode & 7)
+                want = gen_pattern(2, seed, n)
+                s.write(bytes([MZP_CMD_FDCWRITE, 8, t, sector, sd,
+                               sizecode & 7, 2, seed]))
+                s.flush()
+                w = read_exact(s, 6)
+                wrote = len(w) == 6 and w[1] == 0 and w[2] == 1
+                flags = w[3] if len(w) == 6 else 0
+                got = b""
+                crc_ok = False
+                if wrote:
+                    s.write(bytes([MZP_CMD_FDCREAD, 6, t, sector, sd, 0]))
+                    s.flush()
+                    h = read_exact(s, 5)
+                    if len(h) == 5 and h[1] == 0:
+                        crc_ok = bool(h[2] & 4)
+                        size = h[3] | (h[4] << 8)
+                        got = read_exact(s, size) if size else b""
+                good = wrote and crc_ok and got == want
+                if good:
+                    ok += 1
+                else:
+                    bad += 1
+                    why = ("not written" if not wrote else
+                           "bad CRC on read-back" if not crc_ok else
+                           "data mismatch")
+                    names = [nm for bit, nm in SPLICE_FLAGS if flags & bit]
+                    failures.append((p, t, sd, why, ",".join(names)))
+                    print(f"  FAIL pass {p} track {t} side {sd}: {why} "
+                          f"[{','.join(names) or '-'}]")
+        print(f"pass {p + 1}/{passes}: {ok} ok, {bad} failed")
+    print(f"\nsoak done: {ok} ok, {bad} failed "
+          f"({len(tracks)} tracks x {len(sides)} sides x {passes} passes)")
+    if failures:
+        print("failures (pass, track, side, why, splice flags):")
+        for f in failures:
+            print(f"  {f}")
+        print("\nIf these cluster on high track numbers, that is the "
+              "write-precompensation question answering itself.")
+    else:
+        print("No failures. Run `firstfail` and `wrdiag` for the "
+              "controller's own view.")
+
+
 def do_pintest(s):
     s.write(bytes([MZP_CMD_PINTEST, 2]))
     s.flush()
@@ -926,6 +1057,21 @@ def main():
                 do_wrverify(s, track, sector, side, sizecode, mode, seed)
         elif cmd == "wrdiag":
             do_wrdiag(s)
+        elif cmd == "firstfail":
+            # optional "clear" to re-arm the latch for a fresh run
+            do_firstfail(s, clear=(len(sys.argv) > 3
+                                   and sys.argv[3] == "clear"))
+        elif cmd == "wrsoak":
+            # !! WRITES THE DISK, repeatedly, across the whole surface.
+            # args: [passes] [sector] [t_start] [t_end] [t_step] [sides]
+            passes = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+            sector = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+            t0 = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+            t1 = int(sys.argv[6]) if len(sys.argv) > 6 else 39
+            step = int(sys.argv[7]) if len(sys.argv) > 7 else 4
+            sides = ([int(sys.argv[8])] if len(sys.argv) > 8 else [0, 1])
+            do_wrsoak(s, list(range(t0, t1 + 1, step)), sides, passes,
+                      sector, 2, 0x11)
         elif cmd == "wren":
             # no arg = query (2), else 0 = read-only, 1 = writes enabled
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2

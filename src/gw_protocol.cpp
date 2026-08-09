@@ -67,6 +67,7 @@
 #define MZP_CMD_FDCWRITE 0x91 // bench: WRITE SECTOR via the FDC (splice)
 #define MZP_CMD_WRDIAG 0x92   // why the last WRITE SECTOR wrote / refused
 #define MZP_CMD_WREN 0x93     // enable/disable writes from the MZ-800
+#define MZP_CMD_FIRSTFAIL 0x94 // first read/seek failure since power-up (sticky)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1094,6 +1095,47 @@ void gw_task() {
     reply_buffer[i++] = n & 0xFF;
     reply_buffer[i++] = (n >> 8) & 0xFF;
     cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FIRSTFAIL) {
+    // cmd_buffer[2]: 1 = clear the latch after reporting (arm for a new run).
+    // [cmd, ACK, valid, kind, count(4), at_ms(4), want_sec, trk_reg,
+    //  head_target, phys_track, side, seen_cyl, seen_head, capture_ok,
+    //  flux_n(4), capture_us(4), ids_seen, ids[16], pos_resyncs(4),
+    //  resync_from, resync_to] -- 51 bytes.
+    FdcFirstFail f;
+    fdc_firstfail_snapshot(&f);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = f.valid;
+    reply_buffer[i++] = f.kind;
+    const uint32_t c32[] = {f.count, f.at_ms};
+    for (uint32_t v : c32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    reply_buffer[i++] = f.want_sec;
+    reply_buffer[i++] = f.trk_reg;
+    reply_buffer[i++] = f.head_target;
+    reply_buffer[i++] = f.phys_track;
+    reply_buffer[i++] = f.side;
+    reply_buffer[i++] = f.seen_cyl;
+    reply_buffer[i++] = f.seen_head;
+    reply_buffer[i++] = f.capture_ok;
+    const uint32_t f32[] = {f.flux_n, f.capture_us};
+    for (uint32_t v : f32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    reply_buffer[i++] = f.ids_seen;
+    for (int k = 0; k < 16; k++)
+      reply_buffer[i++] = f.ids[k];
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (f.pos_resyncs >> (8 * k)) & 0xFF;
+    reply_buffer[i++] = f.last_resync_from;
+    reply_buffer[i++] = f.last_resync_to;
+    cdc_write_all(reply_buffer, i);
+    if (cmd_buffer[2] == 1)
+      fdc_firstfail_reset();
   }
 
   else if (cmd == MZP_CMD_WRDIAG) {
