@@ -74,6 +74,8 @@
 #define MZP_CMD_RESETPOLL 0x98 // enable/disable the core1 bus-RESET poller
 #define MZP_CMD_POSFIX 0x99    // enable/disable head-position self-correction
 #define MZP_CMD_FMTEN 0x9A     // enable/disable host-initiated WRITE TRACK
+#define MZP_CMD_DRVSEL 0x9B    // bench: which unit (~DS0/~DS1) the FDC drives
+#define MZP_CMD_DRVLOCK 0x9C   // pin every access to drive 0 (escape hatch)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -97,9 +99,23 @@
 // readypin < 0, which is the right answer for a PC drive. (This used to be
 // PIN_DS1 -- GPIO25, a drive-select *output* -- so ready-sense was reading back
 // our own select line.)
-static FloppyDrive g_drive(PIN_DENSITY, PIN_INDEX, PIN_SELECT, PIN_MOTOR,
-                           PIN_DIR, PIN_STEP, PIN_WDATA, PIN_WGATE, PIN_TRK00,
-                           PIN_WPT, PIN_RDATA, PIN_HDSEL, -1);
+//
+// Two instances, one per ~DSn line, sharing every other pin. Everything that is
+// genuinely per-drive -- the head position, and the TRK00 cross-check built on
+// it -- is per-instance state, which is exactly what a second drive needs and
+// what a single instance could not express. The shared lines are handed over on
+// each select; see FloppyDrive::adopt_shared_lines().
+static FloppyDrive g_drive0(PIN_DENSITY, PIN_INDEX, PIN_DS0, PIN_MOTOR,
+                            PIN_DIR, PIN_STEP, PIN_WDATA, PIN_WGATE, PIN_TRK00,
+                            PIN_WPT, PIN_RDATA, PIN_HDSEL, -1);
+static FloppyDrive g_drive1(PIN_DENSITY, PIN_INDEX, PIN_DS1, PIN_MOTOR,
+                            PIN_DIR, PIN_STEP, PIN_WDATA, PIN_WGATE, PIN_TRK00,
+                            PIN_WPT, PIN_RDATA, PIN_HDSEL, -1);
+static FloppyDrive *g_drives[2] = {&g_drive0, &g_drive1};
+// The greaseweazle/USB path is single-drive by protocol: gw has no concept of a
+// second unit here, so it always talks to drive 0. Bench access to drive 1 goes
+// through the FDC bridge's own drive select (`mzp_probe.py drive 1`).
+static FloppyDrive &g_drive = g_drive0;
 static FloppyDrive *floppy = nullptr;
 
 static uint8_t cmd_buffer[32];
@@ -189,20 +205,19 @@ void gw_init() {
   // Bring up the drive GPIOs and hand the drive to the FDC bridge. The FDC disk
   // task stays idle until the MZ-800 first touches an FDC port, so it doesn't
   // conflict with greaseweazle/USB drive control when no machine is attached.
-  // Park the unused second drive-select HIGH (= deselected; ~DS1 is active low)
-  // BEFORE bringing the drive up. Nothing else touches GPIO25: FloppyDrive only
-  // knows about PIN_SELECT (= ~DS0). RP2040 pads power up as inputs with a
-  // pull-DOWN, so leaving this pin alone asserts ~DS1 permanently and a second
-  // drive answers alongside (or instead of) drive 0. This used to happen by
-  // accident -- PIN_DS1 was passed as FloppyDrive's `readypin`, whose
-  // init_in_pullup() parked it high as a side effect. That slot is now -1 (see
-  // the constructor above), so the parking has to be explicit.
-  gpio_init(PIN_DS1);
-  gpio_put(PIN_DS1, 1);
-  gpio_set_dir(PIN_DS1, GPIO_OUT);
-
-  g_drive.begin();
-  fdc_init(&g_drive);
+  // Both drive-select lines must be parked HIGH (= deselected; ~DSn is active
+  // low) before anything else. RP2040 pads power up as inputs with a pull-DOWN,
+  // so a select line left alone is asserted permanently and that drive answers
+  // alongside -- or instead of -- the one we mean. Each FloppyDrive::begin()
+  // parks its own ~DSn as part of soft_reset(), so bringing both up covers both
+  // lines; ~DS1 no longer needs the explicit parking it used to.
+  //
+  // Order matters only in that drive 1 is brought up FIRST: soft_reset() also
+  // re-parks the shared pins, so the last begin() to run leaves them in the
+  // known state, and drive 0 is the one we start selected on.
+  g_drive1.begin();
+  g_drive0.begin();
+  fdc_init(g_drives, 2);
 }
 
 void gw_task() {
@@ -545,8 +560,12 @@ void gw_task() {
     // MZPico Phase-2 validation: seek a track, capture raw flux, decode its
     // sectors on-device, and report the layout. cmd_buffer[2]=track,
     // [3]=side, [4]=density (0=DD/2.0us, 1=HD/1.0us).
-    if (!floppy)
-      setbustype(GW_CMD_SETBUSTYPE_IBM);
+    // Follow the FDC's drive select rather than the greaseweazle drive: with
+    // `drive 1` set, this must read drive 1. Hardwired to drive 0 it does not
+    // merely mislead -- fmtverify would format one disk and verify another, and
+    // a single-drive check of the select lines would always pass. Null = the
+    // host selected a unit this board has no select line for.
+    FloppyDrive *floppy = fdc_bench_drive();
     if (!floppy) {
       reply_buffer[i++] = GW_ACK_BADCMD;
       cdc_write_all(reply_buffer, 2);
@@ -573,7 +592,7 @@ void gw_task() {
                             sizeof(g_scan_scratch));
 
     floppy->spin_motor(false);
-    floppy->select(false);
+    fdc_bench_release();
 
     // Report: [cmd, ACK, ns, nflux(4 LE), then {cyl,head,sec,n,flags} * ns].
     reply_buffer[i++] = GW_ACK_OK;
@@ -599,8 +618,12 @@ void gw_task() {
     // call, to isolate whether that new capture path itself produces valid,
     // decodable flux -- independent of any live-FDC timing/settle questions.
     // cmd_buffer[2]=track, [3]=side, [4]=density, [5..6]=capture_ms (LE).
-    if (!floppy)
-      setbustype(GW_CMD_SETBUSTYPE_IBM);
+    // Follow the FDC's drive select rather than the greaseweazle drive: with
+    // `drive 1` set, this must read drive 1. Hardwired to drive 0 it does not
+    // merely mislead -- fmtverify would format one disk and verify another, and
+    // a single-drive check of the select lines would always pass. Null = the
+    // host selected a unit this board has no select line for.
+    FloppyDrive *floppy = fdc_bench_drive();
     if (!floppy) {
       reply_buffer[i++] = GW_ACK_BADCMD;
       cdc_write_all(reply_buffer, 2);
@@ -635,7 +658,7 @@ void gw_task() {
                             sizeof(g_scan_scratch));
 
     floppy->spin_motor(false);
-    floppy->select(false);
+    fdc_bench_release();
 
     // Same reply shape as MZP_CMD_SCAN: [cmd, ACK, ns, nflux(4 LE)] then
     // {cyl,head,sec,n,flags} * ns.
@@ -1185,6 +1208,36 @@ void gw_task() {
       fdc_set_format_enable(cmd_buffer[2] != 0);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = fdc_get_format_enable() ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_DRVSEL) {
+    // cmd_buffer[2]: 0..3 = select that unit, 4 (or more) = query only.
+    // Bench access to drive 1: every fdcread/fdcwrite/scan/fdcformat below
+    // follows the same drive field the MZ-800 writes to port 0xDC, so setting
+    // it here points the whole bench path at the second drive.
+    if (cmd_buffer[2] < 4)
+      fdc_set_drive(cmd_buffer[2]);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_drive();
+    // The live levels on both select lines, so "did the select actually move?"
+    // is answered by measurement rather than by whether a read happened to
+    // succeed. ~DSn is active LOW, so 0 = asserted. A drive that answers on
+    // both units shows up here as either both lines low (we never released the
+    // old one) or one line low while the other unit still reads the disk (the
+    // drive is strapped to answer regardless, or the cable twist puts both on
+    // its select input) -- and those want completely different fixes.
+    reply_buffer[i++] = (uint8_t)(gpio_get(PIN_DS0) ? 1 : 0);
+    reply_buffer[i++] = (uint8_t)(gpio_get(PIN_DS1) ? 1 : 0);
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_DRVLOCK) {
+    // cmd_buffer[2]: 0 = multi-drive (default), 1 = pin to drive 0, 2 = query.
+    if (cmd_buffer[2] < 2)
+      fdc_set_drive_lock(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_drive_lock() ? 1 : 0;
     cdc_write_all(reply_buffer, i);
   }
 

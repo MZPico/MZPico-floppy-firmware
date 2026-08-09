@@ -28,6 +28,8 @@ Usage:
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
     python mzp_probe.py PORT posfix [0|1]                 # head-position self-correction on/off (no arg = query)
     python mzp_probe.py PORT fmten [0|1]                  # allow WRITE TRACK from the MZ-800 (default OFF)
+    python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
+    python mzp_probe.py PORT drvlock [0|1]                # pin every access to drive 0, ignoring port 0xDC (no arg = query)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -100,6 +102,8 @@ MZP_CMD_RESETDIAG = 0x97
 MZP_CMD_RESETPOLL = 0x98
 MZP_CMD_POSFIX = 0x99
 MZP_CMD_FMTEN = 0x9A
+MZP_CMD_DRVSEL = 0x9B
+MZP_CMD_DRVLOCK = 0x9C
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -1278,6 +1282,32 @@ def main():
             print("head-position self-correction: "
                   + ("ON" if len(r) == 3 and r[2] else
                      "OFF (seek path as it was before it was added)"))
+        elif cmd == "drive":
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+            s.write(bytes([MZP_CMD_DRVSEL, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 5)
+            if len(r) == 5:
+                unit, ds0, ds1 = r[2], r[3], r[4]
+                where = "~DS0" if unit == 0 else ("~DS1" if unit == 1 else "no select line on this board")
+                print("selected unit: %d (%s)" % (unit, where))
+                # ~DSn is active low: 0 = asserted.
+                print("  ~DS0 (GPIO24) = %d  %s" % (ds0, "ASSERTED" if ds0 == 0 else "released"))
+                print("  ~DS1 (GPIO25) = %d  %s" % (ds1, "ASSERTED" if ds1 == 0 else "released"))
+                if ds0 == 0 and ds1 == 0:
+                    print("  !! BOTH select lines asserted -- the old drive was never released.")
+                elif unit < 2 and ds0 and ds1:
+                    print("  note: neither line asserted (nothing has selected yet this session).")
+                if unit > 1:
+                    print("  STATUS reports NOT READY and nothing is actuated.")
+        elif cmd == "drvlock":
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            s.write(bytes([MZP_CMD_DRVLOCK, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            print("drive select: "
+                  + ("PINNED to drive 0 -- port 0xDC's drive field ignored"
+                     if len(r) == 3 and r[2] else "follows port 0xDC (multi-drive)"))
         elif cmd == "fmten":
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
             s.write(bytes([MZP_CMD_FMTEN, 3, val & 0xFF]))

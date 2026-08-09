@@ -41,6 +41,10 @@ static constexpr int FDC_MAX_CYLINDER = 79;
 // they said. A wrong guess is caught (not acted on) at splice time by the size
 // compare in mfm_write_sector().
 static constexpr int FDC_SIZE_CACHE_N = FDC_MAX_CYLINDER + 1;
+// Drives the board can select: one per ~DSn line (GPIO24/25). Port 0xDC's
+// drive field is 2 bits wide, so the host can ask for units 2 and 3 that this
+// hardware has no select line for; those report NOT READY.
+static constexpr int FDC_DRIVE_MAX = 2;
 // One track's worth of host-visible bytes. A DD track at 250 kbit/s and 300 rpm
 // is ~6250 bytes; the margin covers a slow spindle and READ TRACK's inserted
 // sync-mark bytes. This bounds WRITE TRACK, so a host that never stops sending
@@ -112,7 +116,14 @@ struct FdcState {
   // short. A physical drive absorbs each surplus pulse AS IT ARRIVES, so the
   // clamp has to be applied per command. Folding into a clamped absolute target
   // does exactly that.
-  volatile int16_t head_target = 0;
+  //
+  // One target PER DRIVE. The WD has a single step engine and a single Track
+  // register, but the heads it steps are physical and independent: park drive 0
+  // at cylinder 40, select drive 1, and drive 1's head is wherever it was left,
+  // not at 40. A shared target would drive the newly selected head to the other
+  // drive's cylinder on the next Type I -- and since the Track register does not
+  // change across a select, the host would have no way to see it happen.
+  volatile int16_t head_target[FDC_DRIVE_MAX] = {0, 0};
   volatile uint32_t restore_req = 0;  // core1 only: bumped per RESTORE
   volatile uint32_t restore_done = 0; // core0 only
   volatile bool step_in = true; // last direction, for the bare STEP (0x2X/0x3X)
@@ -420,16 +431,49 @@ struct FdcState {
 };
 
 FdcState S;
+// The drive currently selected. Resolved from S.drive_sel by
+// fdc_apply_drive_select() -- never assigned anywhere else, so every path that
+// actuates the drive sees the same answer.
 FloppyDrive *DRV = nullptr;
+FloppyDrive *g_drives[FDC_DRIVE_MAX];
+int g_ndrives = 0;
+// Which entry of g_drives DRV points at (-1 = none selected yet).
+int g_cur_drive = -1;
 
-// Sector size code per cylinder (see FDC_SIZE_CACHE_N). Written by core0 as it
-// decodes ID fields, read by core1 when a WRITE SECTOR command arrives. A byte
-// each, single-writer, and a stale entry only costs a refused write -- so no
-// synchronisation beyond `volatile`.
-volatile uint8_t g_size_code[FDC_SIZE_CACHE_N];
+// Sector size code per cylinder, PER DRIVE (see FDC_SIZE_CACHE_N). Written by
+// core0 as it decodes ID fields, read by core1 when a WRITE SECTOR command
+// arrives. A byte each, single-writer, and a stale entry only costs a refused
+// write -- so no synchronisation beyond `volatile`.
+//
+// Per drive because the cache's whole job is to know a sector's length before
+// the host's first byte arrives, and two drives can hold different formats: an
+// MZ-800 CP/M disk's 16x256 boot track against another disk's 9x512 at the same
+// cylinder number. Sharing one table would carry drive 0's geometry onto drive
+// 1, and the size compare at splice time would refuse every write to it.
+volatile uint8_t g_size_code[FDC_DRIVE_MAX][FDC_SIZE_CACHE_N];
+
+// Index for the tables above. S.drive_sel is 2 bits but only 0/1 exist; a
+// nonexistent unit reports NOT READY and never actuates anything, so it needs
+// no slot of its own -- clamping keeps every array access in range without
+// pretending drive 2 is drive 0.
+ALWAYS_INLINE int fdc_drive_idx(void) {
+  uint8_t d = S.drive_sel;
+  return (d < FDC_DRIVE_MAX) ? (int)d : 0;
+}
+
+// The drive core0 is ACTUALLY driving, which is not always the one core1 has
+// latched: S.drive_sel can change at any instant, while g_cur_drive only moves
+// where fdc_apply_drive_select() moves it. core0 must index the per-drive
+// tables with this, or a select landing mid-seek makes it step one drive's head
+// toward another drive's target.
+ALWAYS_INLINE int fdc_cur_idx(void) {
+  return (g_cur_drive >= 0 && g_cur_drive < FDC_DRIVE_MAX) ? g_cur_drive : 0;
+}
 
 ALWAYS_INLINE uint16_t fdc_sector_size_for(uint8_t trk) {
-  uint8_t n = (trk < FDC_SIZE_CACHE_N) ? g_size_code[trk] : FDC_SIZE_CODE_DEFAULT;
+  int d = fdc_drive_idx();
+  uint8_t n =
+      (trk < FDC_SIZE_CACHE_N) ? g_size_code[d][trk] : FDC_SIZE_CODE_DEFAULT;
   return (uint16_t)(128u << (n & 7));
 }
 
@@ -437,7 +481,7 @@ ALWAYS_INLINE uint16_t fdc_sector_size_for(uint8_t trk) {
 // every decoded ID (read, READ ADDRESS and splice alike).
 inline void fdc_note_size_code(uint8_t trk, uint8_t n) {
   if (trk < FDC_SIZE_CACHE_N)
-    g_size_code[trk] = (uint8_t)(n & 7);
+    g_size_code[fdc_cur_idx()][trk] = (uint8_t)(n & 7);
 }
 
 } // namespace
@@ -666,6 +710,34 @@ bool g_applied_motor = false; // physical motor state (may lag S.motor_on)
 int g_applied_side = -1;
 bool g_timing_set = false;
 uint32_t g_motor_off_at = 0; // deferred motor-stop deadline (ms; 0 = none)
+// Has this drive's spindle been confirmed turning (index seen) since boot?
+bool g_spun[FDC_DRIVE_MAX] = {false, false};
+
+// Did this drive's most recent spin-up actually see an index pulse?
+//
+// Index is the only evidence a floppy interface gives that a drive is there at
+// all with a disk in it: no drive, no disk, or a dead spindle all present as
+// "the motor line is asserted and nothing ever passes the head". Without this,
+// selecting an empty or absent unit leaves STATUS reporting a perfectly READY
+// drive that then RNFs every sector forever -- which is what an absent drive 1
+// did before this, after burning ~1.3 s per attempt in the index wait.
+//
+// Initialised TRUE and only ever cleared by an OBSERVED failure, so behaviour
+// is identical to before until a spin-up actually times out. That matters: this
+// bit reaches the boot ROM, and a spuriously-set NOT READY on drive 0 would
+// stop the machine booting. It is re-evaluated on every spin-up rather than
+// latched, so a drive that is later loaded recovers by itself.
+bool g_ready[FDC_DRIVE_MAX] = {true, true};
+
+// Pin every access to drive 0, whatever port 0xDC says. The drive field is two
+// bits of a port the boot ROM writes on every access, so if any host ever puts
+// something other than 0 there, multi-drive turns a machine that boots into one
+// that selects a drive that is not on the cable. This is the escape hatch --
+// `mzp_probe.py drvlock 1` -- and it exists for the same reason the seek
+// self-correction and host formatting have theirs: it must be possible to rule
+// this subsystem out without a reflash.
+bool g_drive_lock = false;
+
 
 // core0-only decode scratch (one sector) + streaming-capture state.
 uint8_t g_secbuf[FDC_SECTOR_MAX];
@@ -673,6 +745,113 @@ uint8_t g_readaddr_id[6];     // last ID field found by READ ADDRESS
 bool g_readaddr_found = false;
 size_t g_flux_n = 0;         // bytes drained into the shared flux buffer so far
 bool g_stream_active = false; // an incremental capture is currently running
+
+// Point DRV at the drive port 0xDC has selected. Returns false if the host
+// asked for a unit this board has no select line for -- the caller must then
+// report NOT READY and actuate nothing at all.
+//
+// core0 only, and only from a point where no transfer is in flight: the shared
+// lines are handed over here, and doing that under a read or a splice would
+// move the flux path to a different spindle mid-sector.
+static bool fdc_apply_drive_select(void) {
+  uint8_t want = g_drive_lock ? 0 : S.drive_sel;
+  if (want >= (uint8_t)g_ndrives) {
+    // No such unit. Leave NOTHING selected rather than quietly acting on
+    // whichever drive happened to be live -- every caller guards on DRV, so a
+    // null here makes "the host asked for a drive that is not there" fail
+    // closed at every one of them instead of writing to the wrong disk.
+    if (DRV)
+      DRV->select(false);
+    DRV = nullptr;
+    g_cur_drive = -1;
+    g_applied_select = false;
+    return false;
+  }
+  if ((int)want == g_cur_drive && g_applied_select)
+    return true;
+
+  FloppyDrive *prev = DRV;
+  FloppyDrive *next = g_drives[want];
+
+  // Read the shared lines' state off the outgoing instance before deselecting
+  // it, then hand it to the incoming one. ~HDSEL and ~MOTOR_ON are single wires
+  // reaching every drive on the ribbon; only their believed state is per-object,
+  // and a stale belief makes side()/spin_motor() short-circuit on a line that
+  // is not where the new drive thinks it is. See adopt_shared_lines().
+  int side = g_applied_side;
+  bool motor = g_applied_motor;
+  if (prev) {
+    side = prev->get_side();
+    motor = prev->motor_is_spinning();
+    prev->select(false);
+  }
+  next->adopt_shared_lines(side, motor);
+
+  DRV = next;
+  g_cur_drive = (int)want;
+  next->select(true);
+  g_applied_select = true;
+  g_timing_set = false; // the step/settle knobs are per-instance; re-apply them
+
+  // Flux already in hand was read off the other drive's media.
+  if (g_stream_active) {
+    rp2040_flux_capture_stop();
+    g_stream_active = false;
+  }
+  g_flux_n = 0;
+
+  // The motor line is shared, so this drive's spindle has been turning for as
+  // long as the line has been asserted -- but only if it was on the cable and
+  // loaded the whole time. The first time we ever select a drive we have no
+  // such history, so make the disk task re-run spin_motor() and earn an index
+  // sighting on this spindle. Every later switch trusts the shared line, which
+  // is what stops a host that alternates drives paying the ~300 ms spin-up on
+  // each swap. See the spin-up quirk: this drive will not step to TRK00
+  // reliably until its disk is actually turning.
+  if (!g_spun[want]) {
+    g_spun[want] = true;
+    g_applied_motor = false;
+  }
+
+  // Catch up this drive's head to its own target, if it has drifted from it
+  // while another drive was selected.
+  //
+  // This closes a dropped seek. core1 folds a step into head_target[drive_sel]
+  // the instant the command arrives, but core0 may still be running with the
+  // previous drive selected -- so it executes that seek against the OLD drive's
+  // target (a no-op, since that target did not move) and marks op_done, which
+  // consumes the request. The new drive's head would then never move, and the
+  // Track register would report the cylinder the host asked for. That is the
+  // "never drop a queued Type I" rule applied across a select.
+  //
+  // Only for a drive we have driven before (`prev` non-null) whose position we
+  // actually know: on the first-ever select the head position is unknown and
+  // the next Type I recalibrates anyway, and stepping here would do it before
+  // the spindle is up -- which this drive will not tolerate (see the spin-up
+  // quirk in fdc_disk_task).
+  if (prev && g_applied_motor && next->track() >= 0) {
+    // Apply the FDC step timing before moving: these are per-instance and this
+    // drive is still on the flux-capture defaults (12 ms/step), which would
+    // turn a full-stroke catch-up into a ~1 s stall inside the disk task.
+    next->step_delay_us = 2000;
+    next->settle_delay_ms = 5;
+    next->motor_delay_ms = 300;
+    g_timing_set = true;
+    int tgt = S.head_target[want];
+    if (next->track() != tgt)
+      next->goto_track(tgt);
+  }
+
+  // Refresh the physical status bits from the drive we have just selected --
+  // ALWAYS, not only when we moved. ~TRK00 and ~WPT are shared lines gated by
+  // drive select, so until this runs STATUS is reporting the previous drive's
+  // senses. Write protect is the one that matters: a stale clear bit from an
+  // unprotected drive 0 is what would let a WRITE SECTOR reach a write-protected
+  // disk in drive 1 before the next refresh caught up.
+  S.at_track0 = next->get_track0_sense();
+  S.write_protect = next->get_write_protect();
+  return true;
+}
 
 // MZ-800 disks are MFM double-density: 250 kbit/s -> 2.0 µs nominal bit time.
 // (FM/single-density decode is out of scope until 3.4; see 0xDE density port.)
@@ -927,7 +1106,7 @@ static void fdc_note_failure(uint8_t kind, uint8_t want_sec, uint8_t seen_cyl,
   S.ff_kind = kind;
   S.ff_want_sec = want_sec;
   S.ff_trk_reg = S.track;
-  S.ff_head_target = (uint8_t)S.head_target;
+  S.ff_head_target = (uint8_t)S.head_target[fdc_cur_idx()];
   int pt = DRV ? DRV->track() : -1;
   S.ff_phys_track = (pt < 0) ? 0xFE : (uint8_t)pt;
   S.ff_side = S.side1 ? 1 : 0;
@@ -956,9 +1135,9 @@ static void fdc_resync_head(uint8_t seen_cyl) {
     return;
   S.pos_resyncs++;
   S.last_resync_from = seen_cyl;
-  S.last_resync_to = (uint8_t)S.head_target;
+  S.last_resync_to = (uint8_t)S.head_target[fdc_cur_idx()];
   DRV->set_track_belief((int)seen_cyl);
-  int tgt = S.head_target;
+  int tgt = S.head_target[fdc_cur_idx()];
   if ((int)seen_cyl != tgt)
     DRV->goto_track(tgt);
   S.at_track0 = DRV->get_track0_sense();
@@ -992,6 +1171,19 @@ inline uint8_t compose_status() {
   // is unreliable; refine in 3.4). NotReady = bit7 in both layouts.
   if (!S.motor_on)
     st |= 0x80; // NOT READY
+  // Port 0xDC's drive field is 2 bits, so a host can select unit 2 or 3; this
+  // board has select lines for 0 and 1 only. Report the missing unit as NOT
+  // READY -- which is what the host would see from an empty drive bay anyway --
+  // rather than silently answering for drive 0 and letting it write there.
+  if (!g_drive_lock && S.drive_sel >= FDC_DRIVE_MAX)
+    st |= 0x80;
+  // The selected unit is spinning but nothing ever passed the head: no drive on
+  // that select line, or no disk in it. Report NOT READY rather than a ready
+  // drive that answers every sector with RNF. See g_ready -- it starts true and
+  // is only cleared by an observed spin-up timeout, so a working drive cannot
+  // acquire this bit by accident.
+  if (S.motor_on && !g_ready[fdc_drive_idx()])
+    st |= 0x80;
 
   if (S.type2) {
     // Type II layout: b1 DRQ, b2 LostData, b3 CRC, b4 RNF, b5 RecordType(deleted).
@@ -1033,10 +1225,20 @@ inline uint8_t compose_status() {
 
 } // namespace
 
-void fdc_init(FloppyDrive *drive) {
-  DRV = drive;
-  for (int i = 0; i < FDC_SIZE_CACHE_N; ++i)
-    g_size_code[i] = FDC_SIZE_CODE_DEFAULT;
+void fdc_init(FloppyDrive *const *drives, int n) {
+  if (n > FDC_DRIVE_MAX)
+    n = FDC_DRIVE_MAX;
+  g_ndrives = n;
+  for (int d = 0; d < n; ++d)
+    g_drives[d] = drives[d];
+  // DRV stays null and g_cur_drive stays -1: the first fdc_apply_drive_select()
+  // resolves them, so the select handshake has exactly one implementation and
+  // drive 0 is not a special case that skips it.
+  DRV = nullptr;
+  g_cur_drive = -1;
+  for (int d = 0; d < FDC_DRIVE_MAX; ++d)
+    for (int i = 0; i < FDC_SIZE_CACHE_N; ++i)
+      g_size_code[d][i] = FDC_SIZE_CODE_DEFAULT;
 }
 
 // RAM_FUNC is not optional here. listen_loop() is RAM_FUNC because it has ~560
@@ -1124,17 +1326,17 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // Fold into the target. A second Type I arriving before core0 has run the
       // first must combine with it, never replace it -- see head_target.
       if (restore) {
-        S.head_target = 0;
+        S.head_target[fdc_drive_idx()] = 0;
         S.restore_req++; // force a physical TRK00 seek even if we think we're there
       } else {
         // Clamp HERE, per command -- this is the end-stop absorption a real
         // drive performs on every surplus pulse. See head_target.
-        int t = (int)S.head_target + steps;
+        int t = (int)S.head_target[fdc_drive_idx()] + steps;
         if (t < 0)
           t = 0;
         if (t > FDC_MAX_CYLINDER)
           t = FDC_MAX_CYLINDER;
-        S.head_target = (int16_t)t;
+        S.head_target[fdc_drive_idx()] = (int16_t)t;
       }
       S.op_verify = (cmd & 0x04) != 0; // WD Type I Verify (V) bit
       S.busy = true;
@@ -1828,6 +2030,10 @@ void fdc_bustest_snapshot(FdcBusTest *o) {
 }
 
 void fdc_bench_seek(uint8_t target, uint16_t param, uint8_t mode, FdcDebug *o) {
+  // Bench/USB entry point: resolve the selected unit here, since the disk
+  // task may never have run. Leaves DRV null if the selected unit does not
+  // exist, which the guard below turns into a clean refusal.
+  fdc_apply_drive_select();
   if (!DRV) {
     fdc_debug_snapshot(o);
     return;
@@ -1838,7 +2044,7 @@ void fdc_bench_seek(uint8_t target, uint16_t param, uint8_t mode, FdcDebug *o) {
   if (mode == 1) {
     // spin_motor: wait `param` ms then wait for the INDEX pulse (disk spinning).
     DRV->motor_delay_ms = param;
-    DRV->spin_motor(true);
+    g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   } else {
     // motor_raw: assert motor line + fixed delay, NO index wait.
     DRV->motor_raw(true);
@@ -1861,6 +2067,10 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
                                uint8_t *flags) {
   if (flags)
     *flags = 0;
+  // Bench/USB entry point: resolve the selected unit here, since the disk
+  // task may never have run. Leaves DRV null if the selected unit does not
+  // exist, which the guard below turns into a clean refusal.
+  fdc_apply_drive_select();
   if (!DRV)
     return 0;
 
@@ -1868,7 +2078,7 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
   DRV->settle_delay_ms = 5;
   DRV->motor_delay_ms = 300;
   DRV->select(true);
-  DRV->spin_motor(true);
+  g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
   DRV->goto_track(track);
 
@@ -1899,6 +2109,10 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
                             const uint8_t *data, uint16_t n, uint8_t *flags) {
   if (flags)
     *flags = 0;
+  // Bench/USB entry point: resolve the selected unit here, since the disk
+  // task may never have run. Leaves DRV null if the selected unit does not
+  // exist, which the guard below turns into a clean refusal.
+  fdc_apply_drive_select();
   if (!DRV || n == 0 || n > FDC_SECTOR_MAX)
     return false;
 
@@ -1906,7 +2120,7 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
   DRV->settle_delay_ms = 5;
   DRV->motor_delay_ms = 300;
   DRV->select(true);
-  DRV->spin_motor(true);
+  g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
   DRV->goto_track(track);
 
@@ -1941,6 +2155,10 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
                           uint8_t *out_result) {
   if (out_result)
     *out_result = 0;
+  // Bench/USB entry point: resolve the selected unit here, since the disk
+  // task may never have run. Leaves DRV null if the selected unit does not
+  // exist, which the guard below turns into a clean refusal.
+  fdc_apply_drive_select();
   if (!DRV || n_sectors == 0 || n_sectors > 32)
     return 0;
   size_code &= 7;
@@ -2003,7 +2221,7 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
   DRV->settle_delay_ms = 5;
   DRV->motor_delay_ms = 300;
   DRV->select(true);
-  DRV->spin_motor(true);
+  g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
   DRV->goto_track(track);
   if (DRV->get_write_protect()) {
@@ -2036,13 +2254,17 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
 
 uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
                              size_t flux_cap) {
+  // Bench/USB entry point: resolve the selected unit here, since the disk
+  // task may never have run. Leaves DRV null if the selected unit does not
+  // exist, which the guard below turns into a clean refusal.
+  fdc_apply_drive_select();
   if (!DRV)
     return 0;
   DRV->step_delay_us = 2000;
   DRV->settle_delay_ms = 5;
   DRV->motor_delay_ms = 300;
   DRV->select(true);
-  DRV->spin_motor(true);
+  g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
   DRV->goto_track(track);
 
@@ -2057,6 +2279,26 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
 }
 
 const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
+
+FloppyDrive *fdc_bench_drive(void) {
+  if (!fdc_apply_drive_select())
+    return nullptr;
+  return DRV;
+}
+
+void fdc_bench_release(void) {
+  if (DRV)
+    DRV->select(false);
+  // Do NOT clear g_cur_drive: the per-drive state it indexes is still valid and
+  // clearing it would make the next select think it is the first one and skip
+  // the head catch-up. Only the physical select needs re-asserting.
+  g_applied_select = false;
+}
+
+void fdc_set_drive_lock(bool on) { g_drive_lock = on; }
+bool fdc_get_drive_lock(void) { return g_drive_lock; }
+void fdc_set_drive(uint8_t unit) { S.drive_sel = (uint8_t)(unit & 0x03); }
+uint8_t fdc_get_drive(void) { return S.drive_sel; }
 
 void fdc_set_write_enable(bool on) { g_write_enable = on; }
 void fdc_set_reset_poll(bool on) { g_reset_poll_enabled = on; }
@@ -2075,8 +2317,22 @@ bool fdc_get_write_enable(void) { return g_write_enable; }
 
 
 void fdc_disk_task(void) {
-  if (!S.active || !DRV)
+  if (!S.active || g_ndrives == 0)
     return; // idle until the MZ-800 talks to us (don't fight USB/gw drive use)
+
+  // Apply drive select FIRST -- everything below actuates DRV, which does not
+  // exist until this has run once. Only between operations: a switch hands over
+  // the shared lines and drops any captured flux, so doing it under a read or a
+  // splice would move the flux path to another spindle mid-sector. A select
+  // that arrives during a transfer simply takes effect when that transfer ends,
+  // which is also what a real drive does with a select line that moves while
+  // its head is over data.
+  if (!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) {
+    if (!fdc_apply_drive_select())
+      return; // no such unit; STATUS already reports NOT READY
+  }
+  if (!DRV)
+    return; // selected unit never resolved (only reachable before the first one)
 
   if (!g_timing_set) {
     // Faster step rate than the flux-capture default so a full-stroke RESTORE
@@ -2085,23 +2341,23 @@ void fdc_disk_task(void) {
     // 0 the index wait triggers on a barely-moving disk and returns before the
     // drive can step reliably to TRK00 (cold-start failure). 300 ms + index is
     // the config proven to work from a cold spindle.
+    //
+    // Re-applied on every drive switch: these are per-instance fields, so the
+    // drive we have just selected is still on the flux-capture defaults.
     DRV->step_delay_us = 2000;
     DRV->settle_delay_ms = 5;
     DRV->motor_delay_ms = 300;
     g_timing_set = true;
-  }
-
-  // Apply drive select (single drive: always select once active).
-  if (!g_applied_select) {
-    DRV->select(true);
-    g_applied_select = true;
   }
   // Motor with a spin-down delay: spin up on request (spin_motor waits for
   // index = disk really turning), but defer stop so retries keep the spin-up.
   if (S.motor_on) {
     g_motor_off_at = 0; // cancel any pending stop
     if (!g_applied_motor) {
-      DRV->spin_motor(true); // spin up + wait index (~spin-up time)
+      // The return value is the index sighting -- i.e. "is a disk actually
+      // turning in this unit". Keep it: it is what separates an empty or absent
+      // drive from a working one, and STATUS has no other source for NOT READY.
+      g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
       g_applied_motor = true;
     }
   } else if (g_applied_motor) {
@@ -2146,7 +2402,7 @@ void fdc_disk_task(void) {
     // core1 may move it again while we step, which just leaves op_seq != op_done
     // and brings us straight back here.
     {
-      int tgt = S.head_target;
+      int tgt = S.head_target[fdc_cur_idx()];
       if (DRV->track() != tgt)
         DRV->goto_track(tgt);
     }
@@ -2413,7 +2669,7 @@ void fdc_disk_task(void) {
     fdc_record_splice(sr);
     if (sr.id_found)
       fdc_note_size_code(S.track, sr.size_n);
-    S.last_head_target = (uint8_t)S.head_target;
+    S.last_head_target = (uint8_t)S.head_target[fdc_cur_idx()];
     {
       int pt = DRV->track();
       S.last_phys_track = (pt < 0) ? 0xFE : (uint8_t)pt;
@@ -2599,7 +2855,7 @@ void fdc_disk_task(void) {
       }
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;
-      S.last_head_target = (uint8_t)S.head_target;
+      S.last_head_target = (uint8_t)S.head_target[fdc_cur_idx()];
       {
         int pt = DRV->track();
         S.last_phys_track = (pt < 0) ? 0xFE : (uint8_t)pt;

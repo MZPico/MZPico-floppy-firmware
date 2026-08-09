@@ -42,6 +42,28 @@ public:
   void set_track0_crosscheck(bool on) { _track0_crosscheck = on; }
   int get_side() const { return _side; }
 
+  // Multi-drive: hand over the state of the lines that are SHARED between all
+  // drives on the cable, from the instance that was selected until now.
+  //
+  // Only ~DSn is per-drive. ~HDSEL and ~MOTOR_ON are one wire each, reaching
+  // every drive on the ribbon (on this board's J3, MOTOR is driven onto pins 10
+  // AND 16), so the newly selected instance's beliefs about them describe pins
+  // it does not own and would otherwise be stale. Left uncorrected, a `side(0)`
+  // on a drive that already believes `_side == 0` short-circuits and the head
+  // stays on side 1, where the previous drive left the line -- a read from the
+  // wrong surface with every status bit clean.
+  //
+  // _is_index_seen is deliberately NOT adopted: the motor LINE is shared but
+  // the spindles are not, so the new drive must earn its own index sighting.
+  // _track is not adopted either -- it is the one piece of genuinely per-drive
+  // state, and preserving it across selects is the whole point of this class
+  // being instantiated per drive.
+  void adopt_shared_lines(int side, bool motor_spinning) {
+    _side = side;
+    _is_motor_spinning = motor_spinning;
+    _is_index_seen = false;
+  }
+
   bool read_index();
   bool get_write_protect();
   bool get_track0_sense();

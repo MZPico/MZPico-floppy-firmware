@@ -24,8 +24,29 @@
 
 class FloppyDrive;
 
-// core0: hand the FDC the drive to actuate. Call once before the MZ talks to us.
-void fdc_init(FloppyDrive *drive);
+// core0: hand the FDC the drives it may actuate, in unit order (element 0 =
+// the drive on ~DS0). Call once before the MZ talks to us. Which one is live at
+// any moment follows port 0xDC's drive field; units past `n` report NOT READY.
+void fdc_init(FloppyDrive *const *drives, int n);
+
+// Pin every access to drive 0 regardless of what port 0xDC selects. Escape
+// hatch for the case where a host writes a nonzero drive field we did not
+// expect; see g_drive_lock in fdc.cpp. Default OFF (multi-drive active).
+void fdc_set_drive_lock(bool on);
+bool fdc_get_drive_lock(void);
+// core1/USB: force the selected unit, for bench use (scan/wrverify/fmtverify on
+// drive 1 without an MZ-800 attached). Same field the host writes.
+void fdc_set_drive(uint8_t unit);
+uint8_t fdc_get_drive(void);
+
+// USB bench commands that drive the floppy themselves (scan/streamscan) rather
+// than going through the FDC command path: resolve the selected unit and return
+// it, or null if the host selected a unit this board has no select line for.
+// Without this they act on drive 0 whatever `drive 1` said -- which does not
+// merely mislead, it makes fmtverify format one disk and verify another.
+// Release it with fdc_bench_release() so the FDC re-selects from scratch.
+FloppyDrive *fdc_bench_drive(void);
+void fdc_bench_release(void);
 
 // core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back
