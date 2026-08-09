@@ -204,9 +204,48 @@ BUSY-polling covers latency instead, per the ROM driver).
     what the chip would have given it. Also loads the ID's track byte into the
     Sector register (WD quirk; the CP/M BIOS reads head position from there).
     This is what stopped the BIOS stepping blindly and giving up.
-  - **Still to do:** READ TRACK, WRITE TRACK (format), density applied to
-    `~DEN_RDY` (decoded already — see wd-fidelity.md), drive-select via
-    `~DS0/DS1`.
+  - **WRITE TRACK (0xFX) — format. IMPLEMENTED, not yet hardware-verified.**
+    The host shifts in a whole track image and `mfm_encode_format_image()`
+    obeys the four write-channel commands in it: `F5` writes 0xA1 with a
+    missing clock bit and presets the CRC, `F6` writes 0xC2 the same way, `F7`
+    emits the accumulated CRC, everything else is written literally. Those
+    missing clock bits are the point — they make a sync mark unambiguous in a
+    stream where any data pattern is legal, they cannot be produced by writing
+    an ordinary 0xA1, and creating them is the reason formatting is a distinct
+    operation rather than a run of sector writes.
+    - **The CRC presets once per run of `F5`, not per byte.** A real track has
+      three in a row and the CRC that follows must cover all three 0xA1s;
+      resetting on each would leave it covering only the last, and every ID
+      field on the disk would be unreadable.
+    - **`F8..FB`/`FE` are not CRC-initialising here.** That rule is FM's, where
+      there is no 0xA1 sync to do the job. In MFM they are ordinary bytes.
+    - **Safer than the sector splice, despite being far more destructive.** It
+      runs index-to-index, so there is no ~700 µs window to hit — the whole
+      failure mode the splice is built around simply does not arise. Short
+      images are padded with gap bytes so a track can never end up half one
+      format and half the previous one, with the seam wherever the host
+      stopped.
+    - Gated exactly like WRITE SECTOR: physical `~WPT` and the `wren` switch,
+      both checked before anything is destroyed. Test with
+      `mzp_probe.py PORT fmtverify <track>` (format, then read the sectors
+      back) on a scratch disk.
+  - **READ TRACK (0xEX). IMPLEMENTED, not yet hardware-verified.** Returns every
+    byte on the track — gaps, address marks, CRC bytes — uninterpreted, via
+    `mfm_read_track_raw()`. It is the one decode here that cannot anchor itself
+    to a sync mark, since the point is to see what lies between them, so it
+    free-runs and resynchronises whenever an 0xA1 passes. Byte boundaries in the
+    gaps are therefore arbitrary — true of a real WD too, which is why READ
+    TRACK is a diagnostic rather than a way to copy a disk. `mzp_probe.py PORT
+    readtrack <track>` dumps it and counts the address marks.
+  - **Density applied to `~DEN_RDY`: closed as "not to be done".** The ROM
+    defines the port and never writes it, so there is no traffic to infer the
+    bit's polarity from and the two documented readings disagree; driving
+    DENSEL on a guess risks a machine that currently boots, for media this
+    platform does not have. See wd-fidelity.md.
+  - **Still to do:** drive-select via `~DS0`/`~DS1` and real multi-drive. Left
+    alone deliberately: it needs per-drive head positions, and with one drive
+    attached there is no way to test that a second select line does not simply
+    deselect the working drive.
 - **3.5 — Robustness.** Error/retry paths, edge-case timing, soak testing.
   - **Write precomp: not needed so far.** `wrsoak` verified 200/200 writes over
     tracks 0–76 (both sides, 5 passes, pseudo-random patterns), covering the

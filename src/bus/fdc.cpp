@@ -4,7 +4,8 @@
 #include "floppy.hpp"
 #include "flux/arch_rp2.h" // rp2040_flux_capture_start/drain/stop (streaming)
 #include "gw_protocol.hpp" // mzp_flux_buffer (shared capture buffer)
-#include "mfm_decode.hpp"  // mfm_read_sector
+#include "mfm_decode.hpp"  // mfm_read_sector, mfm_read_track_raw
+#include "mfm_encode.hpp"  // mfm_encode_format_image (WRITE TRACK)
 #include "mfm_splice.hpp"  // mfm_write_sector (in-place data-field splice)
 #include "mz_bus.hpp"      // bus_diag_reset
 #include "hardware/gpio.h" // gpio_get (index-edge sync)
@@ -39,6 +40,22 @@ static constexpr int FDC_MAX_CYLINDER = 79;
 // they said. A wrong guess is caught (not acted on) at splice time by the size
 // compare in mfm_write_sector().
 static constexpr int FDC_SIZE_CACHE_N = FDC_MAX_CYLINDER + 1;
+// One track's worth of host-visible bytes. A DD track at 250 kbit/s and 300 rpm
+// is ~6250 bytes; the margin covers a slow spindle and READ TRACK's inserted
+// sync-mark bytes. This bounds WRITE TRACK, so a host that never stops sending
+// cannot run off the end of it.
+static constexpr uint16_t FDC_TRACK_IMAGE_MAX = 7200;
+// The host has stopped shifting format bytes in. A real WD ends WRITE TRACK on
+// the index pulse and simply ignores anything still coming; we have to buffer
+// the image before writing it, so instead we take a gap in the byte stream as
+// "that is the whole image". A Z80 feeding a DRQ'd byte takes tens of us, so a
+// few ms of silence is unambiguous.
+static constexpr uint32_t FDC_TRACK_IDLE_US = 4000;
+// Flux budget for one formatted track. A revolution is ~43.5k transitions
+// (measured); 48k leaves the write with flux still queued when the terminating
+// index pulse arrives, which is what stops it running out early.
+static constexpr size_t FDC_TRACK_FLUX_MAX = 48000;
+
 // Size code N means 128 << N bytes, so 512 is 2. MZ-800 CP/M data tracks are
 // 9x512 (N=2); the boot track is 16x256 (N=1).
 static constexpr uint8_t FDC_SIZE_CODE_DEFAULT = 2;
@@ -140,6 +157,28 @@ struct FdcState {
   volatile bool wr_deleted = false; // command bit a0: write a deleted DAM
   volatile uint32_t wr_seq = 0;   // core1 -> core0: "splice this buffer"
   volatile uint32_t wr_done = 0;
+
+  // ---- Type III READ TRACK / WRITE TRACK (3.4) ---------------------------
+  // Both move a whole track at once -- far more than the one-sector xfer[]
+  // holds -- so they get their own buffer and their own DATA routing. `trk_op`
+  // says which is running and is what tells the DATA register which buffer it
+  // is talking to; 0 means neither and the sector paths own the register.
+  //
+  // WRITE TRACK is how a disk gets formatted, and it is the only operation that
+  // can create the missing-clock sync marks an ID field needs. It is also the
+  // most destructive thing this bridge can do: it replaces an entire track,
+  // gaps, ID fields and all.
+  volatile uint8_t trk_op = 0;    // 0 none, 1 READ TRACK, 2 WRITE TRACK
+  volatile bool trk_armed = false; // the image is complete; core0 may write it
+  volatile uint32_t trk_seq = 0;
+  volatile uint32_t trk_done = 0;
+  volatile uint16_t trk_pos = 0;  // host's position within track_buf
+  volatile uint16_t trk_len = 0;  // bytes valid / expected
+  volatile uint32_t trk_ok = 0;      // tracks formatted / read
+  volatile uint32_t trk_fail = 0;    // ...that failed to reach the media
+  volatile uint32_t trk_last_us = 0; // last operation's disk time
+  volatile uint16_t trk_last_bytes = 0; // last image length
+  volatile uint8_t track_buf[FDC_TRACK_IMAGE_MAX];
   // Write-path diagnostics, cumulative. The equivalent of the sec_* counters:
   // a snapshot of the last write cannot show the one that went wrong earlier.
   volatile uint32_t wr_ok = 0;            // data fields actually written
@@ -464,7 +503,7 @@ ALWAYS_INLINE void fdc_refresh_int_line(void) {
   // waits on exactly the same edge to feed the sector as it does to drain one.
   // The Force-Interrupt (I3) latch is the only other source; a Type I
   // completion does NOT interrupt on this card.
-  bool want = enabled && (((S.reading || S.writing) && S.drq) ||
+  bool want = enabled && (((S.reading || S.writing || S.trk_op) && S.drq) ||
                           S.force_int_latched);
   if (want) {
     if (!S.int_asserted) {
@@ -888,6 +927,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // left alone -- see the Force Interrupt notes on queued Type I commands.)
       S.writing = false;
       S.wr_armed = false;
+      if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
+        S.trk_op = 0; // same reasoning: never lay a track down on another cyl
       // The Track register is the WD's *belief*; the head position is physical
       // and separate. Compute a relative step count here and update the Track
       // register per the WD rules — core0 applies the motion to wherever the
@@ -972,6 +1013,11 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // nothing further.
         S.writing = false;
         S.wr_armed = false;
+        // A WRITE TRACK image collected but not yet laid down is dropped; one
+        // already going onto the media finishes, for the same reason a splice
+        // does -- the flux is being written in real time and cannot be recalled.
+        if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
+          S.trk_op = 0;
         // NOTE: deliberately do NOT cancel a pending Type I move here (i.e. no
         // `S.op_done = S.op_seq`). On a real WD the step pulse is already out
         // the door before the CPU can write the Force Interrupt byte, so the
@@ -1009,6 +1055,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // first -- would splice a stale buffer instead of serving the read.
       S.writing = false;
       S.wr_armed = false;
+      if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
+        S.trk_op = 0;
       if ((cmd & 0x20) == 0) {
         // READ SECTOR — single (0x8X) or multiple (0x9X). Ask core0 to decode
         // the current Sector register off a fresh capture of the current track.
@@ -1160,7 +1208,12 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     S.side1 = g_invert_side ? !rom_side1 : rom_side1;
     break;
   }
-  case 0xDE: // DENSITY (not CPL'd): b0 = single density
+  case 0xDE: // DENSITY (not CPL'd): b0 = density select.
+    // Latched only -- deliberately not driven onto DENSEL. The Disk BASIC ROM
+    // defines this port and never writes it, so nothing has ever told us which
+    // way round b0 goes, and the two documented readings disagree. Guessing
+    // would risk a machine that currently boots in order to serve media this
+    // platform does not have. See docs/wd-fidelity.md.
     S.density_single = (raw & 0x01) != 0;
     // Bus-test read-back channel: during the 0xDF loopback the test program
     // writes here whatever it just read from 0xDF. Compare against the byte we
@@ -1636,6 +1689,128 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
   return sr.wrote;
 }
 
+uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
+                          uint8_t size_code, uint8_t interleave, uint8_t fill,
+                          uint8_t *out_result) {
+  if (out_result)
+    *out_result = 0;
+  if (!DRV || n_sectors == 0 || n_sectors > 32)
+    return 0;
+  size_code &= 7;
+
+  // Build a standard IBM System-34 MFM track image -- the same byte stream a
+  // host would shift in for WRITE TRACK -- and run it through the same encoder
+  // the host's command uses. Formatting from the bench therefore exercises the
+  // real path, not a parallel one that could drift away from it.
+  uint8_t *img = (uint8_t *)S.track_buf;
+  uint16_t n = 0;
+  auto put = [&](uint8_t b, int count) {
+    while (count-- > 0 && n < FDC_TRACK_IMAGE_MAX)
+      img[n++] = b;
+  };
+
+  put(0x4E, 80);       // gap 4a
+  put(0x00, 12);       // presync
+  put(0xF6, 3);        // 0xC2 sync marks
+  put(0xFC, 1);        // index address mark
+  put(0x4E, 50);       // gap 1
+
+  // Interleave: lay the sector NUMBERS around the track in steps of
+  // `interleave` so consecutive logical sectors are not physically adjacent.
+  // Without it a host that needs any processing time between sectors misses the
+  // next one and waits a whole revolution for it to come round again.
+  uint8_t order[32];
+  for (int k = 0; k < n_sectors; ++k)
+    order[k] = 0;
+  {
+    int slot = 0;
+    uint8_t il = interleave ? interleave : 1;
+    for (int sec = 1; sec <= n_sectors; ++sec) {
+      while (order[slot])
+        slot = (slot + 1) % n_sectors; // that slot is taken; take the next free
+      order[slot] = (uint8_t)sec;
+      slot = (slot + il) % n_sectors;
+    }
+  }
+
+  static const uint16_t gap3_for[8] = {32, 54, 84, 116, 255, 255, 255, 255};
+  for (int k = 0; k < n_sectors; ++k) {
+    put(0x00, 12);
+    put(0xF5, 3);            // 0xA1 x3, presets the CRC
+    put(0xFE, 1);            // ID address mark
+    put(track, 1);
+    put(side ? 1 : 0, 1);
+    put(order[k], 1);
+    put(size_code, 1);
+    put(0xF7, 1);            // ID CRC
+    put(0x4E, 22);           // gap 2
+    put(0x00, 12);
+    put(0xF5, 3);
+    put(0xFB, 1);            // data address mark
+    put(fill, 128 << size_code);
+    put(0xF7, 1);            // data CRC
+    put(0x4E, gap3_for[size_code]);
+  }
+
+  DRV->step_delay_us = 2000;
+  DRV->settle_delay_ms = 5;
+  DRV->motor_delay_ms = 300;
+  DRV->select(true);
+  DRV->spin_motor(true);
+  DRV->side(side ? 1 : 0);
+  DRV->goto_track(track);
+  if (DRV->get_write_protect()) {
+    if (out_result)
+      *out_result = 1; // write protected
+    return 0;
+  }
+
+  size_t cap = 0;
+  uint8_t *flux = mzp_flux_buffer(&cap);
+  size_t limit = (cap < FDC_TRACK_FLUX_MAX) ? cap : FDC_TRACK_FLUX_MAX;
+  size_t n_flux = mfm_encode_format_image(flux, limit, img, n, FDC_DD_BIT_US);
+  if (!n_flux) {
+    if (out_result)
+      *out_result = 2; // image would not fit
+    return 0;
+  }
+  n_flux = mfm_encode_gap_fill(flux, n_flux, limit, FDC_DD_BIT_US);
+  bool ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
+                             /*use_index=*/true);
+  if (out_result)
+    *out_result = ok ? 0 : 3;
+  if (ok)
+    S.trk_ok++;
+  else
+    S.trk_fail++;
+  S.trk_last_bytes = n;
+  return ok ? n : 0;
+}
+
+uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
+                             size_t flux_cap) {
+  if (!DRV)
+    return 0;
+  DRV->step_delay_us = 2000;
+  DRV->settle_delay_ms = 5;
+  DRV->motor_delay_ms = 300;
+  DRV->select(true);
+  DRV->spin_motor(true);
+  DRV->side(side ? 1 : 0);
+  DRV->goto_track(track);
+
+  int32_t idx = 0;
+  size_t nflux = DRV->capture_track(flux_buf, flux_cap, &idx,
+                                    /*store_greaseweazle=*/false,
+                                    /*capture_ms=*/220, /*index_wait_ms=*/250);
+  size_t n = mfm_read_track_raw(flux_buf, nflux, FDC_DD_BIT_US,
+                                (uint8_t *)S.track_buf, FDC_TRACK_IMAGE_MAX);
+  S.trk_last_bytes = (uint16_t)n;
+  return (uint16_t)n;
+}
+
+const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
+
 void fdc_set_write_enable(bool on) { g_write_enable = on; }
 bool fdc_get_write_enable(void) { return g_write_enable; }
 
@@ -1804,6 +1979,139 @@ void fdc_disk_task(void) {
       S.last_ready_us = time_us_32(); // diagnostic: gap until the next command
       fdc_refresh_int_line();              // Type I complete
     }
+  }
+
+  // ---- Type III READ TRACK / WRITE TRACK -----------------------------------
+  if (S.trk_op) {
+    // Neither may run with a move outstanding, for the same reason a sector
+    // write may not -- and for WRITE TRACK the stakes are a whole track, not
+    // one sector's data field.
+    if (S.op_done != S.op_seq)
+      return;
+
+    if (S.trk_op == 1) { // READ TRACK
+      if (S.trk_done != S.trk_seq) {
+        uint32_t seq = S.trk_seq;
+        size_t cap = 0;
+        uint8_t *flux = mzp_flux_buffer(&cap);
+        uint32_t t0 = time_us_32();
+        fdc_capture_window(FDC_READ_CAPTURE_BYTES);
+        if (!S.trk_op) // aborted while we were blocked capturing
+          return;
+        size_t n = mfm_read_track_raw(flux, g_flux_n, FDC_DD_BIT_US,
+                                      (uint8_t *)S.track_buf,
+                                      FDC_TRACK_IMAGE_MAX);
+        S.trk_last_us = time_us_32() - t0;
+        S.trk_last_bytes = (uint16_t)n;
+        if (n == 0) {
+          S.err_rnf = true; // nothing decodable -> the WD's only "no data" bit
+          S.trk_fail++;
+          S.trk_op = 0;
+          S.busy = false;
+        } else {
+          S.trk_ok++;
+          S.trk_len = (uint16_t)n;
+          S.trk_pos = 0;
+          S.last_data_read_us = time_us_32();
+          S.drq = true;
+        }
+        S.trk_done = seq;
+        fdc_refresh_int_line();
+      } else if (S.drq &&
+                 (time_us_32() - S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
+        // Nobody is taking the bytes. Same reasoning as the sector read: we
+        // buffer, so we *can* wait forever, and a host entitled to walk away
+        // would deadlock us holding BUSY.
+        S.lost_data = true;
+        S.lost_data_events++;
+        S.trk_op = 0;
+        S.drq = false;
+        S.busy = false;
+        fdc_refresh_int_line();
+      }
+      return;
+    }
+
+    // WRITE TRACK.
+    if (!S.trk_armed) {
+      // The host is still shifting the image in. It stops when the image ends,
+      // not when we say so, so silence is the end-of-image signal.
+      if (S.trk_pos > 0 &&
+          (time_us_32() - S.last_data_read_us) > FDC_TRACK_IDLE_US) {
+        S.trk_len = S.trk_pos;
+        S.drq = false;
+        S.trk_armed = true;
+        S.trk_seq++;
+        fdc_refresh_int_line();
+      } else if (S.trk_pos == 0 &&
+                 (time_us_32() - S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
+        // Command issued, not one byte sent. Nothing to write; don't hold BUSY.
+        S.lost_data = true;
+        S.lost_data_events++;
+        S.trk_op = 0;
+        S.drq = false;
+        S.busy = false;
+        fdc_refresh_int_line();
+      }
+      return;
+    }
+
+    if (S.trk_done == S.trk_seq)
+      return;
+    uint32_t seq = S.trk_seq;
+
+    if (g_stream_active) {
+      rp2040_flux_capture_stop();
+      g_stream_active = false;
+    }
+    g_flux_n = 0; // the captured window describes the track we are replacing
+
+    S.write_protect = DRV->get_write_protect();
+    bool ok = false;
+    uint32_t t0 = time_us_32();
+    if (!S.write_protect) {
+      size_t cap = 0;
+      uint8_t *flux = mzp_flux_buffer(&cap);
+      // Cap the flux at a bit over one revolution: the write is terminated by
+      // the index pulse anyway, and encoding more is wasted time.
+      size_t limit = (cap < FDC_TRACK_FLUX_MAX) ? cap : FDC_TRACK_FLUX_MAX;
+      size_t n_flux = mfm_encode_format_image(
+          flux, limit, (const uint8_t *)S.track_buf, S.trk_len, FDC_DD_BIT_US);
+      if (n_flux) {
+        // Pad to the end of the buffer with gap bytes. A short image would
+        // otherwise leave the tail of the OLD track standing past the end of
+        // the new one -- half of each format, spliced wherever the host
+        // happened to stop. The index pulse cuts the write off at the right
+        // place; our job is only to have flux ready to write until it comes.
+        n_flux = mfm_encode_gap_fill(flux, n_flux, limit, FDC_DD_BIT_US);
+        // use_index: start at the index pulse and stop at the next one. That
+        // is what makes this a *track* write rather than a very long splice --
+        // there is no timing window to hit, which is why formatting is the
+        // safer of the two write paths despite being the more destructive.
+        ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
+                              /*use_index=*/true);
+      }
+    }
+    S.trk_last_us = time_us_32() - t0;
+    S.trk_last_bytes = S.trk_len;
+    if (ok) {
+      S.trk_ok++;
+    } else {
+      S.trk_fail++;
+      if (S.write_protect)
+        S.err_write_protect = true;
+      else
+        S.err_rnf = true;
+    }
+    if (S.trk_op == 2 && S.trk_seq == seq) {
+      S.trk_op = 0;
+      S.trk_armed = false;
+      S.drq = false;
+      S.busy = false;
+      fdc_refresh_int_line();
+    }
+    S.trk_done = seq;
+    return;
   }
 
   // ---- Type II write: collect from the host, then splice -------------------

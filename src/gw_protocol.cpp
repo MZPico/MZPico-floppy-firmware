@@ -68,6 +68,8 @@
 #define MZP_CMD_WRDIAG 0x92   // why the last WRITE SECTOR wrote / refused
 #define MZP_CMD_WREN 0x93     // enable/disable writes from the MZ-800
 #define MZP_CMD_FIRSTFAIL 0x94 // first read/seek failure since power-up (sticky)
+#define MZP_CMD_FDCFORMAT 0x95 // bench: WRITE TRACK (format) one track
+#define MZP_CMD_READTRACK 0x96 // bench: READ TRACK -- raw decoded byte stream
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1095,6 +1097,41 @@ void gw_task() {
     reply_buffer[i++] = n & 0xFF;
     reply_buffer[i++] = (n >> 8) & 0xFF;
     cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FDCFORMAT) {
+    // Bench (no MZ-800): format one track. cmd_buffer[2]=track [3]=side
+    // [4]=n_sectors [5]=size code [6]=interleave [7]=fill byte.
+    // Reply: [cmd, ACK, result, img_lo, img_hi]. result: 0 ok, 1 write
+    // protected, 2 image too long, 3 write failed.
+    uint8_t result = 0;
+    uint16_t n = fdc_bench_format(cmd_buffer[2], cmd_buffer[3], cmd_buffer[4],
+                                  cmd_buffer[5], cmd_buffer[6], cmd_buffer[7],
+                                  &result);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = result;
+    reply_buffer[i++] = n & 0xFF;
+    reply_buffer[i++] = (n >> 8) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_READTRACK) {
+    // Bench (no MZ-800): capture a revolution and stream the raw decoded byte
+    // stream -- gaps, address marks, CRCs, everything, uninterpreted.
+    // cmd_buffer[2]=track [3]=side. Reply: [cmd, ACK, n_lo, n_hi] + n bytes.
+    uint8_t track = cmd_buffer[2], side = cmd_buffer[3];
+    uint16_t n = fdc_bench_read_track(track, side, flux_transitions,
+                                      sizeof(flux_transitions));
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = n & 0xFF;
+    reply_buffer[i++] = (n >> 8) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+    uint16_t sent = 0;
+    while (sent < n) {
+      uint16_t chunk = (uint16_t)tmin((uint32_t)(n - sent), (uint32_t)256);
+      cdc_write_all(fdc_track_buffer() + sent, chunk);
+      sent += chunk;
+    }
   }
 
   else if (cmd == MZP_CMD_FIRSTFAIL) {

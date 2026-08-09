@@ -78,6 +78,23 @@ SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
 bool mfm_verify_track(const uint8_t *flux, size_t n_flux,
                       float nominal_bit_time_us, uint8_t want_cyl);
 
+// WD Type III READ TRACK primitive: decode `flux` into the raw byte stream a
+// WD hands over DRQ -- everything on the track including gaps, address marks
+// and CRC bytes, with no interpretation and no CRC checking.
+//
+// Unlike every other decode here it cannot be anchored to a sync mark, because
+// the point is to see what lies BETWEEN the marks. So it free-runs: it recovers
+// the bit phase from the flux intervals and emits a byte every 8 data bits,
+// resynchronising whenever an 0xA1 sync mark passes (the missing clock bit
+// makes those unambiguous). Byte boundaries in the gaps are therefore arbitrary
+// -- which is exactly what a real WD produces too, and why READ TRACK is a
+// diagnostic tool rather than a way to copy a disk.
+//
+// Returns the number of bytes written to `out`.
+size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
+                          float nominal_bit_time_us, uint8_t *out,
+                          size_t out_size);
+
 // WD Type III READ ADDRESS primitive: return the *first* ID field found in
 // `flux` (whatever sector it belongs to), as the six bytes a real WD179x hands
 // the host over DRQ -- track, side, sector, size code, CRC1, CRC2. The CRC

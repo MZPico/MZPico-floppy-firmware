@@ -32,3 +32,42 @@ size_t mfm_encode_track(uint8_t *flux, size_t max_flux, const uint8_t *sectors,
 size_t mfm_encode_data_field(uint8_t *flux, size_t max_flux,
                              const uint8_t *data, size_t n_data, bool deleted,
                              float nominal_bit_time_us, int trailing_gap);
+
+// Encode a WD WRITE TRACK image -- the byte stream a host shifts in to format a
+// track -- into flux. Most bytes are written literally; four are commands to
+// the WD's write channel, and this is where they are obeyed (MFM values):
+//
+//   0xF5  write 0xA1 with a missing clock bit, and preset the CRC
+//   0xF6  write 0xC2 with a missing clock bit (the index address mark's sync)
+//   0xF7  write the two accumulated CRC bytes
+//   else  write the byte, accumulating it into the CRC
+//
+// The missing clock bits are the whole point: they make the sync marks
+// unambiguous in a stream where any data pattern is otherwise legal, and they
+// cannot be produced by writing an ordinary 0xA1 or 0xC2. Only a format can
+// create them, which is why formatting is a distinct operation and not just a
+// sequence of sector writes.
+//
+// On the CRC preset: a real IBM track has three 0xF5s in a row and the CRC that
+// follows must cover all three 0xA1s. So the preset happens once, at the START
+// of a run of 0xF5s, not on each one -- resetting per byte would leave the CRC
+// covering only the last 0xA1 and every ID field would be unreadable.
+//
+// F8..FB and FE are NOT treated as CRC-initialising here. That rule belongs to
+// FM/single density, where there is no 0xA1 sync to do the job; in MFM the
+// address marks are ordinary bytes that simply accumulate. MZ-800 media is MFM
+// throughout.
+//
+// Returns flux bytes produced, or 0 if the image would not fit.
+size_t mfm_encode_format_image(uint8_t *flux, size_t max_flux,
+                               const uint8_t *image, size_t n_image,
+                               float nominal_bit_time_us);
+
+// Fill `flux` from `n_flux` onward with encoded 0x4E gap bytes, up to
+// `max_flux`. A track image shorter than one revolution would otherwise leave
+// the tail of the OLD track intact past the end of the new one -- a track that
+// is half one format and half another, with the seam wherever the host happened
+// to stop. Padding lets the write run past the index pulse that terminates it.
+// Returns the new total flux length.
+size_t mfm_encode_gap_fill(uint8_t *flux, size_t n_flux, size_t max_flux,
+                           float nominal_bit_time_us);

@@ -24,6 +24,9 @@ Usage:
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
+    python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
+    python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
+    python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
 
   MZ-800 bus-test programs to run against `bustest` (Z80 machine code):
     write only : 3E 00 D3 DF 3C 18 FB
@@ -49,6 +52,13 @@ Usage:
   wrsoak  - the test that answers "does this need write precompensation on
             inner tracks": enough writes, spread over the surface, for a rare
             fault to show up. Overwrites one sector per track. Scratch disk.
+  fdcformat/fmtverify - Milestone 3.4 WRITE TRACK. Formatting is the only way
+            to create the missing-clock sync marks an ID field needs, so this
+            is what makes a blank disk usable. It replaces the ENTIRE track.
+            fmtverify is the one to run: format, then read the sectors back.
+  readtrack - READ TRACK: every byte on the track, gaps and marks included, no
+            interpretation. Byte boundaries in the gaps are arbitrary by
+            nature; the address-mark count at the end is the useful summary.
   fdcwrite/wrverify - the Milestone 3.3 write splice. These OVERWRITE one
             sector's data field on the disk in the drive; use a scratch disk.
             wrverify is the one to run: it writes a pattern, reads it back
@@ -80,6 +90,8 @@ MZP_CMD_FDCWRITE = 0x91
 MZP_CMD_WRDIAG = 0x92
 MZP_CMD_WREN = 0x93
 MZP_CMD_FIRSTFAIL = 0x94
+MZP_CMD_FDCFORMAT = 0x95
+MZP_CMD_READTRACK = 0x96
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -980,6 +992,75 @@ def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
               "controller's own view.")
 
 
+FMT_RESULT = {0: "ok", 1: "WRITE PROTECTED", 2: "image too long",
+              3: "write failed"}
+
+
+def do_fdcformat(s, track, side, nsec, sizecode, interleave, fill):
+    # !! DESTROYS THE TRACK. Builds a standard IBM System-34 image on-device and
+    # writes it index-to-index through the same encoder the host's WRITE TRACK
+    # command uses.
+    s.write(bytes([MZP_CMD_FDCFORMAT, 8, track, side, nsec, sizecode & 7,
+                   interleave, fill & 0xFF]))
+    s.flush()
+    r = read_exact(s, 5)
+    if len(r) < 5 or r[1] != 0:
+        print(f"bad/short reply: {r.hex()}")
+        return False
+    result = r[2]
+    n = r[3] | (r[4] << 8)
+    print(f"format track {track} side {side}: {nsec}x{128 << (sizecode & 7)} "
+          f"interleave {interleave} -> {FMT_RESULT.get(result, result)} "
+          f"({n} image bytes)")
+    return result == 0
+
+
+def do_fmtverify(s, track, side, nsec, sizecode, interleave, fill):
+    """Format a track, then scan it back. The check that matters is that every
+    sector formatted comes back with a valid ID CRC *and* a valid data CRC --
+    the ID CRC proves the missing-clock sync marks and the F5/F7 handling are
+    right, the data CRC proves the fill field and its CRC were laid down too."""
+    if not do_fdcformat(s, track, side, nsec, sizecode, interleave, fill):
+        return
+    ids = scan_geometry(s, track, side)
+    print(f"read back: {len(ids)} sectors with valid ID CRCs")
+    do_scan(s, track, side, 0)
+    got = sorted({r for r, _n in ids})
+    want = list(range(1, nsec + 1))
+    missing = [x for x in want if x not in got]
+    if missing:
+        print(f"MISSING sectors: {missing}")
+    else:
+        print(f"all {nsec} sectors present and identifiable")
+
+
+def do_readtrack(s, track, side, limit):
+    s.write(bytes([MZP_CMD_READTRACK, 4, track, side]))
+    s.flush()
+    hdr = read_exact(s, 4)
+    if len(hdr) < 4 or hdr[1] != 0:
+        print(f"bad/short reply: {hdr.hex()}")
+        return
+    n = hdr[2] | (hdr[3] << 8)
+    data = read_exact(s, n) if n else b""
+    print(f"track {track} side {side}: {n} raw bytes decoded\n")
+    # Byte boundaries in the gaps are arbitrary (see mfm_read_track_raw), so the
+    # useful view is where the address marks are, not a clean hex dump.
+    show = data[:limit]
+    for off in range(0, len(show), 16):
+        row = show[off:off + 16]
+        hexs = " ".join(f"{b:02X}" for b in row)
+        txt = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        print(f"  {off:05X}  {hexs:<47}  {txt}")
+    if n > limit:
+        print(f"  ... ({n - limit} more bytes)")
+    marks = [k for k in range(len(data) - 1)
+             if data[k] == 0xA1 and data[k + 1] in (0xFE, 0xFB, 0xF8)]
+    print(f"\naddress marks found: {len(marks)} "
+          f"({sum(1 for k in marks if data[k + 1] == 0xFE)} ID, "
+          f"{sum(1 for k in marks if data[k + 1] in (0xFB, 0xF8))} data)")
+
+
 def do_pintest(s):
     s.write(bytes([MZP_CMD_PINTEST, 2]))
     s.flush()
@@ -1108,6 +1189,24 @@ def main():
                 do_wrverify(s, track, sector, side, sizecode, mode, seed)
         elif cmd == "wrdiag":
             do_wrdiag(s)
+        elif cmd in ("fdcformat", "fmtverify"):
+            # !! DESTROYS THE TRACK.
+            # args: track [side] [n_sectors] [sizecode] [interleave] [fill]
+            track = int(sys.argv[3])
+            side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            nsec = int(sys.argv[5]) if len(sys.argv) > 5 else 9
+            sizecode = int(sys.argv[6]) if len(sys.argv) > 6 else 2
+            il = int(sys.argv[7]) if len(sys.argv) > 7 else 2
+            fill = int(sys.argv[8], 0) if len(sys.argv) > 8 else 0xE5
+            if cmd == "fdcformat":
+                do_fdcformat(s, track, side, nsec, sizecode, il, fill)
+            else:
+                do_fmtverify(s, track, side, nsec, sizecode, il, fill)
+        elif cmd == "readtrack":
+            track = int(sys.argv[3])
+            side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            limit = int(sys.argv[5]) if len(sys.argv) > 5 else 256
+            do_readtrack(s, track, side, limit)
         elif cmd == "firstfail":
             # optional "clear" to re-arm the latch for a fresh run
             do_firstfail(s, clear=(len(sys.argv) > 3

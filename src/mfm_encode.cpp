@@ -69,3 +69,78 @@ size_t mfm_encode_data_field(uint8_t *flux, size_t max_flux,
   // disk. Report it as a failure instead.
   return mfm_io_eof(&io) ? 0 : io.pos;
 }
+
+size_t mfm_encode_format_image(uint8_t *flux, size_t max_flux,
+                               const uint8_t *image, size_t n_image,
+                               float nominal_bit_time_us) {
+  mfm_io_t io;
+  memset(&io, 0, sizeof(io));
+  io.T1_nom = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 1e-6f);
+  io.pulses = flux;
+  io.n_pulses = max_flux;
+  io.settings = &standard_mfm;
+  io.flux_byte = mfm_io_flux_byte;
+  io.encode_raw = mfm_io_encode_raw_mfm;
+  io.pos = 0;
+  io.y = 0;
+  io.pulse_len = 1; // see mfm_encode_data_field
+  mfm_io_crc_preload(&io);
+
+  static const uint8_t sync_a1[2] = {0x44, 0x89}; // 0xA1, clock bit dropped
+  static const uint8_t sync_c2[2] = {0x52, 0x24}; // 0xC2, clock bit dropped
+
+  bool in_a1_run = false; // preset the CRC once per run of 0xF5, not per byte
+  for (size_t i = 0; i < n_image && !mfm_io_eof(&io); ++i) {
+    uint8_t b = image[i];
+    switch (b) {
+    case 0xF5:
+      if (!in_a1_run) {
+        // NOT mfm_io_crc_preload(): that constant (0xcdb4) is the CRC *after*
+        // three 0xA1s have been clocked in, which is the right shortcut when
+        // the encoder emits the sync itself. Here the image decides how many
+        // 0xF5s there are, so start from the true seed and clock each one in.
+        io.crc = 0xFFFF;
+        in_a1_run = true;
+      }
+      mfm_io_encode_raw_buf(&io, sync_a1, sizeof(sync_a1));
+      {
+        const uint8_t a1 = 0xA1;
+        io.crc = mfm_io_crc16(&a1, 1, io.crc);
+      }
+      continue;
+    case 0xF6:
+      in_a1_run = false;
+      mfm_io_encode_raw_buf(&io, sync_c2, sizeof(sync_c2));
+      continue;
+    case 0xF7:
+      in_a1_run = false;
+      mfm_io_encode_crc(&io); // writes both bytes, leaves crc == 0
+      continue;
+    default:
+      in_a1_run = false;
+      mfm_io_encode_byte_crc(&io, b);
+      continue;
+    }
+  }
+  return mfm_io_eof(&io) ? 0 : io.pos;
+}
+
+size_t mfm_encode_gap_fill(uint8_t *flux, size_t n_flux, size_t max_flux,
+                           float nominal_bit_time_us) {
+  if (n_flux >= max_flux)
+    return n_flux;
+  mfm_io_t io;
+  memset(&io, 0, sizeof(io));
+  io.T1_nom = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 1e-6f);
+  io.pulses = flux;
+  io.n_pulses = max_flux;
+  io.settings = &standard_mfm;
+  io.flux_byte = mfm_io_flux_byte;
+  io.encode_raw = mfm_io_encode_raw_mfm;
+  io.pos = n_flux;
+  io.y = 0;
+  io.pulse_len = 1;
+  while (!mfm_io_eof(&io))
+    mfm_io_encode_byte(&io, standard_mfm.gap_byte);
+  return io.pos;
+}

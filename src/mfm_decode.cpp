@@ -206,3 +206,62 @@ bool mfm_verify_track(const uint8_t *flux, size_t n_flux,
   }
   return false;
 }
+
+size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
+                          float nominal_bit_time_us, uint8_t *out,
+                          size_t out_size) {
+  mfm_io_t io;
+  memset(&io, 0, sizeof(io));
+  io.pulses = const_cast<uint8_t *>(flux);
+  io.n_pulses = n_flux;
+  io.pos = 0;
+  io.T1_nom = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 1e-6f);
+  io.T2_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 2.5e-6f);
+  io.T3_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 3.5e-6f);
+
+  size_t n = 0;
+  // Bit assembly, same rules as receive_crc() but free-running: `state` tracks
+  // whether the next symbol carries data or clock bits, `tmp`/`weight` shift a
+  // byte together. The sync-mark detector runs in parallel so a mark can force
+  // both the phase and the byte boundary back into agreement with the disk.
+  unsigned tmp = 0, weight = 0x8000;
+  mfm_state_t state = mfm_io_even;
+  uint32_t mark = 0;
+
+  while (!mfm_io_eof(&io) && n < out_size) {
+    mfm_io_symbol_t s = mfm_io_read_symbol(&io);
+
+    mark = ((mark << 2) | (uint32_t)s) & mfm_io_triple_mark_mask;
+    if (mark == mfm_io_triple_mark_magic) {
+      // An 0xA1 sync just went past. Whatever phase we had drifted into, the
+      // disk says the next data bit starts here -- take it, and start a fresh
+      // byte. This is the only correction available in a stream with no other
+      // structure, and it is what keeps the interesting parts (the address
+      // marks and the fields behind them) byte-aligned in the output.
+      tmp = 0;
+      weight = 0x8000;
+      state = mfm_io_even;
+      if (n < out_size)
+        out[n++] = 0xA1; // the mark itself, which no data pattern can produce
+      continue;
+    }
+
+    if (state)
+      tmp |= weight;
+    weight >>= 1;
+    if (s == mfm_io_pulse_1000) {
+      weight >>= 1; // the second bit of a 1000 is always a 0
+    } else if (s == mfm_io_pulse_100) {
+      if (state)
+        weight >>= 1;
+      state = (mfm_state_t)!state;
+    }
+
+    if (weight <= 0x80) {
+      out[n++] = (uint8_t)(tmp >> 8);
+      tmp <<= 8;
+      weight <<= 8;
+    }
+  }
+  return n;
+}

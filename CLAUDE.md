@@ -242,7 +242,17 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     instead of merely returning garbage. Verify with
     `mzp_probe.py PORT wrverify <track> <sector>` (writes, reads back, compares)
     plus `wrdiag`, on a scratch disk, before letting the MZ-800 write.
-  - 3.4 leftovers: READ TRACK, WRITE TRACK (format), density applied to
-    `~DEN_RDY`, drive-select via `~DS0/DS1`.
+  - **3.4 READ TRACK + WRITE TRACK (format): implemented, not yet
+    hardware-verified.** WRITE TRACK obeys the WD write-channel bytes (`F5`
+    0xA1+preset CRC, `F6` 0xC2, `F7` CRC, else literal) — the missing-clock
+    sync marks it creates are the reason formatting cannot be expressed as a
+    run of sector writes. It runs index-to-index, which makes it *safer* than
+    the sector splice despite replacing the whole track: there is no timing
+    window to hit. Verify with `mzp_probe.py PORT fmtverify <track>` on a
+    scratch disk. READ TRACK returns every byte uninterpreted (`readtrack`).
+    Density→DENSEL is closed as "not to be done" (the ROM never writes the
+    port, so its polarity is unknowable and nothing needs it); drive-select via
+    `~DS0/DS1` + multi-drive is deliberately left, needing per-drive head
+    positions and a second drive to test against.
 - **Phase 4 (robustness):** write-precomp if needed, multi-drive, error handling,
   soak testing.

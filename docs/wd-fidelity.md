@@ -54,9 +54,16 @@ booting CP/M: every MZ-800 CP/M image carries its 16×256 IPL track on
 cyl0/head1 as a PC reads it. Runtime-togglable for A/B testing via
 `mzp_probe.py sideswap`.
 
-**Density is decoded but not yet applied** — `0xDE` is latched and reported, but
-not wired to the DENSEL pin and not used to pick the bit time. MZ-800 media is
-DD throughout, so nothing depends on it today.
+**Density is decoded but deliberately not applied** — `0xDE` is latched and
+reported, but not wired to the DENSEL pin and not used to pick the bit time, and
+that is now a decision rather than a to-do. The Disk BASIC ROM defines
+`DE_REG = 0DEH` and **never writes it** (checked against `MZ2Z046.ASM`), so
+there is no observed traffic to infer the bit's polarity from — the two
+candidate readings ("b0=1 means HD" vs "b0=1 means single density") disagree,
+and driving DENSEL on a guess would break a machine that currently boots, to
+serve media that does not exist for this platform. MZ-800 media is DD
+throughout. Revisit only if a host is found that writes the port; `iotrace`
+will show it.
 
 ## Interrupts — DRQ-driven, not INTRQ-driven
 

@@ -19,6 +19,7 @@
 // is 0xD8 -- bit3 (I3) set, i.e. "interrupt immediately". INTRQ is now driven;
 // see fdc_set_int_mode() for the wiring question it leaves open.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 class FloppyDrive;
@@ -249,6 +250,26 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
 // (b0 wrote b1 id_found b2 cyl_mismatch b3 size_mismatch b4 late b5 no_flux).
 bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
                             const uint8_t *data, uint16_t n, uint8_t *flags);
+
+// Bench-only SYNCHRONOUS format of one track (no MZ-800): build a standard IBM
+// System-34 MFM track image with `n_sectors` sectors of 128<<size_code bytes
+// filled with `fill`, numbered 1..n and laid out with the given `interleave`
+// step, then write it index-to-index. Goes through the same encoder the host's
+// WRITE TRACK uses, so it exercises the real path.
+//
+// THIS DESTROYS THE TRACK. Returns the image length in bytes (0 on failure);
+// *out_result: 0 ok, 1 write protected, 2 image too long, 3 write failed.
+uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
+                          uint8_t size_code, uint8_t interleave, uint8_t fill,
+                          uint8_t *out_result);
+
+// Bench-only SYNCHRONOUS READ TRACK (no MZ-800): seek, capture a revolution and
+// decode every byte on the track into the controller's track buffer. Uses
+// `flux_buf` (>= a revolution's worth) as capture scratch. Returns the number
+// of decoded bytes; read them with fdc_track_buffer().
+uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
+                              size_t flux_cap);
+const uint8_t *fdc_track_buffer(void);
 
 // Master enable for WRITE SECTOR from the MZ-800 (see g_write_enable). OFF puts
 // the bridge back to read-only: write commands are refused with WRITE PROTECT
