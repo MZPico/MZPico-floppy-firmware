@@ -816,18 +816,21 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 57)
-    if len(r) < 57 or r[1] != 0:
+    r = read_exact(s, 76)
+    if len(r) < 76 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
     ids_seen = r[4] | (r[5] << 8)
-    vals = [int.from_bytes(r[6 + 4 * k:10 + 4 * k], "little") for k in range(11)]
+    vals = [int.from_bytes(r[6 + 4 * k:10 + 4 * k], "little") for k in range(14)]
     (splice_us, attempts, refused, ok, rnf, cyl_mm, size_mm, late,
-     lost, abandoned, short_armed) = vals
-    ab_want = r[50] | (r[51] << 8)
-    ab_got = r[52] | (r[53] << 8)
-    ab_track, ab_side, ab_sector = r[54], r[55], r[56]
+     lost, abandoned, short_armed, trk_ok, trk_fail, trk_refused) = vals
+    ab_want = r[62] | (r[63] << 8)
+    ab_got = r[64] | (r[65] << 8)
+    ab_track, ab_side, ab_sector = r[66], r[67], r[68]
+    why, trk_op, trk_armed = r[69], r[70], r[71]
+    trk_pos = r[72] | (r[73] << 8)
+    trk_last = r[74] | (r[75] << 8)
     print("WRITE SECTOR state:")
     print(f"  writing={bool(wr_flags & 1)} buffer_full={bool(wr_flags & 2)} "
           f"writes_enabled={bool(wr_flags & 4)} "
@@ -850,6 +853,19 @@ def do_wrdiag(s):
             print("    ! want != got means the sector SIZE assumed for that "
                   "cylinder+side is wrong, so the buffer never filled and no "
                   "splice ran -- nothing was written and nothing else counted it")
+    print("WRITE/READ TRACK:")
+    opname = {0: "idle", 1: "READ TRACK", 2: "WRITE TRACK"}.get(trk_op, "?")
+    print(f"  state={opname} armed={bool(trk_armed)} collected={trk_pos} "
+          f"last_image={trk_last}  completed={trk_ok} failed={trk_fail}")
+    whyname = {0: "", 1: "~WPT (disk is write-protected)",
+               2: "writes disabled (`wren 1`)",
+               3: "format gate off (`fmten 1`) -- DEFAULT after every reflash"}
+    print(f"  refused={trk_refused}"
+          + (f"  reason: {whyname.get(why, '?')}" if trk_refused else ""))
+    if trk_refused and why:
+        print("  ! a refused WRITE TRACK leaves STATUS=0x40 with BUSY clear; a "
+              "format routine that ignores bit 6 polls it forever and the "
+              "machine looks frozen")
     if cyl_mm:
         print("  ! wrong-cylinder aborts mean the head was not where the host "
               "believed -- see `rddiag` for the position chain")

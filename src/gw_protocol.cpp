@@ -1328,7 +1328,8 @@ void gw_task() {
                             d.wr_rnf,           d.wr_cyl_mismatch,
                             d.wr_size_mismatch, d.wr_late,
                             d.lost_data_events,  d.wr_abandoned,
-                            d.wr_short_armed};
+                            d.wr_short_armed,    d.trk_ok,
+                            d.trk_fail,          d.trk_refused};
     for (uint32_t v : w32) {
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
@@ -1342,6 +1343,15 @@ void gw_task() {
     reply_buffer[i++] = d.wr_ab_track;
     reply_buffer[i++] = d.wr_ab_side;
     reply_buffer[i++] = d.wr_ab_sector;
+    // WRITE/READ TRACK state. The refusal REASON matters most: WP, the write
+    // switch and the format gate are indistinguishable to the host.
+    reply_buffer[i++] = d.trk_refuse_why;
+    reply_buffer[i++] = d.trk_op;
+    reply_buffer[i++] = d.trk_armed;
+    reply_buffer[i++] = (uint8_t)(d.trk_pos & 0xFF);
+    reply_buffer[i++] = (uint8_t)(d.trk_pos >> 8);
+    reply_buffer[i++] = (uint8_t)(d.trk_last_bytes & 0xFF);
+    reply_buffer[i++] = (uint8_t)(d.trk_last_bytes >> 8);
     cdc_write_all(reply_buffer, i);
   }
 

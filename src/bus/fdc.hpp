@@ -156,6 +156,14 @@ struct FdcDebug {
   uint32_t wr_rnf;           // the sector's ID never passed the head
   uint32_t wr_abandoned;     // write ended before its buffer filled
   uint32_t wr_short_armed;   // ...armed by a quiet stream, not a full buffer
+  uint32_t trk_ok;           // WRITE/READ TRACK completions
+  uint32_t trk_fail;
+  uint32_t trk_refused;      // host WRITE TRACK refused before the media
+  uint8_t trk_refuse_why;    // 1=~WPT 2=writes off 3=format gate off
+  uint8_t trk_op;            // 0 none, 1 READ TRACK, 2 WRITE TRACK
+  uint8_t trk_armed;
+  uint16_t trk_pos;          // format-image bytes collected so far
+  uint16_t trk_last_bytes;
   uint16_t wr_ab_want;       // bytes expected by the last abandoned write
   uint16_t wr_ab_got;        // ...and how many the host actually sent
   uint8_t wr_ab_track;

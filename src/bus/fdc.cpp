@@ -195,6 +195,15 @@ struct FdcState {
   volatile uint32_t trk_fail = 0;    // ...that failed to reach the media
   volatile uint32_t trk_last_us = 0; // last operation's disk time
   volatile uint16_t trk_last_bytes = 0; // last image length
+  // Why the last host WRITE TRACK was refused. WP, the write switch and the
+  // format gate all present to the host identically -- status 0x40, BUSY clear,
+  // and a format routine that ignores the bit spinning on STATUS forever -- but
+  // they need completely different fixes (unprotect the disk / `wren 1` /
+  // `fmten 1`). One lumped `refused` counter cannot tell you which, and the
+  // machine looks frozen either way.
+  // 0 = none, 1 = ~WPT, 2 = writes disabled, 3 = format gate off.
+  volatile uint8_t trk_refuse_why = 0;
+  volatile uint32_t trk_refused = 0;
   volatile uint8_t track_buf[FDC_TRACK_IMAGE_MAX];
   // Write-path diagnostics, cumulative. The equivalent of the sec_* counters:
   // a snapshot of the last write cannot show the one that went wrong earlier.
@@ -1575,6 +1584,9 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.busy = true;
         S.trk_seq++;
       } else if (S.write_protect || !g_write_enable || !g_format_enable) {
+        S.trk_refuse_why =
+            S.write_protect ? 1 : (!g_write_enable ? 2 : 3);
+        S.trk_refused++;
         // WRITE TRACK refused before anything is destroyed. This replaces an
         // ENTIRE track, so on top of ~WPT and the write switch it needs its own
         // enable: the command register is bus-inverted, so a raw 0x00 here
@@ -1926,6 +1938,14 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->wr_rnf = S.wr_rnf;
   o->wr_abandoned = S.wr_abandoned;
   o->wr_short_armed = S.wr_short_armed;
+  o->trk_ok = S.trk_ok;
+  o->trk_fail = S.trk_fail;
+  o->trk_refused = S.trk_refused;
+  o->trk_refuse_why = S.trk_refuse_why;
+  o->trk_op = S.trk_op;
+  o->trk_armed = S.trk_armed ? 1 : 0;
+  o->trk_pos = S.trk_pos;
+  o->trk_last_bytes = S.trk_last_bytes;
   o->wr_ab_want = S.wr_ab_want;
   o->wr_ab_got = S.wr_ab_got;
   o->wr_ab_track = S.wr_ab_track;
