@@ -1825,7 +1825,15 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->command = S.command;
   o->flags = (uint8_t)((S.motor_on ? 0x80 : 0) | (S.side1 ? 0x04 : 0) |
                        (S.write_protect ? 0x02 : 0) | (S.busy ? 0x01 : 0));
-  o->drive = S.drive_sel;
+  // Both drive numbers, not one: low nibble = the unit the host/probe has
+  // SELECTED, high nibble = the unit core0 is actually driving (0xF = none
+  // yet). They differ whenever a select has not been applied, because it is
+  // applied lazily by the next actuating command -- and everything physical in
+  // this snapshot (phys, t0, wp) describes the ACTUATED drive. Reporting only
+  // the requested unit made a dump taken right after `drive 1` attribute drive
+  // 0's head position to drive 1.
+  o->drive = (uint8_t)((S.drive_sel & 0x0F) |
+                       ((g_cur_drive < 0 ? 0x0F : (g_cur_drive & 0x0F)) << 4));
   o->at_track0 = S.at_track0 ? 1 : 0;
   int t = DRV ? DRV->track() : -1;
   o->phys_track = (t < 0) ? 0xFF : (uint8_t)t;

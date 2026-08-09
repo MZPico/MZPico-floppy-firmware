@@ -334,6 +334,11 @@ STATUS_BITS_T2 = ["B", "DRQ", "Lost", "CRC", "RNF", "Del", "-", "NRdy"]
 def fdc_line(r):
     (status, track, sector, data, command, flags, drive,
      at0, phys, opseq, opdone) = r[2:13]
+    # drive: low nibble = selected unit, high nibble = unit actually driven.
+    # Everything physical below (phys/t0/wp) describes the DRIVEN one.
+    drv_sel, drv_cur = drive & 0x0F, (drive >> 4) & 0x0F
+    drv_txt = "drv=%d" % drv_sel if drv_sel == drv_cur else (
+        "drv=%d(driving %s)" % (drv_sel, "none" if drv_cur == 0x0F else drv_cur))
     rd_flags = rd_sector = xpos = xlen = rdseq = rddone = None
     rd_elapsed_us = cmd_gap_us = None
     if len(r) >= 21:
@@ -371,7 +376,8 @@ def fdc_line(r):
             f"DAT={data:02X} CMD={command:02X}({decode_cmd(command)}) "
             f"mot={'1' if flags & 0x80 else '0'} sd={1 if flags & 4 else 0} "
             f"wp={1 if flags & 2 else 0} busy={1 if flags & 1 else 0} "
-            f"t0={at0} phys={'?' if phys == 0xFF else phys} seek={opdone}/{opseq}")
+            f"t0={at0} phys={'?' if phys == 0xFF else phys} seek={opdone}/{opseq} "
+            f"{drv_txt}")
     if cmd_gap_us is not None:
         line += f"  gap_since_seek={cmd_gap_us / 1000:.1f}ms"
     if verify_n is not None:
