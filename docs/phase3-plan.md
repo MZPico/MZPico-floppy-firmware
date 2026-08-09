@@ -234,12 +234,23 @@ BUSY-polling covers latency instead, per the ROM driver).
       both checked before anything is destroyed. Test with
       `mzp_probe.py PORT fmtverify <track>` (format, then read the sectors
       back) on a scratch disk.
-  - **READ TRACK (0xEX). IMPLEMENTED; first hardware run found a bug, fixed,
-    awaiting re-test.** The first version dropped the rule governing the symbol
-    immediately after a sync mark and so latched *clock* bits as data: gaps came
-    back as 0x84 rather than 0x4E — not even a rotation of it, which is what
-    identified the fault as a parity error rather than an arbitrary byte
-    boundary — and no address mark was ever recognisable. Returns every
+  - **READ TRACK (0xEX). Phase-locked and decoding correctly on hardware; a
+    cosmetic sync-count fix is awaiting re-test.** Two bugs, both found by
+    dumping a real track:
+    1. It dropped the rule governing the symbol immediately after a sync mark
+       and so latched *clock* bits as data. The gaps came back as 0x84 rather
+       than 0x4E — not even a rotation of it, which is what identified the
+       fault as inverted parity rather than the arbitrary byte boundary READ
+       TRACK is entitled to — and no address mark was recognisable. Fixed;
+       ID fields now read `A1 A1 A1 FE <c> <h> <r> <n> <crc> <crc>` and data
+       fields decode to their real contents.
+    2. Sync runs were reported as five 0xA1s instead of three. The mark
+       detector runs on a sliding window primed by whatever preceded the sync
+       (unlike the sector decoder's, which restarts per search), so it can
+       fire a byte or two early, leaving the rest of the same physical run to
+       decode again as ordinary bytes. Decoded 0xA1s are now swallowed until
+       the first byte that is not one — which is the address mark, the thing
+       the caller is looking for. Returns every
     byte on the track — gaps, address marks, CRC bytes — uninterpreted, via
     `mfm_read_track_raw()`. It is the one decode here that cannot anchor itself
     to a sync mark, since the point is to see what lies between them, so it

@@ -229,6 +229,14 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
   mfm_state_t state = mfm_io_even;
   uint32_t mark = 0;
   bool resync = false; // the next symbol is the one after a sync mark
+  // The detector does not always fire on the last 0xA1 of a run: it works on a
+  // sliding window of symbols that, unlike the sector decoder's, is primed by
+  // whatever preceded the sync, so it can match a byte or two early. When it
+  // does, the remaining physical 0xA1s decode again as ordinary bytes and the
+  // run is reported as five sync bytes instead of three. Swallow decoded 0xA1s
+  // until the first byte that is not one -- which is the address mark, the
+  // thing the caller is actually looking for.
+  bool eat_a1 = false;
 
   while (!mfm_io_eof(&io) && n < out_size) {
     mfm_io_symbol_t s = mfm_io_read_symbol(&io);
@@ -242,6 +250,8 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
       tmp = 0;
       weight = 0x8000;
       resync = true;
+      eat_a1 = true; // see below
+      mark = 0;      // require a full fresh pattern before firing again
       continue;
     }
 
@@ -283,9 +293,15 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
     }
 
     if (weight <= 0x80) {
-      out[n++] = (uint8_t)(tmp >> 8);
+      uint8_t b = (uint8_t)(tmp >> 8);
       tmp <<= 8;
       weight <<= 8;
+      if (eat_a1) {
+        if (b == 0xA1)
+          continue; // a sync byte already reported at the mark
+        eat_a1 = false;
+      }
+      out[n++] = b;
     }
   }
   return n;
