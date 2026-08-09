@@ -242,9 +242,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     instead of merely returning garbage. Verify with
     `mzp_probe.py PORT wrverify <track> <sector>` (writes, reads back, compares)
     plus `wrdiag`, on a scratch disk, before letting the MZ-800 write.
-  - **3.4 WRITE TRACK (format): DONE (hardware-verified) — formats a track
-    that scans back with all sectors and CRCs valid. READ TRACK: implemented,
-    re-test pending after a phase fix.** WRITE TRACK obeys the WD write-channel bytes (`F5`
+  - **3.4 WRITE TRACK (format) + READ TRACK: DONE.** Bench path
+    hardware-verified — formats a track that scans back with all sectors and
+    CRCs valid; READ TRACK decodes ID fields, gaps and data correctly off real
+    media. The host command path is wired but unproven from the MZ-800, and
+    host formatting is gated **OFF** by default (`fmten`): the command register
+    is bus-inverted, so a raw 0x00 decodes to 0xFF = WRITE TRACK and one
+    glitched byte would reformat a track. WRITE TRACK obeys the WD write-channel bytes (`F5`
     0xA1+preset CRC, `F6` 0xC2, `F7` CRC, else literal) — the missing-clock
     sync marks it creates are the reason formatting cannot be expressed as a
     run of sector writes. It runs index-to-index, which makes it *safer* than

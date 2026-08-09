@@ -238,9 +238,8 @@ BUSY-polling covers latency instead, per the ROM driver).
     what the chip would have given it. Also loads the ID's track byte into the
     Sector register (WD quirk; the CP/M BIOS reads head position from there).
     This is what stopped the BIOS stepping blindly and giving up.
-  - **WRITE TRACK (0xFX) — format. Bench path ✅ hardware-verified; the HOST
-    command path is NOT WIRED YET** (an edit was lost and the 0xEX/0xFX branch
-    still completes benignly — see the note at the end of this milestone).** Formatting
+  - **WRITE TRACK (0xFX) — format. ✅ Bench path hardware-verified; host command
+    path wired (untested from the MZ-800, and gated OFF by default).** Formatting
     track 70 as 9x512 interleave 2 and scanning it back returns all nine
     sectors, in the interleaved physical order 1,6,2,7,3,8,4,9,5, every one
     with a valid ID **and** data CRC — which is the proof that the missing-clock
@@ -304,16 +303,24 @@ BUSY-polling covers latency instead, per the ROM driver).
     bit's polarity from and the two documented readings disagree; driving
     DENSEL on a guess risks a machine that currently boots, for media this
     platform does not have. See wd-fidelity.md.
-  - **Host command path for 0xEX/0xFX still to wire.** The encoders, the
-    core0 track-op block, the state and the bench commands all landed and are
-    verified; the *command decode* that sets `trk_op` from a host 0xEX/0xFX did
-    not, so from the MZ-800's point of view both commands still complete
-    benignly as they did in 3.2. When it is wired, note that
-    `g_format_enable` (`mzp_probe.py fmten`, default **OFF**) must stay the
-    gate: the command register is bus-inverted, so a raw 0x00 on port 0xD8
-    decodes to 0xFF = WRITE TRACK, and one glitched byte during a power-up
-    transient would otherwise reformat a track. Every other opcode a stray byte
-    can land on is survivable; this one is not.
+  - **Host command path for 0xEX/0xFX: wired.** A host READ TRACK captures a
+    revolution and streams the decoded bytes over DRQ; a host WRITE TRACK
+    collects the format image and lays the track down. Not yet exercised from
+    the MZ-800 — no software is known to format through us — so treat it as
+    implemented-but-unproven.
+    - **Host formatting is gated OFF by default** (`g_format_enable`,
+      `mzp_probe.py fmten 1`). The command register is bus-inverted, so a raw
+      0x00 on port 0xD8 decodes to 0xFF = WRITE TRACK: one glitched byte during
+      a power-up transient would otherwise reformat a track. Every other opcode
+      a stray byte can land on is survivable — a spurious READ returns data
+      nobody wanted, a spurious SEEK moves the head and the ID track compare
+      catches it — this one is not. READ TRACK needs no such gate; it only
+      costs the host a revolution.
+    - A collected image is additionally refused unless it is at least 256 bytes
+      and contains both an 0xF5 and an 0xFE. A real format necessarily carries
+      the write-channel commands for a sync mark and an ID address mark; a
+      stream without them cannot be a format, and writing it would destroy the
+      track just as thoroughly as a real one would.
   - **Still to do:** drive-select via `~DS0`/`~DS1` and real multi-drive. Left
     alone deliberately: it needs per-drive head positions, and with one drive
     attached there is no way to test that a second select line does not simply

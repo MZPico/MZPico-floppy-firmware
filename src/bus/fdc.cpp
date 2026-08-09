@@ -1313,13 +1313,48 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       S.rd_elapsed_us = 0;
       S.rd_seq++;
     } else {
-      // ---- Type III READ TRACK / WRITE TRACK (0xEX/0xFX) ----
-      // Milestone 3.4. Use the Type II status layout (not Type I) and complete
-      // benignly so the host doesn't hang polling BUSY.
-      S.type2 = true;
+      // ---- Type III READ TRACK (0xEX) / WRITE TRACK (0xFX) ----
+      S.type2 = true; // both report in the Type II status layout
       S.reading = false;
+      S.writing = false;
+      S.wr_armed = false;
       S.read_addr = false;
-      S.busy = false;
+      S.multi = false;
+      S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
+      S.err_write_protect = false;
+      S.trk_armed = false;
+      S.trk_pos = 0;
+      S.trk_len = 0;
+      S.rd_issue_us = time_us_32();
+      S.status_polls = 0;
+      S.status_last_us = S.rd_issue_us;
+      S.last_data_read_us = S.rd_issue_us;
+      if ((cmd & 0x10) == 0) {
+        // READ TRACK: core0 captures a revolution and decodes every byte on it.
+        S.trk_op = 1;
+        S.drq = false;
+        S.busy = true;
+        S.trk_seq++;
+      } else if (S.write_protect || !g_write_enable || !g_format_enable) {
+        // WRITE TRACK refused before anything is destroyed. This replaces an
+        // ENTIRE track, so on top of ~WPT and the write switch it needs its own
+        // enable: the command register is bus-inverted, so a raw 0x00 here
+        // decodes to 0xFF = WRITE TRACK, and a single glitched byte during a
+        // power-up transient would otherwise reformat a track. Every other
+        // opcode a stray byte can land on is survivable; this one is not.
+        S.trk_op = 0;
+        S.drq = false;
+        S.busy = false;
+        S.err_write_protect = true;
+        S.wr_refused++;
+      } else {
+        // WRITE TRACK: collect the format image, then core0 lays the whole
+        // track down. DRQ comes up at once, exactly as on a sector write.
+        S.trk_op = 2;
+        S.busy = true;
+        S.drq = true;
+      }
+      fdc_refresh_int_line();
     }
     break;
   }
@@ -1340,6 +1375,24 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     // at a time. Ownership of xfer[] passes to core0 via `wr_armed`+`wr_seq`
     // once the last byte lands -- the mirror of how `drq` hands a read sector
     // the other way.
+    if (S.trk_op == 2 && S.drq) {
+      // WRITE TRACK: the host is shifting in the whole format image. Unlike a
+      // sector write there is no length known in advance -- core0 decides the
+      // image is complete when the byte stream goes quiet (FDC_TRACK_IDLE_US).
+      if (S.trk_pos < FDC_TRACK_IMAGE_MAX) {
+        S.track_buf[S.trk_pos] = S.data;
+        S.trk_pos++;
+      }
+      S.last_data_read_us = time_us_32();
+      if (S.trk_pos >= FDC_TRACK_IMAGE_MAX) {
+        S.drq = false; // buffer full: that is as much track as there can be
+        S.trk_len = S.trk_pos;
+        S.trk_armed = true;
+        S.trk_seq++;
+      }
+      fdc_refresh_int_line();
+      break;
+    }
     if (S.writing && S.drq) {
       S.xfer[S.xfer_pos] = S.data;
       S.xfer_pos++;
@@ -1460,7 +1513,7 @@ RAM_FUNC uint8_t fdc_reg_read(uint8_t addr) {
 RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
   switch (addr) {
   case 0xD8:
-    if (S.reading || S.writing) { // measure the host's real BUSY/DRQ patience
+    if (S.reading || S.writing || S.trk_op) { // host's BUSY/DRQ patience
       S.status_polls++;
       S.status_last_us = time_us_32();
     }
@@ -1484,6 +1537,19 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
     // pace DRQ. The ROM only reads DATA when STATUS shows DRQ (it guards every
     // INI with the status test), so an out-of-transfer read just returns the
     // stale Data register.
+    if (S.trk_op == 1 && S.drq) {
+      // READ TRACK: hand out the decoded track image byte by byte.
+      uint8_t b = S.track_buf[S.trk_pos];
+      S.trk_pos++;
+      S.last_data_read_us = time_us_32();
+      if (S.trk_pos >= S.trk_len) {
+        S.drq = false;
+        S.trk_op = 0;
+        S.busy = false;
+      }
+      fdc_refresh_int_line();
+      return (uint8_t)~b;
+    }
     if (S.reading && S.drq) {
       uint8_t b = S.xfer[S.xfer_pos];
       S.xfer_pos++;
