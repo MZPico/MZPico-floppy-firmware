@@ -151,10 +151,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Write soak + inner tracks.** WRITE SECTOR is verified (3.3) but only over
   tens of writes on outer tracks. Still open: whether inner tracks need
   write-precomp, and whether the +2-byte splice bias holds across drives and
-  media with more spindle-speed spread. The tool for it now exists —
-  `mzp_probe.py PORT wrsoak` writes and verifies across the whole surface with a
-  fresh pattern each pass; failures clustering on high track numbers would be
-  the precomp question answering itself. **Needs running.**
+  media with more spindle-speed spread. First soak run: **95/95 writes verified
+  byte-for-byte** over tracks 0–36 (step 4), both sides, 5 passes, with no
+  clustering on high track numbers — so no evidence so far that inner tracks
+  need precomp. The five "failures" in that run were the size compare correctly
+  refusing to write 512 bytes into the boot track's 256-byte sectors;
+  `mzp_probe.py PORT wrsoak` now reads each track's geometry first and writes
+  what is actually there. Longer soaks and a second drive are still worth doing.
 - **Rare `FD:Loading error` on boot** (~1 in 20; everything else reads clean).
   The **first-failure latch** it needed now exists (`mzp_probe.py firstfail`):
   it holds the first RNF/CRC/wrong-cylinder/Verify failure since power-up in

@@ -868,6 +868,32 @@ def do_firstfail(s, clear=False):
               "sector number")
 
 
+def scan_geometry(s, track, side):
+    """Return [(sector_id, size_code), ...] actually recorded on a track.
+
+    The soak cannot assume a geometry. An MZ-800 CP/M disk is 9x512 on its data
+    tracks but 16x256 on the boot track (cyl 0, physical head 1), and asking to
+    write 512 bytes into a 256-byte sector is correctly refused by the splice's
+    size compare -- which looks like a write failure but is the safety check
+    working. Read the ID fields and use what is really there.
+    """
+    s.write(bytes([MZP_CMD_SCAN, 5, track, side, 0]))
+    s.flush()
+    hdr = read_exact(s, 7)
+    if len(hdr) < 7 or hdr[1] != 0:
+        return []
+    ns = hdr[2]
+    out = []
+    for _ in range(ns):
+        rec = read_exact(s, 5)
+        if len(rec) < 5:
+            break
+        c, h, r, n, flags = rec
+        if flags & 1:  # ID CRC ok
+            out.append((r, n & 7))
+    return out
+
+
 def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
     """Write/verify soak across many tracks and sides.
 
@@ -881,9 +907,32 @@ def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
     ok = bad = 0
     failures = []
     seed = start_seed
+
+    # Probe each surface once and remember what is really on it, so a track
+    # with a different format is exercised rather than reported as a failure.
+    geom = {}
+    for t in tracks:
+        for sd in sides:
+            ids = scan_geometry(s, t, sd)
+            if not ids:
+                print(f"  track {t} side {sd}: no readable IDs -- skipping")
+                continue
+            # Prefer the requested sector; otherwise take the first one there.
+            pick = next((x for x in ids if x[0] == sector), ids[0])
+            geom[(t, sd)] = pick
+            if pick[0] != sector or pick[1] != sizecode:
+                print(f"  track {t} side {sd}: {len(ids)} sectors, using "
+                      f"sector {pick[0]} @ {128 << pick[1]} bytes")
+    if not geom:
+        print("nothing readable to soak")
+        return
+
     for p in range(passes):
         for t in tracks:
             for sd in sides:
+                if (t, sd) not in geom:
+                    continue
+                sector, sizecode = geom[(t, sd)]
                 seed = (seed + 37) & 0xFF
                 n = 128 << (sizecode & 7)
                 want = gen_pattern(2, seed, n)
@@ -923,7 +972,9 @@ def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
         for f in failures:
             print(f"  {f}")
         print("\nIf these cluster on high track numbers, that is the "
-              "write-precompensation question answering itself.")
+              "write-precompensation question answering itself. A SIZE "
+              "MISMATCH is not a write fault -- it is the splice refusing to "
+              "write a sector of the wrong length, before any flux.")
     else:
         print("No failures. Run `firstfail` and `wrdiag` for the "
               "controller's own view.")
@@ -1106,4 +1157,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # A mistyped argument should say so, not dump a traceback. These commands
+    # get run at a prompt while a machine is mid-boot, and the usual mistake is
+    # a mis-ordered or duplicated positional -- which surfaces as an int()
+    # ValueError several frames down and reads as a tool bug.
+    try:
+        main()
+    except (ValueError, IndexError) as e:
+        print(f"bad arguments: {e}\n")
+        print(__doc__)
+        sys.exit(2)
