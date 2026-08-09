@@ -33,6 +33,17 @@ void fdc_init(FloppyDrive *drive);
 void fdc_reg_write(uint8_t addr, uint8_t raw);
 uint8_t fdc_reg_read(uint8_t addr);
 
+// core1 (bus): sample the MZ-800 bus RESET line (GPIO29, active HIGH, idles
+// low) and, on a confirmed assertion, release ~INT and drop any command in
+// flight. Call once per pass of the listen loop, off the critical path.
+//
+// This lives on core1 because it is safety-critical and core0 is not available:
+// core0 blocks for up to ~250 ms inside a flux capture with interrupts off, so
+// a reset arriving during a read would go unnoticed until it was far too late.
+// See the commentary at fdc_bus_reset_poll() for why the line's polarity is
+// established rather than assumed.
+void fdc_bus_reset_poll(void);
+
 // core0: run any pending physical operation (motor/select/side/seek). Poll from
 // the main loop. No-op until the MZ-800 first accesses an FDC port, so it never
 // fights the greaseweazle/USB drive control when no machine is attached.
@@ -150,6 +161,15 @@ struct FdcFirstFail {
   uint32_t pos_resyncs;
   uint8_t last_resync_from;
   uint8_t last_resync_to;
+  // Bus RESET (GPIO29). `line` is the level RIGHT NOW, which is the number to
+  // look at first: the whole design rests on the line idling LOW, so a machine
+  // sitting at a BASIC prompt must read 0 here. If it reads 1, the polarity
+  // assumption is wrong for this board and the poller is holding EINT cleared,
+  // silently killing interrupts for an interrupt-driven host.
+  uint32_t reset_events;
+  uint32_t reset_at_ms;
+  uint8_t reset_line;
+  uint8_t reset_active;
 };
 void fdc_firstfail_snapshot(FdcFirstFail *out);
 void fdc_firstfail_reset(void);

@@ -132,8 +132,34 @@ BUSY-polling covers latency instead, per the ROM driver).
     "already in that state" short-circuit. Both cores call it; a compare-and-skip
     on a plain flag is a read-modify-write race whose bad direction is `~INT`
     stuck low with nothing pending = hard machine hang.
-  - **Bus RESET** (GPIO29, active **high** — the one active-high control line)
-    must disarm EINT. It is a latch in our state; a resetting host cannot clear
+  - **Bus RESET** (GPIO29, active **high**, idles low — the one active-high
+    control line) must disarm EINT. ✅ **Live**, polled on **core1**.
+    - **The polarity is established, not assumed.** The reference firmware's
+      `bus_reset` PIO program on this same bus does `wait 1 gpio 19` and then
+      requires the line to stay high for 31 more samples before rebooting. A
+      firmware that reboots on a sustained high would reboot continuously if
+      the line idled high — so it idles low. That was the open question that
+      kept this compiled out: acting on a line that actually rests high would
+      hold EINT cleared forever and silently kill interrupts for CP/M 4.1.
+      `firstfail` now prints the live level so the assumption is checkable on a
+      running machine rather than trusted.
+    - **On core1, because core0 cannot do it.** core0 blocks for up to ~250 ms
+      inside a flux capture with interrupts disabled, so a reset arriving
+      during a read would go unnoticed until far too late. The earlier attempt
+      also debounced by counting consecutive polls, which measures nothing when
+      the interval between them ranges from a microsecond to a quarter second;
+      core1 never blocks for more than one Z80 I/O cycle, so the debounce is
+      now a duration (100 µs).
+    - **What it does:** releases `~INT` and disarms EINT (the part that must
+      happen — a machine that resets while we hold `~INT` low returns to a
+      permanent interrupt at 0x0038 with no ISR, which the reset button cannot
+      clear because EINT is a latch in our state); drops BUSY/DRQ and any
+      transfer; abandons writes that have not reached the media, while letting
+      one already in the splice finish, since that flux cannot be recalled; and
+      loads 01 into the Sector register per WD Master Reset. It deliberately
+      does **not** perform the RESTORE a real WD would — that would drive the
+      head on a signal the host never asked us to act on, and every host we
+      know of issues its own RESTORE at startup. It is a latch in our state; a resetting host cannot clear
     it, so a reset mid-interrupt otherwise brought the machine back up into a
     permanent one.
 - **3.3 — WRITE SECTOR (in-place splice). ✅ DONE (hardware-verified) — CP/M 4.1

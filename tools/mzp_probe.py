@@ -833,8 +833,8 @@ def do_firstfail(s, clear=False):
     """
     s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
     s.flush()
-    r = read_exact(s, 51)
-    if len(r) < 51 or r[1] != 0:
+    r = read_exact(s, 61)
+    if len(r) < 61 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     valid, kind = r[2], r[3]
@@ -847,7 +847,19 @@ def do_firstfail(s, clear=False):
     ids = list(r[29:45])
     resyncs = int.from_bytes(r[45:49], "little")
     rs_from, rs_to = r[49], r[50]
+    reset_events = int.from_bytes(r[51:55], "little")
+    reset_at_ms = int.from_bytes(r[55:59], "little")
+    reset_line, reset_active = r[59], r[60]
 
+    # Read this first. The bus-RESET handling assumes the line idles LOW; if a
+    # running machine shows it high, that assumption is wrong for this board and
+    # the poller is holding EINT cleared, silently killing interrupts.
+    print(f"bus RESET line now: {'HIGH' if reset_line else 'low'}"
+          + ("  <-- machine in reset, or the polarity assumption is WRONG"
+             if reset_line else " (idle, as expected)"))
+    print(f"bus resets seen:   {reset_events}"
+          + (f"  (last at {reset_at_ms / 1000:.1f} s)" if reset_events else "")
+          + ("  [currently asserted]" if reset_active else ""))
     print(f"failures since power-up: {count}")
     print(f"head-position resyncs:   {resyncs}"
           + (f"  (last: disk said {rs_from}, we wanted {rs_to})"

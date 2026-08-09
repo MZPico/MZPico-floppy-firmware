@@ -172,6 +172,12 @@ RAM_FUNC static void listen_loop(void) {
       g_bus_hello.addr_low |= (uint8_t)~addr; // bit-activity over ALL reads
       g_bus_hello.addr_high |= addr;
     }
+
+    // Bus RESET. Sampled here, once per pass, because core1 is the only thing
+    // that is always running: core0 spends up to ~250 ms at a time inside a
+    // flux capture with interrupts disabled. Two GPIO reads in the common case,
+    // and off the critical path -- the FIFOs are drained before we get here.
+    fdc_bus_reset_poll();
   }
 }
 

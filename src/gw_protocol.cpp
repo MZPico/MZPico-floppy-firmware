@@ -1139,7 +1139,8 @@ void gw_task() {
     // [cmd, ACK, valid, kind, count(4), at_ms(4), want_sec, trk_reg,
     //  head_target, phys_track, side, seen_cyl, seen_head, capture_ok,
     //  flux_n(4), capture_us(4), ids_seen, ids[16], pos_resyncs(4),
-    //  resync_from, resync_to] -- 51 bytes.
+    //  resync_from, resync_to, reset_events(4), reset_at_ms(4),
+    //  reset_line, reset_active] -- 61 bytes.
     FdcFirstFail f;
     fdc_firstfail_snapshot(&f);
     reply_buffer[i++] = GW_ACK_OK;
@@ -1170,6 +1171,13 @@ void gw_task() {
       reply_buffer[i++] = (f.pos_resyncs >> (8 * k)) & 0xFF;
     reply_buffer[i++] = f.last_resync_from;
     reply_buffer[i++] = f.last_resync_to;
+    const uint32_t r32[] = {f.reset_events, f.reset_at_ms};
+    for (uint32_t v : r32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    reply_buffer[i++] = f.reset_line;
+    reply_buffer[i++] = f.reset_active;
     cdc_write_all(reply_buffer, i);
     if (cmd_buffer[2] == 1)
       fdc_firstfail_reset();

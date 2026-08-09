@@ -259,6 +259,11 @@ struct FdcState {
 
   // Head-position resyncs: times an ID field proved the head was not where we
   // believed, and we adopted the disk's answer (see fdc_resync_head).
+  // Bus RESET (GPIO29). Sampled by core1 -- see fdc_bus_reset_poll().
+  volatile uint32_t reset_events = 0;
+  volatile uint32_t reset_at_ms = 0;
+  volatile bool reset_active = false;
+
   volatile uint32_t pos_resyncs = 0;
   volatile uint8_t last_resync_from = 0xFF; // cylinder we were actually on
   volatile uint8_t last_resync_to = 0xFF;   // cylinder we meant to be on
@@ -516,6 +521,31 @@ ALWAYS_INLINE void fdc_refresh_int_line(void) {
     release_int_line();
   }
 }
+
+// ---- Bus RESET (GPIO29) ---------------------------------------------------
+//
+// Polarity is not a guess: the reference firmware's `bus_reset` PIO program on
+// this same MZ-800 bus does `wait 1 gpio 19` and then requires the line to stay
+// high for 31 further samples before it acts. A firmware that reboots on a
+// sustained high would reboot continuously if the line idled high, so the line
+// idles LOW and RESET is asserted HIGH. (bus_init() also pulls it down, so a
+// board on the bench with nothing attached reads "not in reset".)
+//
+// This runs on CORE1, not core0. It is the safety-critical one: ~INT goes
+// straight to expansion pin 38 with no buffer and the Z80's INT input is level
+// sensitive, so a machine that resets while we hold ~INT low comes back up into
+// an immediate, permanent interrupt at 0x0038 with no ISR installed -- a hard
+// hang that the reset button cannot clear, because EINT is a latch in OUR state
+// and the resetting host has no way to reach it.
+//
+// core0 cannot do this job. It blocks for up to ~250 ms inside a flux capture
+// with interrupts disabled, so a poll there is neither timely nor evenly
+// spaced -- and the earlier attempt debounced by counting consecutive polls,
+// which measures nothing when the gap between polls can be a microsecond or a
+// quarter of a second. core1 never blocks for more than one Z80 I/O cycle, so
+// here the debounce can be what it should be: a duration.
+static constexpr uint32_t FDC_RESET_CONFIRM_US = 100;
+
 
 // core0-only "last applied" shadow (no volatile needed — single core).
 bool g_applied_select = false;
@@ -894,6 +924,61 @@ void fdc_init(FloppyDrive *drive) {
   DRV = drive;
   for (int i = 0; i < FDC_SIZE_CACHE_N; ++i)
     g_size_code[i] = FDC_SIZE_CODE_DEFAULT;
+}
+
+void fdc_bus_reset_poll(void) {
+  static uint32_t high_since = 0;
+  static bool acted = false;
+
+  if (!gpio_get(RESET_PIN)) {
+    high_since = 0;
+    acted = false;
+    S.reset_active = false;
+    return;
+  }
+  uint32_t now = time_us_32();
+  if (!high_since) {
+    high_since = now ? now : 1; // 0 is the "not high" sentinel
+    return;
+  }
+  if (acted || (now - high_since) < FDC_RESET_CONFIRM_US)
+    return;
+  acted = true;
+  S.reset_active = true;
+  S.reset_events++;
+  S.reset_at_ms = to_ms_since_boot(get_absolute_time());
+
+  // 1. Release the interrupt. This is the part that must happen.
+  S.eint = false;
+  S.force_int_latched = false;
+
+  // 2. Drop everything the host was waiting on. It is gone; holding BUSY or
+  //    DRQ serves nobody, and leaving them set means the machine comes back to
+  //    a controller that claims to be mid-command.
+  S.busy = false;
+  S.drq = false;
+  S.reading = false;
+  S.read_addr = false;
+  S.multi = false;
+  S.pending_force_int = false;
+  S.pending_force_since_us = 0;
+
+  // 3. Abandon writes that have not reached the media. One already in the
+  //    splice or laying a track down finishes -- the flux is going onto the
+  //    disk in real time and cannot be recalled, exactly as on a real WD.
+  S.writing = false;
+  S.wr_armed = false;
+  if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
+    S.trk_op = 0;
+
+  // 4. WD Master Reset also loads 01 into the Sector register. It additionally
+  //    executes a RESTORE, which we deliberately do NOT do: that would drive
+  //    the head on a signal the host has not asked us to act on, and every host
+  //    we know of issues its own RESTORE on startup anyway.
+  S.sector = 1;
+  S.command = 0;
+
+  fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
 }
 
 // ---- core1 (bus) hot path -------------------------------------------------
@@ -1493,6 +1578,10 @@ void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->ids_seen = S.ff_ids_seen;
   for (int k = 0; k < 16; ++k)
     o->ids[k] = S.ff_ids[k];
+  o->reset_events = S.reset_events;
+  o->reset_at_ms = S.reset_at_ms;
+  o->reset_line = gpio_get(RESET_PIN) ? 1 : 0;
+  o->reset_active = S.reset_active ? 1 : 0;
   o->pos_resyncs = S.pos_resyncs;
   o->last_resync_from = S.last_resync_from;
   o->last_resync_to = S.last_resync_to;
@@ -1816,62 +1905,8 @@ bool fdc_get_write_enable(void) { return g_write_enable; }
 
 // ---- core0 (disk) ---------------------------------------------------------
 
-// DISABLED pending investigation -- see the polarity warning below. Set to 1 to
-// re-enable. This is the only behavioural difference between the current tree
-// and the build that booted CP/M 4.1, so it is compiled out rather than deleted
-// while we bisect: with it off, the firmware is functionally equivalent to that
-// build (the other changes since -- FDC_PORT_LAST, the ~DS1 parking, the docs --
-// all resolve to the same runtime behaviour).
-#define FDC_RESET_POLL_ENABLED 0
-
-#if FDC_RESET_POLL_ENABLED
-// Bus reset (GPIO29, reported active HIGH -- unlike every other control line on
-// this board, and unlike the Z80's own /RESET. The board's pin table names it
-// `RESET`, not `~RESET`; bus_init() pulls it DOWN so an unconnected board (USB
-// bench use) reads "not in reset" rather than resetting forever.
-//
-// !! UNVERIFIED: "active high" describes the asserted level of a reset PULSE. It
-// does NOT establish the line's IDLE level, which is what this poller actually
-// depends on. If GPIO29 rests high while the machine runs normally, this fires
-// continuously and holds EINT cleared, silently killing every interrupt for an
-// interrupt-driven host (CP/M 4.1). Measure the resting level before re-enabling.
-//
-// Without this, a reset while ~INT was asserted was unrecoverable: EINT is a
-// latch in OUR state, the resetting host cannot clear it, and ~INT is a level
-// input straight to the Z80 (no buffer). The machine would come out of reset
-// into an immediate, permanent interrupt at 0x0038 with no ISR installed --
-// exactly the hang documented in fdc_set_int_mode(), but triggered by the reset
-// button rather than by mode 2. Disarming EINT and releasing the line is enough;
-// the transfer state is rebuilt by the next command anyway.
-//
-// Debounced over consecutive polls rather than acted on from one sample: this
-// runs on the core0 task loop with no synchroniser guarantees, and a spurious
-// EINT clear mid-transfer would silently break an interrupt-driven host.
-static void fdc_poll_bus_reset(void) {
-  static uint8_t high_polls = 0;
-  static bool in_reset = false;
-
-  if (gpio_get(RESET_PIN)) {
-    if (high_polls < 3)
-      high_polls++;
-    if (high_polls >= 3 && !in_reset) {
-      in_reset = true;
-      S.eint = false;
-      S.force_int_latched = false;
-      fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
-    }
-  } else {
-    high_polls = 0;
-    in_reset = false;
-  }
-}
-#endif // FDC_RESET_POLL_ENABLED
 
 void fdc_disk_task(void) {
-#if FDC_RESET_POLL_ENABLED
-  fdc_poll_bus_reset();
-#endif
-
   if (!S.active || !DRV)
     return; // idle until the MZ-800 talks to us (don't fight USB/gw drive use)
 
