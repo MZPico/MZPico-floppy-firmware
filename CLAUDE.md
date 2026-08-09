@@ -304,10 +304,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
       refusal, because an unfilled buffer is none of those. A gap in the host's
       byte stream now ends the sector, as WRITE TRACK already did, and the ID
       field's size code is the authority.
-    - **`fmten` resets to OFF on every reflash**, and a refused WRITE TRACK is
-      indistinguishable from a frozen machine (STATUS 0x40, BUSY clear, host
-      polls forever). `wrdiag` now names which of ~WPT / `wren` / `fmten`
-      refused it.
+    - **Host formatting now defaults ON.** The old default-off gate claimed a
+      glitched command byte could reformat a track; that stopped being true once
+      the format image was validated — a spurious WRITE TRACK collects no image
+      and writes nothing. Meanwhile a refusal is indistinguishable from a frozen
+      machine (STATUS 0x40, BUSY clear, host polls forever) and it reset on every
+      reflash, so it recurred. The image check was strengthened in exchange: it
+      now requires a real IDAM preamble (≥2 × `0xF5` immediately followed by
+      `0xFE`) rather than those bytes appearing anywhere, which arbitrary sector
+      data satisfies ~86% of the time. `wrdiag` names which of ~WPT / `wren` /
+      `fmten` refused a format.
     - `~MOTOR_ON` reaches every drive on the cable (J3 wires it to floppy pins
       10 *and* 16), so it is **not** gated by drive select: selecting an absent
       drive still spins the present one. Not a bug — one spindle cannot be run

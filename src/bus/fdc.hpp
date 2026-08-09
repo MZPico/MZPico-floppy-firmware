@@ -82,9 +82,11 @@ void fdc_bus_reset_irq_init(void);
 void fdc_set_reset_poll(bool on);
 bool fdc_get_reset_poll(void);
 
-// Host-initiated WRITE TRACK (formatting). DEFAULT OFF -- a raw 0x00 on the
-// bus-inverted command port decodes to 0xFF = WRITE TRACK, so one glitched byte
-// could otherwise reformat a track. The bench format path is unaffected.
+// Host-initiated WRITE TRACK (formatting). DEFAULT ON. The media is protected
+// by physical ~WPT, the `wren` switch, and the format image having to contain a
+// real IDAM preamble (a run of 0xF5 followed by 0xFE) -- not by refusing the
+// command, which only made a refusal look like a frozen machine. See
+// g_format_enable in fdc.cpp for why the old default was wrong.
 void fdc_set_format_enable(bool on);
 bool fdc_get_format_enable(void);
 

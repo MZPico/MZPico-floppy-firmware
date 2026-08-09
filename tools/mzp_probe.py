@@ -27,7 +27,7 @@ Usage:
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
     python mzp_probe.py PORT posfix [0|1]                 # head-position self-correction on/off (no arg = query)
-    python mzp_probe.py PORT fmten [0|1]                  # allow WRITE TRACK from the MZ-800 (default OFF)
+    python mzp_probe.py PORT fmten [0|1]                  # allow WRITE TRACK from the MZ-800 (default ON)
     python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
     python mzp_probe.py PORT drvlock [0|1]                # pin every access to drive 0, ignoring port 0xDC (no arg = query)
     python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
@@ -859,7 +859,7 @@ def do_wrdiag(s):
           f"last_image={trk_last}  completed={trk_ok} failed={trk_fail}")
     whyname = {0: "", 1: "~WPT (disk is write-protected)",
                2: "writes disabled (`wren 1`)",
-               3: "format gate off (`fmten 1`) -- DEFAULT after every reflash"}
+               3: "format gate off (`fmten 1`)"}
     print(f"  refused={trk_refused}"
           + (f"  reason: {whyname.get(why, '?')}" if trk_refused else ""))
     if trk_refused and why:
@@ -1376,8 +1376,10 @@ def main():
             s.flush()
             r = read_exact(s, 3)
             print("host WRITE TRACK (format): "
-                  + ("ENABLED -- a stray command byte can reformat a track"
-                     if len(r) == 3 and r[2] else "disabled (default)"))
+                  + ("enabled (default)" if len(r) == 3 and r[2] else
+                     "DISABLED -- a host format will be refused, and a format "
+                     "routine that ignores the WP status bit will appear to "
+                     "hang the machine"))
         elif cmd == "resetpoll":
             # no arg = query (2), else 0 = off, 1 = on
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2

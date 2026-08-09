@@ -564,7 +564,27 @@ volatile bool g_reset_poll_enabled = true;
 // and one glitched byte during a power-up transient would be enough. The bench
 // path (fdc_bench_format) is unaffected and is what the milestone is verified
 // with, so the default costs nothing. Enable with `mzp_probe.py fmten 1`.
-volatile bool g_format_enable = false;
+// Host-initiated WRITE TRACK. DEFAULT ON.
+//
+// It used to default off, on the grounds that the command register is
+// bus-inverted so a raw 0x00 decodes to 0xFF = WRITE TRACK and one glitched
+// byte could reformat a track. That has not been true since the format image
+// itself started being validated: a spurious command collects no image, fails
+// the plausibility check above, and writes nothing. The gate was guarding a
+// door that was already locked.
+//
+// What it cost was real and repeated. A refused WRITE TRACK leaves STATUS 0x40
+// with BUSY clear -- WD-faithful, and exactly what a write-protected disk
+// produces -- and a format routine that ignores bit 6 polls it forever. The
+// machine is then indistinguishable from dead hardware, which is precisely the
+// failure mode this project has learned to avoid at almost any cost (see the
+// core1 listen-loop rule). It also reset on every reflash, so it recurred.
+//
+// What actually protects the media: physical ~WPT, the `wren` master switch,
+// the sequence check on the image, and the fact that WRITE TRACK runs
+// index-to-index with no timing window to miss. `mzp_probe.py fmten 0` still
+// turns it off for anyone who wants the old behaviour.
+volatile bool g_format_enable = true;
 
 // Runtime disable for the head-position self-correction (goto_track's TRK00
 // cross-check and fdc_resync_head). Both act on their own initiative -- one can
@@ -2637,16 +2657,36 @@ void fdc_disk_task(void) {
     // short or markless stream is a glitch, a truncated transfer, or a host
     // that never meant to format, and writing it destroys the track just as
     // thoroughly as a real format would.
+    // The image must contain an actual ID address mark PREAMBLE -- a run of at
+    // least two 0xF5 immediately followed by 0xFE -- not merely those two bytes
+    // somewhere in it. Every real formatter emits the standard three; two is
+    // allowed only so a non-standard one is not refused.
+    //
+    // Requiring the SEQUENCE is what makes this check load-bearing. "contains
+    // an 0xF5 and contains an 0xFE" is nearly free for arbitrary data: each
+    // byte appears in 512 bytes of sector data with ~86% probability, so a
+    // command mis-decoded as WRITE TRACK while the host went on writing would
+    // have sailed through it. The sequence will not appear by chance -- about
+    // one 7200-byte image in ten thousand even for uniformly random bytes, and
+    // this is not random bytes, it is a stream that only exists at all if a
+    // command was already mis-decoded.
     bool plausible = S.trk_len >= FDC_TRACK_IMAGE_MIN;
     if (plausible) {
-      bool has_sync = false, has_idam = false;
+      bool found = false;
+      uint16_t run = 0;
       for (uint16_t k = 0; k < S.trk_len; ++k) {
-        if (S.track_buf[k] == 0xF5)
-          has_sync = true;
-        else if (S.track_buf[k] == 0xFE)
-          has_idam = true;
+        uint8_t b = S.track_buf[k];
+        if (b == 0xF5) {
+          run++;
+        } else {
+          if (b == 0xFE && run >= 2) {
+            found = true;
+            break;
+          }
+          run = 0;
+        }
       }
-      plausible = has_sync && has_idam;
+      plausible = found;
     }
 
     bool ok = false;

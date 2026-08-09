@@ -314,14 +314,15 @@ BUSY-polling covers latency instead, per the ROM driver).
     collects the format image and lays the track down. Not yet exercised from
     the MZ-800 — no software is known to format through us — so treat it as
     implemented-but-unproven.
-    - **Host formatting is gated OFF by default** (`g_format_enable`,
-      `mzp_probe.py fmten 1`). The command register is bus-inverted, so a raw
-      0x00 on port 0xD8 decodes to 0xFF = WRITE TRACK: one glitched byte during
-      a power-up transient would otherwise reformat a track. Every other opcode
-      a stray byte can land on is survivable — a spurious READ returns data
-      nobody wanted, a spurious SEEK moves the head and the ID track compare
-      catches it — this one is not. READ TRACK needs no such gate; it only
-      costs the host a revolution.
+    - **Host formatting defaults ON** (`g_format_enable`, `mzp_probe.py
+      fmten 0` to disable). It was originally gated off because the command
+      register is bus-inverted, so a raw 0x00 on port 0xD8 decodes to 0xFF =
+      WRITE TRACK and a glitched byte during a power-up transient could
+      reformat a track — every other opcode a stray byte lands on is
+      survivable, this one was not. That reasoning stopped applying once the
+      format image itself was validated: the command alone destroys nothing,
+      because a spurious one collects no image and is refused. See the
+      end-to-end note below for why the gate then cost more than it bought.
     - A collected image is additionally refused unless it is at least 256 bytes
       and contains both an 0xF5 and an 0xFE. A real format necessarily carries
       the write-channel commands for a sync mark and an ID address mark; a
@@ -419,11 +420,19 @@ BUSY-polling covers latency instead, per the ROM driver).
          a destination nobody had read used the 512-byte default and every
          boot-track write silently did nothing. The host's byte stream now ends
          the sector instead, with the ID field's size code as the authority.
-    - **`fmten` is a RAM flag: every reflash re-gates host formatting.** A
-      refused WRITE TRACK leaves STATUS 0x40 with BUSY clear, and a format
-      routine that ignores bit 6 polls it forever — the machine looks frozen,
-      identically to a dead card. This cost two separate sessions before
-      `wrdiag` learned to name the reason (`~WPT` / `wren` / `fmten`).
+    - **Host formatting defaults ON, and the image check carries the safety.**
+      The gate was justified as stopping a glitched command byte from
+      reformatting a track, but that has not been true since the format image
+      began being validated: a spurious WRITE TRACK collects no image and
+      writes nothing. What it did instead was make a refusal look exactly like
+      a frozen machine (STATUS 0x40, BUSY clear, a format routine that ignores
+      bit 6 polling forever), and it reset on every reflash, so it recurred —
+      two separate sessions lost before `wrdiag` learned to name the reason.
+      In exchange the image check was made load-bearing: it now requires a real
+      IDAM preamble (≥2 × `0xF5` immediately followed by `0xFE`) instead of
+      those two bytes appearing anywhere, which arbitrary sector data satisfies
+      about 86% of the time each. The media is protected by physical `~WPT`,
+      the `wren` switch, that check, and WRITE TRACK running index-to-index.
     - **Still unproven: the catch-up seek on select.** It only fires when
       `head_target` diverges from the head, and only core1 sets `head_target` —
       from real host Type I commands. Bench seeks drive the head directly and
