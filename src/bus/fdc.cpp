@@ -210,6 +210,11 @@ struct FdcState {
   // worst possible report for 23 writes that did not happen, because the host's
   // copy of the disk diverges from the disk with nothing to point at.
   volatile uint32_t wr_abandoned = 0;
+  // Writes armed by the byte stream going quiet rather than by the buffer
+  // filling -- i.e. where our cached guess at the sector length was too big.
+  // Worth counting separately: it is the normal path for a disk we have not
+  // read, but a climbing count on a disk we HAVE read means the cache is wrong.
+  volatile uint32_t wr_short_armed = 0;
   volatile uint16_t wr_ab_want = 0; // bytes we were waiting for
   volatile uint16_t wr_ab_got = 0;  // ...and how many the host actually sent
   volatile uint8_t wr_ab_sector = 0;
@@ -1920,6 +1925,7 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->wr_ok = S.wr_ok;
   o->wr_rnf = S.wr_rnf;
   o->wr_abandoned = S.wr_abandoned;
+  o->wr_short_armed = S.wr_short_armed;
   o->wr_ab_want = S.wr_ab_want;
   o->wr_ab_got = S.wr_ab_got;
   o->wr_ab_track = S.wr_ab_track;
@@ -2680,6 +2686,32 @@ void fdc_disk_task(void) {
     // answer is to raise LOST DATA and write nothing at all. The budget is the
     // same generous one the read side uses; it exists to guarantee forward
     // progress, not to police a slow host.
+    // ...but first: the host may not have stopped short at all. It may have
+    // sent the WHOLE sector and be waiting for us, because our idea of the
+    // sector's length is only a guess -- the size cache, which knows a
+    // cylinder+side only if some earlier read decoded an ID there. Writing a
+    // destination disk nobody has read (a whole-disk copy) that guess is the
+    // 512-byte default, and an MZ-800 master disk's boot track is 16x256. Every
+    // one of those writes then hung waiting for 256 bytes that were never
+    // coming.
+    //
+    // So take a gap in the byte stream as "that was the sector", exactly as
+    // WRITE TRACK already does and for the same reason: a Z80 feeding a DRQ'd
+    // byte takes tens of us, so a few ms of silence is unambiguous. The length
+    // becomes what the host actually sent, and the ID field's own size code --
+    // checked against it at splice time -- is the authority, as it is on a real
+    // WD, which never needs the length in advance because it streams to the
+    // media. This runs before the stall check below because that one waits
+    // 250 ms to reach the wrong conclusion.
+    if (S.drq && !S.wr_armed && S.xfer_pos > 0 &&
+        (time_us_32() - S.last_data_read_us) > FDC_TRACK_IDLE_US) {
+      S.drq = false; // stop core1 appending before we fix the length
+      S.xfer_len = S.xfer_pos;
+      S.wr_armed = true;
+      S.wr_seq++;
+      S.wr_short_armed++;
+      fdc_refresh_int_line();
+    }
     if (S.drq && (time_us_32() - S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
       S.lost_data = true;
       S.lost_data_events++;

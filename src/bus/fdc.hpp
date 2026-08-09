@@ -155,6 +155,7 @@ struct FdcDebug {
   uint32_t wr_ok;            // data fields actually spliced onto the media
   uint32_t wr_rnf;           // the sector's ID never passed the head
   uint32_t wr_abandoned;     // write ended before its buffer filled
+  uint32_t wr_short_armed;   // ...armed by a quiet stream, not a full buffer
   uint16_t wr_ab_want;       // bytes expected by the last abandoned write
   uint16_t wr_ab_got;        // ...and how many the host actually sent
   uint8_t wr_ab_track;

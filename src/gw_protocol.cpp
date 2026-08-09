@@ -1327,7 +1327,8 @@ void gw_task() {
                             d.wr_refused,       d.wr_ok,
                             d.wr_rnf,           d.wr_cyl_mismatch,
                             d.wr_size_mismatch, d.wr_late,
-                            d.lost_data_events,  d.wr_abandoned};
+                            d.lost_data_events,  d.wr_abandoned,
+                            d.wr_short_armed};
     for (uint32_t v : w32) {
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;

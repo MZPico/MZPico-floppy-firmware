@@ -816,18 +816,18 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 53)
-    if len(r) < 53 or r[1] != 0:
+    r = read_exact(s, 57)
+    if len(r) < 57 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
     ids_seen = r[4] | (r[5] << 8)
-    vals = [int.from_bytes(r[6 + 4 * k:10 + 4 * k], "little") for k in range(10)]
+    vals = [int.from_bytes(r[6 + 4 * k:10 + 4 * k], "little") for k in range(11)]
     (splice_us, attempts, refused, ok, rnf, cyl_mm, size_mm, late,
-     lost, abandoned) = vals
-    ab_want = r[46] | (r[47] << 8)
-    ab_got = r[48] | (r[49] << 8)
-    ab_track, ab_side, ab_sector = r[50], r[51], r[52]
+     lost, abandoned, short_armed) = vals
+    ab_want = r[50] | (r[51] << 8)
+    ab_got = r[52] | (r[53] << 8)
+    ab_track, ab_side, ab_sector = r[54], r[55], r[56]
     print("WRITE SECTOR state:")
     print(f"  writing={bool(wr_flags & 1)} buffer_full={bool(wr_flags & 2)} "
           f"writes_enabled={bool(wr_flags & 4)} "
@@ -841,7 +841,8 @@ def do_wrdiag(s):
     print(f"  RNF={rnf}  of which wrong-cylinder={cyl_mm} wrong-size={size_mm} "
           f"too-late={late}")
     print(f"  LOST DATA (host stopped feeding mid-sector)={lost}")
-    print(f"  abandoned (ended before the buffer filled)={abandoned}")
+    print(f"  abandoned (ended before the buffer filled)={abandoned}  "
+          f"short-armed (quiet stream ended the sector)={short_armed}")
     if abandoned:
         print(f"    last: wanted {ab_want} bytes, host sent {ab_got} "
               f"(track {ab_track} side {ab_side} sector {ab_sector})")
