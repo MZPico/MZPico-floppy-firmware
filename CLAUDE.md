@@ -292,9 +292,22 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     drives:** each unit reads its own media; `drvstat` shows the heads parked on
     different cylinders across selects (40 and 0) and drive 0 reads cylinder 40
     afterwards without re-stepping; `wp` follows the write-protected disk across
-    selects. Only the catch-up seek on select is unproven — it needs host Type I
-    commands to create the divergence. See
+    selects. **Verified end-to-end under CP/M 4.1:** booted from drive A,
+    `FORMAT4 B: /720` formats drive B, files copy to it, and `copydisk`
+    completes. Only the catch-up seek on select is unproven — it needs host
+    Type I commands to create the divergence. See
     [docs/phase3-plan.md](docs/phase3-plan.md).
+    - **A write must not need the sector length in advance.** It used to take it
+      from the per-cylinder size cache, so writing a disk nobody had read used
+      the 512-byte default and an MZ-800 master disk's 16x256 boot track
+      (cyl 0 / side 1) silently wrote nothing — no RNF, no LOST DATA, no
+      refusal, because an unfilled buffer is none of those. A gap in the host's
+      byte stream now ends the sector, as WRITE TRACK already did, and the ID
+      field's size code is the authority.
+    - **`fmten` resets to OFF on every reflash**, and a refused WRITE TRACK is
+      indistinguishable from a frozen machine (STATUS 0x40, BUSY clear, host
+      polls forever). `wrdiag` now names which of ~WPT / `wren` / `fmten`
+      refused it.
     - `~MOTOR_ON` reaches every drive on the cable (J3 wires it to floppy pins
       10 *and* 16), so it is **not** gated by drive select: selecting an absent
       drive still spins the present one. Not a bug — one spindle cannot be run

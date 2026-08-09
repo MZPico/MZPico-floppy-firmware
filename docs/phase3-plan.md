@@ -405,6 +405,25 @@ BUSY-polling covers latency instead, per the ROM driver).
          disk across selects (`ST=04` vs `ST=44[WP]`). That is the
          refresh-`~WPT`-on-select path, and it is what stands between a WRITE
          SECTOR and a protected disk in the other drive.
+    - **Verified end-to-end under CP/M 4.1 (hardware).** Booted from drive A,
+      `FORMAT4 B: /720` formats drive B, files copy to it, and a whole-disk
+      `copydisk` completes. That exercises host formatting, sector writes and
+      the drive switch together, which is the combination milestone B existed
+      to prove. Three real bugs stood between here and there, all of them
+      diagnostics failures first:
+      1. `scan`/`streamscan` ignored the drive select (fixed — `fmtverify`
+         would have formatted one disk and verified another);
+      2. the sector-size cache was keyed by cylinder alone, so an MZ-800 master
+         disk's 16x256 boot track on cyl 0 / side 1 could not be represented;
+      3. WRITE SECTOR took its length from that cache *in advance*, so writing
+         a destination nobody had read used the 512-byte default and every
+         boot-track write silently did nothing. The host's byte stream now ends
+         the sector instead, with the ID field's size code as the authority.
+    - **`fmten` is a RAM flag: every reflash re-gates host formatting.** A
+      refused WRITE TRACK leaves STATUS 0x40 with BUSY clear, and a format
+      routine that ignores bit 6 polls it forever — the machine looks frozen,
+      identically to a dead card. This cost two separate sessions before
+      `wrdiag` learned to name the reason (`~WPT` / `wren` / `fmten`).
     - **Still unproven: the catch-up seek on select.** It only fires when
       `head_target` diverges from the head, and only core1 sets `head_target` —
       from real host Type I commands. Bench seeks drive the head directly and
