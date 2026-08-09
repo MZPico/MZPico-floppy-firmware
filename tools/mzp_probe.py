@@ -375,8 +375,10 @@ def fdc_line(r):
     line = (f"ST={status:02X}[{sb.strip()}] TRK={track:<2} SEC={sector:<2} "
             f"DAT={data:02X} CMD={command:02X}({decode_cmd(command)}) "
             f"mot={'1' if flags & 0x80 else '0'} sd={1 if flags & 4 else 0} "
-            f"wp={1 if flags & 2 else 0} busy={1 if flags & 1 else 0} "
-            f"t0={at0} phys={'?' if phys == 0xFF else phys} seek={opdone}/{opseq} "
+            f"wp={'?' if drv_cur == 0x0F else (1 if flags & 2 else 0)} "
+            f"busy={1 if flags & 1 else 0} "
+            f"t0={'?' if drv_cur == 0x0F else at0} "
+            f"phys={'?' if phys == 0xFF else phys} seek={opdone}/{opseq} "
             f"{drv_txt}")
     if cmd_gap_us is not None:
         line += f"  gap_since_seek={cmd_gap_us / 1000:.1f}ms"
