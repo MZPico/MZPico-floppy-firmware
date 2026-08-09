@@ -464,6 +464,13 @@ volatile bool g_invert_side = true;
 // bringing up a new host, or for touching a disk you cannot replace.
 volatile bool g_write_enable = true;
 
+// Runtime kill switch for the bus-RESET poller (`mzp_probe.py resetpoll 0`).
+// This one runs inside core1's hard real-time loop, so if it is ever suspected
+// of costing bus cycles it has to be possible to take it out of the picture
+// without a reflash -- reflashing to bisect a timing regression means changing
+// two things at once.
+volatile bool g_reset_poll_enabled = true;
+
 namespace {
 
 // Record one register access. Values are stored exactly as they appear on the
@@ -947,7 +954,14 @@ void fdc_init(FloppyDrive *drive) {
     g_size_code[i] = FDC_SIZE_CODE_DEFAULT;
 }
 
-void fdc_bus_reset_poll(void) {
+// RAM_FUNC is not optional here. listen_loop() is RAM_FUNC because it has ~560
+// ns to answer a Z80 I/O cycle, and calling out to a flash-resident function on
+// every pass puts an XIP cache miss in that path. Doing exactly that made the
+// machine report "no floppy driver detected" -- core1 was arriving late for bus
+// cycles, which looks nothing like a reset bug and everything like a dead card.
+RAM_FUNC void fdc_bus_reset_poll(void) {
+  if (!g_reset_poll_enabled)
+    return;
   static uint32_t high_since = 0;
   static bool acted = false;
   static bool was_high = false;
@@ -1969,6 +1983,8 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
 const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
 
 void fdc_set_write_enable(bool on) { g_write_enable = on; }
+void fdc_set_reset_poll(bool on) { g_reset_poll_enabled = on; }
+bool fdc_get_reset_poll(void) { return g_reset_poll_enabled; }
 bool fdc_get_write_enable(void) { return g_write_enable; }
 
 // ---- core0 (disk) ---------------------------------------------------------

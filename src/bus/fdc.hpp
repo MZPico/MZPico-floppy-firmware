@@ -44,6 +44,12 @@ uint8_t fdc_reg_read(uint8_t addr);
 // established rather than assumed.
 void fdc_bus_reset_poll(void);
 
+// Runtime enable for the above. It runs inside core1's hard real-time loop, so
+// it must be possible to remove it from that loop without a reflash when
+// diagnosing a bus-timing problem.
+void fdc_set_reset_poll(bool on);
+bool fdc_get_reset_poll(void);
+
 // core0: run any pending physical operation (motor/select/side/seek). Poll from
 // the main loop. No-op until the MZ-800 first accesses an FDC port, so it never
 // fights the greaseweazle/USB drive control when no machine is attached.

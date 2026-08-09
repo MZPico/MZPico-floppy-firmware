@@ -71,6 +71,7 @@
 #define MZP_CMD_FDCFORMAT 0x95 // bench: WRITE TRACK (format) one track
 #define MZP_CMD_READTRACK 0x96 // bench: READ TRACK -- raw decoded byte stream
 #define MZP_CMD_RESETDIAG 0x97 // raw bus-RESET line telemetry (no assumptions)
+#define MZP_CMD_RESETPOLL 0x98 // enable/disable the core1 bus-RESET poller
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1152,6 +1153,17 @@ void gw_task() {
     cdc_write_all(reply_buffer, i);
     if (cmd_buffer[2] == 1)
       fdc_resetdiag_clear();
+  }
+
+  else if (cmd == MZP_CMD_RESETPOLL) {
+    // cmd_buffer[2]: 0 = off, 1 = on, 2 = query. The poller lives in core1's
+    // hard real-time loop, so this exists to take it out of the picture while
+    // diagnosing a bus-timing problem, without a reflash changing two things.
+    if (cmd_buffer[2] < 2)
+      fdc_set_reset_poll(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_reset_poll() ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
   }
 
   else if (cmd == MZP_CMD_FIRSTFAIL) {

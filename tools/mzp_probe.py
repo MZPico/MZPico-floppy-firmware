@@ -25,6 +25,7 @@ Usage:
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
+    python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -94,6 +95,7 @@ MZP_CMD_FIRSTFAIL = 0x94
 MZP_CMD_FDCFORMAT = 0x95
 MZP_CMD_READTRACK = 0x96
 MZP_CMD_RESETDIAG = 0x97
+MZP_CMD_RESETPOLL = 0x98
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -1263,6 +1265,18 @@ def main():
             side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
             limit = int(sys.argv[5]) if len(sys.argv) > 5 else 256
             do_readtrack(s, track, side, limit)
+        elif cmd == "resetpoll":
+            # no arg = query (2), else 0 = off, 1 = on
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            s.write(bytes([MZP_CMD_RESETPOLL, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            if len(r) < 3 or r[1] != 0:
+                print(f"bad reply: {r.hex()}")
+            else:
+                print("bus RESET poller: " + ("ON" if r[2] else
+                                              "OFF (core1 does not sample "
+                                              "GPIO29 at all)"))
         elif cmd == "resetdiag":
             do_resetdiag(s, clear=(len(sys.argv) > 3
                                    and sys.argv[3] == "clear"))
