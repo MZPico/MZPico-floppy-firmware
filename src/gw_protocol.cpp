@@ -70,6 +70,7 @@
 #define MZP_CMD_FIRSTFAIL 0x94 // first read/seek failure since power-up (sticky)
 #define MZP_CMD_FDCFORMAT 0x95 // bench: WRITE TRACK (format) one track
 #define MZP_CMD_READTRACK 0x96 // bench: READ TRACK -- raw decoded byte stream
+#define MZP_CMD_RESETDIAG 0x97 // raw bus-RESET line telemetry (no assumptions)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1132,6 +1133,25 @@ void gw_task() {
       cdc_write_all(fdc_track_buffer() + sent, chunk);
       sent += chunk;
     }
+  }
+
+  else if (cmd == MZP_CMD_RESETDIAG) {
+    // cmd_buffer[2]: 1 = clear the counters after reporting.
+    // [cmd, ACK, line, samples(4), rise(4), fall(4), high_max(4), low_min(4),
+    //  last_high(4), events(4), at_ms(4)] -- 35 bytes.
+    FdcResetDiag d;
+    fdc_resetdiag_snapshot(&d);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = d.line;
+    const uint32_t v32[] = {d.samples,     d.rise,   d.fall,   d.high_max_us,
+                            d.low_min_us,  d.last_high_us, d.events, d.at_ms};
+    for (uint32_t v : v32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    cdc_write_all(reply_buffer, i);
+    if (cmd_buffer[2] == 1)
+      fdc_resetdiag_clear();
   }
 
   else if (cmd == MZP_CMD_FIRSTFAIL) {

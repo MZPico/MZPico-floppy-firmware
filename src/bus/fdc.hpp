@@ -172,6 +172,24 @@ struct FdcFirstFail {
   uint8_t reset_active;
 };
 void fdc_firstfail_snapshot(FdcFirstFail *out);
+
+// Raw bus-RESET line telemetry, recorded with no polarity assumption -- what
+// the pin actually did, as opposed to what we decided about it. This is the
+// tool for "I pressed reset and nothing was counted": it separates a line that
+// never moves from one that pulses the other way from a pulse too short for
+// the debounce, which the event counter alone cannot do.
+struct FdcResetDiag {
+  uint8_t line;          // level right now
+  uint32_t samples;      // core1 polls (i.e. is the poller even running?)
+  uint32_t rise, fall;   // edges seen since the counters were cleared
+  uint32_t high_max_us;  // longest completed HIGH excursion
+  uint32_t low_min_us;   // shortest completed LOW excursion
+  uint32_t last_high_us; // most recent completed HIGH length
+  uint32_t events;       // confirmed resets acted on
+  uint32_t at_ms;
+};
+void fdc_resetdiag_snapshot(FdcResetDiag *out);
+void fdc_resetdiag_clear(void);
 void fdc_firstfail_reset(void);
 
 // Ordered I/O trace (see the io_* ring in fdc.cpp). Entries run oldest ->

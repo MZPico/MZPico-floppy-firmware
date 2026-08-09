@@ -24,6 +24,7 @@ Usage:
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
+    python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -92,6 +93,7 @@ MZP_CMD_WREN = 0x93
 MZP_CMD_FIRSTFAIL = 0x94
 MZP_CMD_FDCFORMAT = 0x95
 MZP_CMD_READTRACK = 0x96
+MZP_CMD_RESETDIAG = 0x97
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -824,6 +826,48 @@ FF_KINDS = {0: "(none)", 1: "RNF -- sector not on this track",
             4: "Verify/seek error"}
 
 
+def do_resetdiag(s, clear=False):
+    """What the bus-RESET pin actually does, with no polarity assumed.
+
+    "resets seen: 0" after pressing reset has at least three causes that the
+    event counter cannot tell apart: the line never moves, it pulses the other
+    way (active low, not high), or the pulse is shorter than the debounce. The
+    edge counts and pulse lengths here separate them.
+    """
+    s.write(bytes([MZP_CMD_RESETDIAG, 3, 1 if clear else 0]))
+    s.flush()
+    r = read_exact(s, 35)
+    if len(r) < 35 or r[1] != 0:
+        print(f"bad/short reply: {r.hex()}")
+        return
+    line = r[2]
+    (samples, rise, fall, high_max, low_min, last_high, events,
+     at_ms) = [int.from_bytes(r[3 + 4 * k:7 + 4 * k], "little") for k in range(8)]
+    print(f"RESET pin (GPIO29) level now: {'HIGH' if line else 'low'}")
+    print(f"  core1 polls      : {samples}")
+    print(f"  edges seen       : {rise} rising, {fall} falling")
+    print(f"  longest HIGH     : {high_max} us"
+          + (f"  (most recent {last_high} us)" if last_high else ""))
+    print(f"  shortest LOW     : {low_min} us")
+    print(f"  resets acted on  : {events}"
+          + (f"  (last at {at_ms / 1000:.1f} s)" if events else ""))
+    print()
+    if samples == 0:
+        print("  core1 is not polling at all -- the listen loop is not running")
+    elif rise == 0 and fall == 0:
+        print("  The pin NEVER MOVED. Either the machine's reset does not reach")
+        print("  GPIO29 on this board, or it was not pressed while this ran.")
+        print("  If the level above is 'low' the net may simply be undriven --")
+        print("  bus_init() pulls it down, so an unconnected pin reads low too.")
+    elif rise and not events:
+        print(f"  The pin DOES pulse high, but no assertion was confirmed: the")
+        print(f"  longest high was {high_max} us against a 100 us debounce.")
+        print("  Shorten FDC_RESET_CONFIRM_US to match what the machine emits.")
+    elif fall and not rise:
+        print("  Only FALLING edges: the line rests high and pulses LOW, i.e.")
+        print("  it is active low and the polarity assumption is inverted.")
+
+
 def do_firstfail(s, clear=False):
     """The first failure since power-up, held unaltered.
 
@@ -1219,6 +1263,9 @@ def main():
             side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
             limit = int(sys.argv[5]) if len(sys.argv) > 5 else 256
             do_readtrack(s, track, side, limit)
+        elif cmd == "resetdiag":
+            do_resetdiag(s, clear=(len(sys.argv) > 3
+                                   and sys.argv[3] == "clear"))
         elif cmd == "firstfail":
             # optional "clear" to re-arm the latch for a fresh run
             do_firstfail(s, clear=(len(sys.argv) > 3

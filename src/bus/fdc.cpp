@@ -263,6 +263,17 @@ struct FdcState {
   volatile uint32_t reset_events = 0;
   volatile uint32_t reset_at_ms = 0;
   volatile bool reset_active = false;
+  // Raw line telemetry, recorded with NO polarity assumption. If a reset press
+  // produces no event, this is what says why: whether the pin moved at all, in
+  // which direction, and for how long. Without it "resets seen: 0" cannot be
+  // told apart from a line that never moves, one that pulses the other way, or
+  // a pulse shorter than the debounce.
+  volatile uint32_t rst_samples = 0;
+  volatile uint32_t rst_rise = 0;         // low -> high transitions
+  volatile uint32_t rst_fall = 0;         // high -> low
+  volatile uint32_t rst_high_max_us = 0;  // longest completed HIGH excursion
+  volatile uint32_t rst_low_min_us = 0;   // shortest completed LOW excursion
+  volatile uint32_t rst_last_high_us = 0; // most recent completed HIGH length
 
   volatile uint32_t pos_resyncs = 0;
   volatile uint8_t last_resync_from = 0xFF; // cylinder we were actually on
@@ -929,14 +940,38 @@ void fdc_init(FloppyDrive *drive) {
 void fdc_bus_reset_poll(void) {
   static uint32_t high_since = 0;
   static bool acted = false;
+  static bool was_high = false;
+  static uint32_t edge_us = 0;
 
-  if (!gpio_get(RESET_PIN)) {
+  bool high = gpio_get(RESET_PIN);
+  uint32_t now = time_us_32();
+
+  // Edge telemetry first, and unconditionally: this has to record what the line
+  // does even when nothing below decides to act on it. "No reset seen" is not a
+  // diagnosis on its own.
+  S.rst_samples++;
+  if (high != was_high) {
+    uint32_t held = now - edge_us;
+    if (was_high) {
+      S.rst_fall++;
+      S.rst_last_high_us = held;
+      if (held > S.rst_high_max_us)
+        S.rst_high_max_us = held;
+    } else {
+      S.rst_rise++;
+      if (S.rst_low_min_us == 0 || held < S.rst_low_min_us)
+        S.rst_low_min_us = held;
+    }
+    was_high = high;
+    edge_us = now;
+  }
+
+  if (!high) {
     high_since = 0;
     acted = false;
     S.reset_active = false;
     return;
   }
-  uint32_t now = time_us_32();
   if (!high_since) {
     high_since = now ? now : 1; // 0 is the "not high" sentinel
     return;
@@ -1585,6 +1620,29 @@ void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->pos_resyncs = S.pos_resyncs;
   o->last_resync_from = S.last_resync_from;
   o->last_resync_to = S.last_resync_to;
+}
+
+void fdc_resetdiag_snapshot(FdcResetDiag *o) {
+  o->line = gpio_get(RESET_PIN) ? 1 : 0;
+  o->samples = S.rst_samples;
+  o->rise = S.rst_rise;
+  o->fall = S.rst_fall;
+  o->high_max_us = S.rst_high_max_us;
+  o->low_min_us = S.rst_low_min_us;
+  o->last_high_us = S.rst_last_high_us;
+  o->events = S.reset_events;
+  o->at_ms = S.reset_at_ms;
+}
+
+void fdc_resetdiag_clear(void) {
+  S.rst_samples = 0;
+  S.rst_rise = 0;
+  S.rst_fall = 0;
+  S.rst_high_max_us = 0;
+  S.rst_low_min_us = 0;
+  S.rst_last_high_us = 0;
+  S.reset_events = 0;
+  S.reset_at_ms = 0;
 }
 
 void fdc_firstfail_reset(void) {
