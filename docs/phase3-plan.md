@@ -136,17 +136,66 @@ BUSY-polling covers latency instead, per the ROM driver).
     must disarm EINT. It is a latch in our state; a resetting host cannot clear
     it, so a reset mid-interrupt otherwise brought the machine back up into a
     permanent one.
-- **3.3 — WRITE SECTOR (in-place splice).** Locate the sector by ID (streaming
-  decode), then WGATE + write the MFM-encoded data field in the ~22-byte Gap 2
-  window (~700 µs slack). Test: MZ-800 writes a file; read back (host `gw`/scan).
-  **Not implemented — now the top priority.** The stub **fails honestly**: a
-  Type II write completes immediately with **WRITE PROTECT** (b6) set in the
-  Type II STATUS layout, so the host sees an unambiguous error. It previously
-  cleared BUSY with no error bits, i.e. reported *success* — defensible when the
-  boot ROM was the only client (it never writes), but a data-loss trap now that
-  CP/M 4.1 boots to a prompt and can: the host's in-RAM directory and buffers
-  would diverge from the disk, and the damage would surface later on a disk the
-  user believes is good. `rddiag` counts refused writes.
+- **3.3 — WRITE SECTOR (in-place splice). ✅ DONE (hardware-verified) — CP/M 4.1
+  on the MZ-800 writes files to a physical disk and reads them back correct.** Locate the sector by ID with a *live* MFM decoder, then
+  WGATE + write the MFM-encoded data field into the ~22-byte Gap 2 window
+  (~700 µs slack). Code: [src/mfm_splice.cpp](../src/mfm_splice.cpp) (the
+  splice), `mfm_encode_data_field` (the payload), the write block in
+  `fdc_disk_task` and the `0xAX/0xBX` branch of `fdc_reg_write`.
+  - **Why a live decoder and not the buffered one.** A read may capture a whole
+    revolution and decode it afterwards; a write cannot — by the time a buffer
+    has been decoded the sector has long since passed the head. So the search
+    pulls one transition at a time straight off the capture FIFO and decodes ID
+    fields as they arrive. Per transition that is a subtract, a compare and a
+    shift (~0.2 µs against a ~4 µs DD interval), which is why it keeps up where
+    the batch decoder — O(n²), rescanning from the start — never could. That
+    distinction is the whole content of the "no decode while capturing" rule in
+    `fdc_capture_window()`; it bans the *buffered* decoder, not live decoding.
+  - **Only the data field is rewritten** — 12 zeros, the 3-byte 0xA1 sync, the
+    DAM, the data, its CRC and 3 gap bytes to carry the write-off splice. ID
+    fields, Gap 2 and the rest of Gap 3 stay as recorded, so sector size,
+    interleave and numbering all survive, and nothing outside one sector's data
+    can be touched by a bug in this path.
+  - **Splice timing.** The gap is measured from the last bit of the ID CRC, with
+    the flux still queued in the FIFO subtracted off (that is disk which has
+    already passed the head). The bias is deliberately +2 bytes: late merely
+    eats presync we rewrite anyway, early destroys the ID field.
+  - **Buffer first, then write.** core1 collects the whole sector from the host
+    over DRQ, then core0 splices. A host that stalls mid-sector therefore stalls
+    *before* any flux is committed (→ LOST DATA, nothing written) instead of
+    half way through a data field. A real WD, streaming host bytes straight to
+    the media, answers that case by writing zeros — i.e. by corrupting the
+    sector. Cost: the sector's length must be known before the first host byte
+    arrives, which is what the per-cylinder size cache (`FDC_SIZE_CACHE_N`,
+    filled from the ID fields every read decodes) is for. A wrong guess is
+    caught, not acted on, by the size compare at splice time.
+  - **Three refusals, all before flux.** Physical `~WPT`, the firmware master
+    switch (`mzp_probe.py wren 0`), and the WD ID **track compare** — which
+    matters far more here than on a read: a read from the wrong cylinder returns
+    garbage the host can retry, a write there destroys a track that was fine.
+  - **Test path (do this before letting the MZ-800 write):**
+    `mzp_probe.py PORT wrverify <track> <sector>` writes a pseudo-random pattern
+    through the real splice, reads it back through the real read path and
+    compares byte for byte. `wrdiag` reports the last splice and the cumulative
+    written / RNF / wrong-cylinder / wrong-size / too-late counters. **Use a
+    scratch disk.**
+  - **Measured, bench:** 16/16 `wrverify` writes across two disks, search
+    45-62 ms (a couple of sector periods from an arbitrary rotational start).
+    A `scan` of a written track returns all nine sectors ID+data CRC clean --
+    the neighbours either side of the spliced sector are untouched, which is the
+    check that actually matters (the failure mode of a mistimed splice is a
+    damaged *adjacent* sector, not a bad written one). NB: a scan captures ~1.05
+    revolutions, so its last row is a wrapped partial re-read of the first
+    sector and its "BAD" data CRC is a window artefact, not damage.
+  - **Measured, MZ-800 under CP/M 4.1:** files written to two physical disks and
+    read back correct; `wrdiag` after each session reported 13/13 and 3/3 writes
+    completed with **zero** RNF, wrong-cylinder, wrong-size, too-late or LOST
+    DATA. That is the result that matters: the host positions the head with
+    STEP/FORCE-INT bursts it never waits on (see the head-position decision in
+    ../CLAUDE.md), so wrong-cylinder was the plausible way for this to destroy
+    data, and the `op_done != op_seq` gate plus the ID track compare held. Zero
+    LOST DATA also says the host kept up with DRQ across a whole sector, and the
+    ~60 ms splice search fits inside its patience.
 - **3.4 — Type III / format / density / multi-drive.**
   - **READ ADDRESS (0xCX). ✅ DONE (hardware-verified).** Returns the first ID
     field in the captured flux as the six bytes a real WD hands over DRQ —

@@ -182,4 +182,11 @@ IRQ only on core0, so core1 keeps servicing the MZ-800 during a read.
   media is DD).
 - Confirm whether any bus wait is inserted on register access by the FD-I/F, and
   the exact `~EXWAIT` timing budget for putting a byte on the shared C0..C7 bus.
-- Write-back for WRITE SECTOR: in-place splice (chosen) vs. any fallback.
+- ~~Write-back for WRITE SECTOR: in-place splice (chosen) vs. any fallback.~~ —
+  ✅ in-place splice, implemented in [src/mfm_splice.cpp](../src/mfm_splice.cpp);
+  see Milestone 3.3 in [phase3-plan.md](phase3-plan.md) for the mechanism and the
+  two places this deviates from a real WD (the sector is buffered from the host
+  before any flux is committed, and the sector length comes from a per-cylinder
+  cache rather than from the ID field the write has not found yet). Verified on
+  hardware: CP/M 4.1 writes files to a physical disk and reads them back
+  correct.

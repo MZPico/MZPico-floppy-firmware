@@ -127,6 +127,7 @@ SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
     uint8_t nsz = idam[3] & 7;
     uint16_t size = (uint16_t)(128u << nsz);
     r.size = size;
+    r.size_n = nsz;
 
     if (skip_triple_sync_mark(&io) && size <= out_size) {
       uint8_t dmark = 0;

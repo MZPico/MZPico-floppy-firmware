@@ -87,7 +87,19 @@ struct FdcDebug {
   uint8_t int_mode;         // the active fdc_set_int_mode() setting
   uint32_t intrq_asserts;   // ~INT Hi-Z -> low transitions this session
   uint32_t lost_data_events; // DRQ'd sectors the host never drained
-  uint32_t write_attempts;   // WRITE SECTOR commands refused by the 3.3 stub
+  // ---- WRITE SECTOR (3.3) ----
+  uint32_t write_attempts;   // WRITE SECTOR commands (host or bench probe)
+  uint32_t wr_refused;       // ...refused before the disk (WP / writes off)
+  uint32_t wr_ok;            // data fields actually spliced onto the media
+  uint32_t wr_rnf;           // the sector's ID never passed the head
+  uint32_t wr_cyl_mismatch;  // found it, but on the wrong cylinder
+  uint32_t wr_size_mismatch; // found it, but its size != the host's data
+  uint32_t wr_late;          // ID decoded too late to hit its Gap 2 window
+  uint32_t wr_splice_us;     // last splice: search time
+  uint16_t wr_ids_seen;      // last splice: ID fields decoded
+  uint8_t wr_last_result;    // b0 wrote b1 id_found b2 cyl b3 size b4 late
+                             // b5 no_flux
+  uint8_t wr_flags;          // b0 writing b1 armed b2 writes enabled b3 ~WPT
   // Cumulative read quality (see the sec_* counters in fdc.cpp). A snapshot of
   // the *last* read cannot show a corrupt sector the host already consumed.
   uint32_t sec_ok;           // sectors delivered with a good data CRC
@@ -194,6 +206,24 @@ void fdc_bench_seek(uint8_t target, uint16_t param, uint8_t mode, FdcDebug *out)
 uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
                                uint8_t density, uint8_t *out, uint16_t out_size,
                                uint8_t *flags);
+
+// Bench-only SYNCHRONOUS write of one sector (no MZ-800): select+spin, seek to
+// `track`, select `side`, then locate sector `sector` on the spinning disk and
+// splice `n` bytes of `data` into its data field (see mfm_splice.hpp). This is
+// the whole WRITE path minus the bus, so a sector can be written and read back
+// over USB before any machine is allowed near it.
+//
+// `n` must equal the sector's recorded size or the write is refused. Returns
+// true only if flux actually went onto the media; *flags gets the splice result
+// (b0 wrote b1 id_found b2 cyl_mismatch b3 size_mismatch b4 late b5 no_flux).
+bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
+                            const uint8_t *data, uint16_t n, uint8_t *flags);
+
+// Master enable for WRITE SECTOR from the MZ-800 (see g_write_enable). OFF puts
+// the bridge back to read-only: write commands are refused with WRITE PROTECT
+// and nothing can reach the media. Does not affect fdc_bench_write_sector().
+void fdc_set_write_enable(bool on);
+bool fdc_get_write_enable(void);
 
 // Fill `out_decoded`/`out_raw` (>=16 bytes each) with recent command bytes
 // (oldest->newest). Decoded is the WD opcode (~raw), raw is the byte sampled on

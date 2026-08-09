@@ -18,6 +18,10 @@ Usage:
     python mzp_probe.py PORT sideswap [0|1]               # invert ROM side-select -> physical head (no arg = query)
     python mzp_probe.py PORT intmode [0|1|2]              # ~INT drive: 0=off 1=follow EINT(0xDF) 2=force (no arg = query)
     python mzp_probe.py PORT iotrace                      # ordered register accesses (reads+writes), newest last
+    python mzp_probe.py PORT wren [0|1]                   # allow WRITE SECTOR from the MZ-800 (no arg = query)
+    python mzp_probe.py PORT wrdiag                       # why the last WRITE SECTOR wrote / was refused
+    python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
+    python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
 
   MZ-800 bus-test programs to run against `bustest` (Z80 machine code):
     write only : 3E 00 D3 DF 3C 18 FB
@@ -30,11 +34,17 @@ Usage:
     python mzp_probe.py PORT <track> <side> [dens]        # shorthand for scan
 
     dens: 0 = DD / 250 kbit/s (default), 1 = HD / 500 kbit/s
-    size_code: 0=128, 1=256, 2=512 bytes/sector
+    size_code: 0=128, 1=256, 2=512, 3=1024 bytes/sector
+    write pattern mode: 0 = ramp from seed, 1 = constant seed,
+                        2 = pseudo-random from seed (default; hardest MFM)
 
   scan    - seek a real track, capture flux, decode its sectors on-device.
   enctest - encode a synthetic track then decode it (no disk); validates the
             MFM encoder + CRC generation via a round-trip.
+  fdcwrite/wrverify - the Milestone 3.3 write splice. These OVERWRITE one
+            sector's data field on the disk in the drive; use a scratch disk.
+            wrverify is the one to run: it writes a pattern, reads it back
+            through the normal read path, and compares byte for byte.
 
 Needs pyserial:  pip install pyserial
 """
@@ -58,6 +68,9 @@ MZP_CMD_RDDIAG = 0x8D
 MZP_CMD_SIDESWAP = 0x8E
 MZP_CMD_INTMODE = 0x8F
 MZP_CMD_IOTRACE = 0x90
+MZP_CMD_FDCWRITE = 0x91
+MZP_CMD_WRDIAG = 0x92
+MZP_CMD_WREN = 0x93
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -668,6 +681,123 @@ def do_fdcread(s, track, sector, side, dens):
         print(f"  first bytes: {preview}{' ...' if size > 32 else ''}")
 
 
+def gen_pattern(mode, seed, n):
+    """Mirror of the payload generator in MZP_CMD_FDCWRITE (gw_protocol.cpp).
+
+    Kept in lockstep so the probe can verify a written sector byte for byte
+    without shipping the payload over USB in either direction.
+    """
+    if mode == 0:
+        return bytes((seed + k) & 0xFF for k in range(n))
+    if mode == 1:
+        return bytes([seed & 0xFF]) * n
+    out = bytearray()
+    lfsr = ((seed & 0xFF) << 8) | 0xA5
+    for _ in range(n):
+        for _b in range(8):
+            bit = (lfsr ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1
+            lfsr = (lfsr >> 1) | (bit << 15)
+        out.append(lfsr & 0xFF)
+    return bytes(out)
+
+
+SPLICE_FLAGS = [
+    (0x01, "wrote"),
+    (0x02, "id_found"),
+    (0x04, "CYL MISMATCH"),
+    (0x08, "SIZE MISMATCH"),
+    (0x10, "LATE (missed Gap 2)"),
+    (0x20, "NO FLUX"),
+]
+
+
+def do_fdcwrite(s, track, sector, side, sizecode, mode, seed):
+    # Bench (no MZ-800): device seeks, then finds the sector on the spinning
+    # disk and splices a new data field into it. THIS WRITES TO THE DISK.
+    s.write(bytes([MZP_CMD_FDCWRITE, 8, track, sector, side,
+                   sizecode & 7, mode & 0xFF, seed & 0xFF]))
+    s.flush()
+    r = read_exact(s, 6)  # cmd, ACK, wrote, flags, size_lo, size_hi
+    if len(r) < 6 or r[1] != 0:
+        print(f"bad/short reply: {r.hex()}")
+        return False
+    wrote, flags = bool(r[2]), r[3]
+    size = r[4] | (r[5] << 8)
+    names = [n for bit, n in SPLICE_FLAGS if flags & bit] or ["(nothing)"]
+    print(f"track {track} sector {sector} side {side} size {size}: "
+          f"{'WROTE' if wrote else 'not written'}  [{', '.join(names)}]")
+    if not wrote and not (flags & 0x02):
+        print("  the sector's ID never passed the head -- wrong track/side, "
+              "or the disk is not the one you think it is")
+    return wrote
+
+
+def do_wrverify(s, track, sector, side, sizecode, mode, seed):
+    """Write a generated pattern, read it back, compare byte for byte."""
+    n = 128 << (sizecode & 7)
+    if not do_fdcwrite(s, track, sector, side, sizecode, mode, seed):
+        print("VERIFY SKIPPED (nothing was written)")
+        return
+    want = gen_pattern(mode, seed, n)
+    s.write(bytes([MZP_CMD_FDCREAD, 6, track, sector, side, 0]))
+    s.flush()
+    hdr = read_exact(s, 5)
+    if len(hdr) < 5 or hdr[1] != 0:
+        print(f"read-back: bad reply {hdr.hex()}")
+        return
+    flags, size = hdr[2], hdr[3] | (hdr[4] << 8)
+    got = read_exact(s, size) if size else b""
+    if not (flags & 1):
+        print("read-back: RNF -- the write may have damaged the ID field")
+        return
+    print(f"read-back: size={size} data_crc="
+          f"{'ok' if flags & 4 else 'BAD'} deleted={bool(flags & 8)}")
+    if size != n:
+        print(f"VERIFY FAILED: read {size} bytes, wrote {n}")
+        return
+    bad = [k for k in range(n) if got[k] != want[k]]
+    if not bad:
+        print(f"VERIFY OK: {n}/{n} bytes match"
+              + ("" if flags & 4 else "  (but the CRC on disk is BAD!)"))
+    else:
+        print(f"VERIFY FAILED: {len(bad)}/{n} bytes differ, "
+              f"first at offset {bad[0]} "
+              f"(want 0x{want[bad[0]]:02X}, got 0x{got[bad[0]]:02X})")
+
+
+def do_wrdiag(s):
+    s.write(bytes([MZP_CMD_WRDIAG, 2]))
+    s.flush()
+    r = read_exact(s, 41)
+    if len(r) < 41 or r[1] != 0:
+        print(f"bad/short reply: {r.hex()}")
+        return
+    wr_flags, last = r[2], r[3]
+    ids_seen = r[4] | (r[5] << 8)
+    vals = [int.from_bytes(r[6 + 4 * k:10 + 4 * k], "little") for k in range(9)]
+    (splice_us, attempts, refused, ok, rnf, cyl_mm, size_mm, late,
+     lost) = vals
+    print("WRITE SECTOR state:")
+    print(f"  writing={bool(wr_flags & 1)} buffer_full={bool(wr_flags & 2)} "
+          f"writes_enabled={bool(wr_flags & 4)} "
+          f"write_protect={bool(wr_flags & 8)}")
+    names = [n for bit, n in SPLICE_FLAGS if last & bit] or ["(no write yet)"]
+    print(f"  last splice: {', '.join(names)}  "
+          f"ids_seen={ids_seen} search={splice_us / 1000:.1f} ms")
+    print("cumulative:")
+    print(f"  commands={attempts}  written={ok}  refused(WP/read-only)="
+          f"{refused}")
+    print(f"  RNF={rnf}  of which wrong-cylinder={cyl_mm} wrong-size={size_mm} "
+          f"too-late={late}")
+    print(f"  LOST DATA (host stopped feeding mid-sector)={lost}")
+    if cyl_mm:
+        print("  ! wrong-cylinder aborts mean the head was not where the host "
+              "believed -- see `rddiag` for the position chain")
+    if late:
+        print("  ! 'too late' means the ID decoded after its Gap 2 had passed; "
+              "the splice was skipped rather than risk the next ID field")
+
+
 def do_pintest(s):
     s.write(bytes([MZP_CMD_PINTEST, 2]))
     s.flush()
@@ -781,6 +911,33 @@ def main():
             side = int(sys.argv[5]) if len(sys.argv) > 5 else 0
             dens = int(sys.argv[6]) if len(sys.argv) > 6 else 0
             do_fdcread(s, track, sector, side, dens)
+        elif cmd in ("fdcwrite", "wrverify"):
+            # THESE WRITE TO THE DISK. args: track sector [side] [sizecode]
+            #                                [mode] [seed]
+            track = int(sys.argv[3])
+            sector = int(sys.argv[4])
+            side = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+            sizecode = int(sys.argv[6]) if len(sys.argv) > 6 else 2
+            mode = int(sys.argv[7]) if len(sys.argv) > 7 else 2
+            seed = int(sys.argv[8], 0) if len(sys.argv) > 8 else 0x5A
+            if cmd == "fdcwrite":
+                do_fdcwrite(s, track, sector, side, sizecode, mode, seed)
+            else:
+                do_wrverify(s, track, sector, side, sizecode, mode, seed)
+        elif cmd == "wrdiag":
+            do_wrdiag(s)
+        elif cmd == "wren":
+            # no arg = query (2), else 0 = read-only, 1 = writes enabled
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            s.write(bytes([MZP_CMD_WREN, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            if len(r) < 3 or r[1] != 0:
+                print(f"bad reply: {r.hex()}")
+            else:
+                print("MZ-800 writes: " + ("ENABLED" if r[2] else
+                                           "disabled (WRITE PROTECT returned "
+                                           "to the host)"))
         elif cmd == "streamscan":
             track = int(sys.argv[3])
             side = int(sys.argv[4])

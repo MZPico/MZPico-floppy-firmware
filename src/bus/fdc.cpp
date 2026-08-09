@@ -5,6 +5,7 @@
 #include "flux/arch_rp2.h" // rp2040_flux_capture_start/drain/stop (streaming)
 #include "gw_protocol.hpp" // mzp_flux_buffer (shared capture buffer)
 #include "mfm_decode.hpp"  // mfm_read_sector
+#include "mfm_splice.hpp"  // mfm_write_sector (in-place data-field splice)
 #include "mz_bus.hpp"      // bus_diag_reset
 #include "hardware/gpio.h" // gpio_get (index-edge sync)
 #include "pico/time.h"     // sleep_ms
@@ -21,6 +22,26 @@ namespace {
 
 // Largest supported sector data field: 128 << 3 = 1024 bytes.
 static constexpr uint16_t FDC_SECTOR_MAX = 1024;
+
+// Highest cylinder the head may be driven to. Relative stepping is clamped here
+// so a runaway host cannot walk the head into the end stop.
+static constexpr int FDC_MAX_CYLINDER = 79;
+
+// Per-cylinder sector size, learned from the ID fields we decode while reading.
+//
+// WRITE SECTOR needs the sector's size BEFORE the host has sent a single byte:
+// the WD raises DRQ the moment the command is written and the host then shifts
+// in exactly one sector's worth. A real WD gets away with not knowing either --
+// it streams bytes and stops when the ID field it eventually finds says to --
+// but we buffer the whole sector before going anywhere near the disk, so the
+// length has to be decided up front. Every cylinder a host writes to it has
+// first read from, so the ID fields have already told us; this remembers what
+// they said. A wrong guess is caught (not acted on) at splice time by the size
+// compare in mfm_write_sector().
+static constexpr int FDC_SIZE_CACHE_N = FDC_MAX_CYLINDER + 1;
+// Size code N means 128 << N bytes, so 512 is 2. MZ-800 CP/M data tracks are
+// 9x512 (N=2); the boot track is 16x256 (N=1).
+static constexpr uint8_t FDC_SIZE_CODE_DEFAULT = 2;
 
 struct FdcState {
   // WD register file (true values)
@@ -95,10 +116,41 @@ struct FdcState {
   volatile bool err_crc = false;
   volatile bool lost_data = false;
   volatile bool rec_deleted = false; // matched a deleted-DAM (0xF8)
-  // Set by the WRITE SECTOR stub so a write fails visibly instead of silently
-  // doing nothing. Remove with the stub in 3.3.
+  // WRITE PROTECT (Type II b6). Set when a write command is refused before it
+  // reaches the disk -- the drive's ~WPT sense, or writes disabled in firmware.
   volatile bool err_write_protect = false;
-  volatile uint32_t write_attempts = 0; // diagnostics: writes we refused
+  volatile uint32_t write_attempts = 0; // WRITE SECTOR commands issued to us
+  volatile uint32_t wr_refused = 0;     // ...of those, refused before the disk
+
+  // ---- Type II WRITE SECTOR (3.3) ---------------------------------------
+  // Mirror image of the read path, with the DRQ direction reversed: core1
+  // collects a whole sector from the host into xfer[], then hands it to core0,
+  // which finds the sector's ID on the spinning disk and splices a new data
+  // field in behind it (see mfm_splice.hpp).
+  //
+  // Buffering the sector before touching the disk is what makes this safe with
+  // a host that paces itself: the splice runs at disk speed and cannot pause,
+  // so a host that stalls mid-sector must stall BEFORE the write starts, not
+  // half way through a data field. A real WD, which streams host bytes straight
+  // onto the media, answers the same situation by writing zeros and raising
+  // LOST DATA -- i.e. by corrupting the sector.
+  volatile bool writing = false;  // a write transfer is in flight (BUSY held)
+  volatile bool wr_armed = false; // xfer[] is full; core0 may splice
+  volatile uint8_t wr_sector = 1; // sector being written
+  volatile bool wr_deleted = false; // command bit a0: write a deleted DAM
+  volatile uint32_t wr_seq = 0;   // core1 -> core0: "splice this buffer"
+  volatile uint32_t wr_done = 0;
+  // Write-path diagnostics, cumulative. The equivalent of the sec_* counters:
+  // a snapshot of the last write cannot show the one that went wrong earlier.
+  volatile uint32_t wr_ok = 0;            // data fields actually written
+  volatile uint32_t wr_rnf = 0;           // the sector's ID never passed the head
+  volatile uint32_t wr_cyl_mismatch = 0;  // found it, on the wrong cylinder
+  volatile uint32_t wr_size_mismatch = 0; // found it, wrong recorded size
+  volatile uint32_t wr_late = 0;          // ID decoded too late for its Gap 2
+  volatile uint32_t wr_splice_us = 0;     // last splice: search time
+  volatile uint16_t wr_ids_seen = 0;      // last splice: ID fields decoded
+  volatile uint8_t wr_last_result = 0;    // b0 wrote b1 id_found b2 cyl_mismatch
+                                          // b3 size_mismatch b4 late b5 no_flux
   // One-sector transfer buffer. core0 fills it and raises `drq`; core1 hands the
   // bytes to the host on DATA reads and lowers `drq` when the sector is drained.
   // Ownership passes via `drq`: core0 writes xfer[]/xfer_len only while drq==0.
@@ -274,6 +326,24 @@ struct FdcState {
 FdcState S;
 FloppyDrive *DRV = nullptr;
 
+// Sector size code per cylinder (see FDC_SIZE_CACHE_N). Written by core0 as it
+// decodes ID fields, read by core1 when a WRITE SECTOR command arrives. A byte
+// each, single-writer, and a stale entry only costs a refused write -- so no
+// synchronisation beyond `volatile`.
+volatile uint8_t g_size_code[FDC_SIZE_CACHE_N];
+
+ALWAYS_INLINE uint16_t fdc_sector_size_for(uint8_t trk) {
+  uint8_t n = (trk < FDC_SIZE_CACHE_N) ? g_size_code[trk] : FDC_SIZE_CODE_DEFAULT;
+  return (uint16_t)(128u << (n & 7));
+}
+
+// Remember the size code an ID field on `trk` reported. Called from core0 on
+// every decoded ID (read, READ ADDRESS and splice alike).
+inline void fdc_note_size_code(uint8_t trk, uint8_t n) {
+  if (trk < FDC_SIZE_CACHE_N)
+    g_size_code[trk] = (uint8_t)(n & 7);
+}
+
 } // namespace
 
 // How the ~INT line (GPIO12) is driven:
@@ -297,6 +367,13 @@ volatile uint8_t g_int_mode = 1;
 // cannot boot at all. Outside the anonymous namespace so the USB probe can flip
 // it live for A/B testing; core1 reads it on every 0xDD write.
 volatile bool g_invert_side = true;
+
+// Master enable for WRITE SECTOR. ON: the bridge is a read/write floppy
+// controller, which is the point of Milestone 3.3. Turn it off (`mzp_probe.py
+// wren 0`) to make the firmware read-only again -- the machine then sees the
+// same honest WRITE PROTECT the 3.2 stub returned, which is the right state for
+// bringing up a new host, or for touching a disk you cannot replace.
+volatile bool g_write_enable = true;
 
 namespace {
 
@@ -348,10 +425,13 @@ ALWAYS_INLINE void fdc_trace_io(uint8_t port, uint8_t val, uint8_t is_rd) {
 // diagnostic counter count edges rather than calls.
 ALWAYS_INLINE void fdc_refresh_int_line(void) {
   bool enabled = (g_int_mode == 2) || (g_int_mode == 1 && S.eint);
-  // DRQ during a data transfer is the normal source. The Force-Interrupt (I3)
-  // latch is the only other one; a Type I completion does NOT interrupt on this
-  // card. Add `|| (S.writing && S.drq)` here when WRITE SECTOR lands (3.3).
-  bool want = enabled && ((S.reading && S.drq) || S.force_int_latched);
+  // DRQ during a data transfer is the normal source -- in either direction: on
+  // a write DRQ means "send me the next byte", and an interrupt-driven host
+  // waits on exactly the same edge to feed the sector as it does to drain one.
+  // The Force-Interrupt (I3) latch is the only other source; a Type I
+  // completion does NOT interrupt on this card.
+  bool want = enabled && (((S.reading || S.writing) && S.drq) ||
+                          S.force_int_latched);
   if (want) {
     if (!S.int_asserted) {
       S.int_asserted = true;
@@ -411,6 +491,12 @@ static constexpr size_t FDC_READ_CAPTURE_BYTES = 45700;
 static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
 
 static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
+
+// How long the write splice hunts for its sector's ID field. One revolution is
+// ~200 ms, so 1.25 of them guarantees every sector on the track passes the head
+// at least once -- if it is there at all, we have seen it. Longer would only
+// delay the RNF; the host is polling BUSY throughout.
+static constexpr uint32_t FDC_WRITE_SEARCH_TIMEOUT_US = 250000;
 // NOTE: a set of "ROM bring-up workarounds" used to live here -- command
 // aliases 0x14->0x94 and 0x58->0xD8, a relaxed Verify seek-error gate, an
 // any-sector read fallback, and a BUSY hold. They existed because the ROM
@@ -507,9 +593,6 @@ static bool fdc_verify_track(uint8_t track) {
   return ok; // capture already stopped above, before the decode
 }
 
-// Highest cylinder the head may be driven to. Relative stepping is clamped here
-// so a runaway host cannot walk the head into the end stop.
-static constexpr int FDC_MAX_CYLINDER = 79;
 // READ ADDRESS is on a MUCH tighter budget than READ SECTOR: measured, the
 // CP/M BIOS polls STATUS for only ~52 ms before Force Interrupt (vs the boot
 // ROM's ~285 ms for a sector read). It also only needs the NEXT ID field, and
@@ -609,6 +692,31 @@ static constexpr uint32_t FDC_MOTOR_OFF_DELAY_MS = 3000;
 
 inline uint32_t now_ms() { return to_ms_since_boot(get_absolute_time()); }
 
+// Record a splice outcome into the wr_* diagnostics. Shared by the MZ-800 write
+// path and fdc_bench_write_sector so `wrdiag` describes whichever one last put
+// (or failed to put) flux on the disk -- the bench command is the tool the
+// write path is brought up with, so leaving it out of the counters made the
+// diagnostic read "no write yet" straight after a successful write.
+inline void fdc_record_splice(const SpliceResult &sr) {
+  S.wr_ids_seen = sr.ids_seen;
+  S.wr_splice_us = sr.search_us;
+  S.wr_last_result =
+      (uint8_t)((sr.wrote ? 0x01 : 0) | (sr.id_found ? 0x02 : 0) |
+                (sr.cyl_mismatch ? 0x04 : 0) | (sr.size_mismatch ? 0x08 : 0) |
+                (sr.late ? 0x10 : 0) | (sr.no_flux ? 0x20 : 0));
+  if (sr.wrote) {
+    S.wr_ok++;
+  } else {
+    S.wr_rnf++;
+    if (sr.cyl_mismatch)
+      S.wr_cyl_mismatch++;
+    if (sr.size_mismatch)
+      S.wr_size_mismatch++;
+    if (sr.late)
+      S.wr_late++;
+  }
+}
+
 inline uint8_t compose_status() {
   uint8_t st = 0;
   if (S.busy)
@@ -658,7 +766,11 @@ inline uint8_t compose_status() {
 
 } // namespace
 
-void fdc_init(FloppyDrive *drive) { DRV = drive; }
+void fdc_init(FloppyDrive *drive) {
+  DRV = drive;
+  for (int i = 0; i < FDC_SIZE_CACHE_N; ++i)
+    g_size_code[i] = FDC_SIZE_CODE_DEFAULT;
+}
 
 // ---- core1 (bus) hot path -------------------------------------------------
 
@@ -685,6 +797,12 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // ---- Type I (seek family) ----
       S.type2 = false; // STATUS reverts to the Type I layout
       S.read_addr = false;
+      // Abandon any half-collected write. The head is about to move, and a
+      // buffer collected for one cylinder must never be spliced onto another;
+      // the size cache is per-cylinder too. (A read in flight is deliberately
+      // left alone -- see the Force Interrupt notes on queued Type I commands.)
+      S.writing = false;
+      S.wr_armed = false;
       // The Track register is the WD's *belief*; the head position is physical
       // and separate. Compute a relative step count here and update the Track
       // register per the WD rules — core0 applies the motion to wherever the
@@ -762,6 +880,13 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.drq = false;
         S.pending_force_int = false;
         S.pending_force_since_us = 0;
+        // A write that has not been handed to core0 yet is simply dropped. One
+        // already in the splice cannot be: the flux is going onto the media in
+        // real time and there is no more stopping it than there is on a real
+        // WD. core0 sees `writing` clear when it comes back and publishes
+        // nothing further.
+        S.writing = false;
+        S.wr_armed = false;
         // NOTE: deliberately do NOT cancel a pending Type I move here (i.e. no
         // `S.op_done = S.op_seq`). On a real WD the step pulse is already out
         // the door before the CPU can write the Force Interrupt byte, so the
@@ -793,6 +918,12 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.err_write_protect = false; // cleared by the next Type II/III command
       S.multi = (cmd & 0x10) != 0;
+      // Any new data command supersedes a write that has not reached the disk.
+      // Without this a READ arriving on top of a half-collected write leaves
+      // both `reading` and `writing` set, and core0 -- which checks writing
+      // first -- would splice a stale buffer instead of serving the read.
+      S.writing = false;
+      S.wr_armed = false;
       if ((cmd & 0x20) == 0) {
         // READ SECTOR — single (0x8X) or multiple (0x9X). Ask core0 to decode
         // the current Sector register off a fresh capture of the current track.
@@ -814,25 +945,44 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.rd_elapsed_us = 0; // cleared until an abort (or drain) records a real value
         S.rd_seq++;
       } else {
-        // WRITE SECTOR — not implemented until Milestone 3.3. Fail the command
-        // with WRITE PROTECT rather than completing benignly.
-        //
-        // The old stub cleared BUSY with no DRQ and no error bits, i.e. it told
-        // the host the write SUCCEEDED. That was defensible while the boot ROM
-        // was the only client (it never writes), but CP/M 4.1 now boots to a
-        // prompt and can. A silent no-op write is the worst possible failure
-        // mode: the host's in-RAM directory and buffers diverge from what is
-        // actually on the disk, and the damage is only discovered later, on a
-        // disk the user believes is good. WRITE PROTECT is the honest answer --
-        // it is a real WD status bit for a write command, every DOS/BIOS already
-        // has a path for it, and it says "this did not happen" unambiguously.
-        //
-        // Delete this whole branch when the real splice lands; the flag is
-        // cleared on the next Type II command, so nothing else has to change.
+        // WRITE SECTOR — single (0xAX) or multiple (0xBX). Collect a whole
+        // sector from the host first, then let core0 splice it in behind the
+        // matching ID field (see the write-path block in fdc_disk_task and
+        // mfm_splice.hpp).
         S.reading = false;
-        S.busy = false;
-        S.err_write_protect = true;
+        S.read_addr = false;
         S.write_attempts++;
+        if (S.write_protect || !g_write_enable) {
+          // Refused before the disk is touched. WRITE PROTECT is a real WD
+          // status bit for a write command and says "this did not happen"
+          // unambiguously -- unlike clearing BUSY with no error bits, which
+          // reports success and lets the host's in-RAM copy of the disk
+          // silently diverge from the disk.
+          S.writing = false;
+          S.wr_armed = false;
+          S.drq = false;
+          S.busy = false;
+          S.err_write_protect = true;
+          S.wr_refused++;
+        } else {
+          S.writing = true;
+          S.wr_armed = false;
+          S.wr_sector = S.sector;
+          S.wr_deleted = (cmd & 0x01) != 0; // a0: 0 -> 0xFB, 1 -> 0xF8
+          S.xfer_len = fdc_sector_size_for(S.track);
+          S.xfer_pos = 0;
+          S.busy = true;
+          // A real WD raises DRQ as soon as the command is written, before it
+          // has found (or even looked for) the ID field, and the host starts
+          // shifting bytes in immediately. Same here -- the difference is only
+          // that our bytes land in a buffer rather than on the media.
+          S.drq = true;
+          S.rd_issue_us = time_us_32();
+          S.status_polls = 0;
+          S.status_last_us = S.rd_issue_us;
+          S.last_data_read_us = S.rd_issue_us;
+          fdc_refresh_int_line();
+        }
       }
     } else if ((cmd & 0xF0) == 0xC0) {
       // ---- Type III READ ADDRESS (0xCX) ----
@@ -843,6 +993,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       S.type2 = true;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.err_write_protect = false; // cleared by the next Type II/III command
+      S.writing = false;
+      S.wr_armed = false;
       S.reading = true;
       S.read_addr = true;
       S.multi = false;
@@ -886,6 +1038,24 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     break;
   case 0xDB:
     S.data = (uint8_t)~raw; // DATA (CPL'd)
+    // During a WRITE SECTOR this is the host feeding the sector, one DRQ'd byte
+    // at a time. Ownership of xfer[] passes to core0 via `wr_armed`+`wr_seq`
+    // once the last byte lands -- the mirror of how `drq` hands a read sector
+    // the other way.
+    if (S.writing && S.drq) {
+      S.xfer[S.xfer_pos] = S.data;
+      S.xfer_pos++;
+      S.last_data_read_us = time_us_32();
+      if (S.xfer_pos >= S.xfer_len) {
+        S.drq = false;   // stop asking; the disk work starts on core0
+        S.wr_armed = true;
+        S.wr_seq++;
+      }
+      // Taking/giving the DATA byte is what clears the interrupt on this card
+      // (a STATUS read does not). With DRQ still set this re-arms for the next
+      // byte, exactly as on the read side.
+      fdc_refresh_int_line();
+    }
     break;
   case 0xDC: // MOTOR/DRIVE (not CPL'd): b7 = motor on, b1..0 = drive select
     S.active = true;
@@ -987,7 +1157,7 @@ RAM_FUNC uint8_t fdc_reg_read(uint8_t addr) {
 RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
   switch (addr) {
   case 0xD8:
-    if (S.reading) { // measure the host's real BUSY/DRQ patience
+    if (S.reading || S.writing) { // measure the host's real BUSY/DRQ patience
       S.status_polls++;
       S.status_last_us = time_us_32();
     }
@@ -1135,6 +1305,18 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->intrq_asserts = S.intrq_asserts;
   o->lost_data_events = S.lost_data_events;
   o->write_attempts = S.write_attempts;
+  o->wr_refused = S.wr_refused;
+  o->wr_ok = S.wr_ok;
+  o->wr_rnf = S.wr_rnf;
+  o->wr_cyl_mismatch = S.wr_cyl_mismatch;
+  o->wr_size_mismatch = S.wr_size_mismatch;
+  o->wr_late = S.wr_late;
+  o->wr_splice_us = S.wr_splice_us;
+  o->wr_ids_seen = S.wr_ids_seen;
+  o->wr_last_result = S.wr_last_result;
+  o->wr_flags = (uint8_t)((S.writing ? 0x01 : 0) | (S.wr_armed ? 0x02 : 0) |
+                          (g_write_enable ? 0x04 : 0) |
+                          (S.write_protect ? 0x08 : 0));
   o->sec_ok = S.sec_ok;
   o->sec_crc_err = S.sec_crc_err;
   o->sec_rnf = S.sec_rnf;
@@ -1294,6 +1476,50 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
   }
   return n;
 }
+
+bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
+                            const uint8_t *data, uint16_t n, uint8_t *flags) {
+  if (flags)
+    *flags = 0;
+  if (!DRV || n == 0 || n > FDC_SECTOR_MAX)
+    return false;
+
+  DRV->step_delay_us = 2000;
+  DRV->settle_delay_ms = 5;
+  DRV->motor_delay_ms = 300;
+  DRV->select(true);
+  DRV->spin_motor(true);
+  DRV->side(side ? 1 : 0);
+  DRV->goto_track(track);
+
+  S.write_attempts++;
+  S.write_protect = DRV->get_write_protect();
+  if (S.write_protect) {
+    S.wr_refused++;
+    return false; // the disk says no; nothing else to report
+  }
+
+  SpliceResult sr =
+      mfm_write_sector(sector, (int)track, data, n, /*deleted=*/false,
+                       FDC_DD_BIT_US, FDC_WRITE_SEARCH_TIMEOUT_US);
+  fdc_record_splice(sr);
+  if (sr.id_found) {
+    fdc_note_size_code(track, sr.size_n);
+    S.last_id_cyl = sr.seen_cyl;
+    S.last_id_head = sr.seen_head;
+    S.last_trk_reg = track;
+    S.last_want_side = side ? 1 : 0;
+  }
+  if (flags)
+    *flags = (uint8_t)((sr.wrote ? 0x01 : 0) | (sr.id_found ? 0x02 : 0) |
+                       (sr.cyl_mismatch ? 0x04 : 0) |
+                       (sr.size_mismatch ? 0x08 : 0) | (sr.late ? 0x10 : 0) |
+                       (sr.no_flux ? 0x20 : 0));
+  return sr.wrote;
+}
+
+void fdc_set_write_enable(bool on) { g_write_enable = on; }
+bool fdc_get_write_enable(void) { return g_write_enable; }
 
 // ---- core0 (disk) ---------------------------------------------------------
 
@@ -1460,6 +1686,133 @@ void fdc_disk_task(void) {
     }
   }
 
+  // ---- Type II write: collect from the host, then splice -------------------
+  if (S.writing) {
+    // The host stopped feeding bytes part way through the sector. A real WD
+    // would have written zeros for the missing bytes and raised LOST DATA; we
+    // have not touched the disk yet, so the honest -- and non-destructive --
+    // answer is to raise LOST DATA and write nothing at all. The budget is the
+    // same generous one the read side uses; it exists to guarantee forward
+    // progress, not to police a slow host.
+    if (S.drq && (time_us_32() - S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
+      S.lost_data = true;
+      S.lost_data_events++;
+      S.writing = false;
+      S.wr_armed = false;
+      S.drq = false;
+      S.busy = false;
+      fdc_refresh_int_line();
+      return;
+    }
+    if (!S.wr_armed)
+      return; // still collecting the sector from the host
+
+    // Never splice with a move outstanding. This matters far more than it does
+    // on the read path, where answering from the wrong cylinder merely returns
+    // data the host can reject: here it would overwrite a sector on a track the
+    // host never asked about. mfm_write_sector's ID track compare is the second
+    // line of defence; this is the first.
+    if (S.op_done != S.op_seq)
+      return;
+
+    uint32_t seq = S.wr_seq; // snapshot
+    uint8_t want = S.wr_sector;
+    uint16_t n = S.xfer_len;
+    if (n > FDC_SECTOR_MAX)
+      n = FDC_SECTOR_MAX;
+    for (uint16_t k = 0; k < n; ++k)
+      g_secbuf[k] = S.xfer[k];
+
+    // The capture peripheral must be free -- the splice starts its own live
+    // capture, and an aborted read can still have one running.
+    if (g_stream_active) {
+      rp2040_flux_capture_stop();
+      g_stream_active = false;
+    }
+    g_flux_n = 0; // whatever was captured describes the track BEFORE this write
+
+    // Re-read ~WPT now rather than trusting the value cached at the last seek:
+    // this is the last moment before flux goes onto the media.
+    S.write_protect = DRV->get_write_protect();
+
+    // Write-protected between the command and here (or the tab was always
+    // open and the earlier check ran on a stale sense). Report WRITE PROTECT
+    // and stop -- deliberately NOT RNF, which would send the host looking for
+    // a positioning problem it does not have.
+    if (S.write_protect) {
+      S.err_write_protect = true;
+      S.wr_refused++;
+      if (S.writing && S.wr_seq == seq) {
+        S.writing = false;
+        S.wr_armed = false;
+        S.drq = false;
+        S.busy = false;
+        fdc_refresh_int_line();
+      }
+      S.wr_done = seq;
+      return;
+    }
+
+    SpliceResult sr =
+        mfm_write_sector(want, (int)S.track, g_secbuf, n, S.wr_deleted,
+                         FDC_DD_BIT_US, FDC_WRITE_SEARCH_TIMEOUT_US);
+
+    fdc_record_splice(sr);
+    if (sr.id_found)
+      fdc_note_size_code(S.track, sr.size_n);
+    S.last_head_target = (uint8_t)S.head_target;
+    {
+      int pt = DRV->track();
+      S.last_phys_track = (pt < 0) ? 0xFE : (uint8_t)pt;
+    }
+    S.last_trk_reg = S.track;
+    S.last_want_side = S.side1 ? 1 : 0;
+
+    if (sr.wrote) {
+      S.err_rnf = false;
+      S.last_id_cyl = sr.seen_cyl;
+      S.last_id_head = sr.seen_head;
+    } else {
+      // Everything that is not a completed write is RNF to the host: the WD has
+      // exactly one "the sector I was told to write is not under this head"
+      // status bit. fdc_record_splice's counters are what tell the causes apart.
+      S.err_rnf = true;
+      if (sr.cyl_mismatch) {
+        S.sec_cyl_mismatch++;
+        S.last_id_cyl = sr.seen_cyl;
+        S.last_id_head = sr.seen_head;
+      }
+    }
+
+    // Publish only if this write is still the live command: a Force Interrupt
+    // or a Type I can have landed while we were on the disk with interrupts
+    // off, and resurrecting BUSY/DRQ afterwards would hang a host that has
+    // already moved on.
+    if (S.writing && S.wr_seq == seq) {
+      if (sr.wrote && S.multi) {
+        // Multi-record: the WD stays BUSY and asks for the next sector's worth
+        // of bytes. Each one is spliced on its own pass, and each re-finds its
+        // ID -- there is no captured window to reuse, because a write has to
+        // ride the disk in real time whatever we do.
+        S.sector++;
+        S.wr_sector = S.sector;
+        S.xfer_len = fdc_sector_size_for(S.track);
+        S.xfer_pos = 0;
+        S.wr_armed = false;
+        S.last_data_read_us = time_us_32();
+        S.drq = true;
+      } else {
+        S.writing = false;
+        S.wr_armed = false;
+        S.drq = false;
+        S.busy = false;
+      }
+      fdc_refresh_int_line();
+    }
+    S.wr_done = seq;
+    return;
+  }
+
   // ---- Type II read: capture a window, then decode -------------------------
   // Capture and decode are strictly sequential -- see fdc_capture_window() for
   // why interleaving them cannot work without DMA.
@@ -1576,6 +1929,11 @@ void fdc_disk_task(void) {
           // Sector register. A host probing head position may read it there
           // rather than from the data stream.
           S.sector = g_readaddr_id[0];
+          // The ID's size code, for the write path's per-cylinder cache --
+          // indexed by the cylinder the ID itself reports, not the Track
+          // register, since READ ADDRESS is precisely what a host uses when
+          // those two disagree.
+          fdc_note_size_code(g_readaddr_id[0], g_readaddr_id[3]);
         }
       } else if (g_flux_n > 0) {
         // WD ID track compare against the Track register -- see MFM_ANY_CYL.
@@ -1625,6 +1983,10 @@ void fdc_disk_task(void) {
           S.sec_ok++;
         }
         if (!S.read_addr) {
+          // A read is where the write path learns this cylinder's sector size
+          // (see FDC_SIZE_CACHE_N). The ID track compare has already confirmed
+          // sd.cyl == the Track register, so either indexes the same entry.
+          fdc_note_size_code(sd.cyl, sd.size_n);
           S.last_id_cyl = sd.cyl;
           S.last_id_head = sd.head;
           S.last_trk_reg = S.track;

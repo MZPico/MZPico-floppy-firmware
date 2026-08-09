@@ -148,8 +148,10 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   yet drive floppy pin 2 or pick the bit time. Deferred: MZ-800 media is DD.
 - **`~EXWAIT` budget** for putting a byte on the shared C0..C7 bus in time on a
   register access.
-- **WRITE SECTOR** in-place splice details (chosen approach) — timing/gap
-  handling; add write-precomp only if inner-track writes prove marginal.
+- **Write soak + inner tracks.** WRITE SECTOR is verified (3.3) but only over
+  tens of writes on outer tracks. Still open: whether inner tracks need
+  write-precomp, and whether the +2-byte splice bias holds across drives and
+  media with more spindle-speed spread.
 - **Rare `FD:Loading error` on boot** (~1 in 20; everything else reads clean).
   `rddiag` only shows the *last* read, so later retries overwrite the evidence —
   chasing it wants a **first-failure latch** holding the first RNF since
@@ -196,8 +198,8 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   **streaming** MFM data-separator (flux → sectors with ID/CRC + rotational
   position) and encoder (sectors → flux, incl. in-place write-splice). Validate
   over USB (dump/patch a sector) before any MZ-800. No cache.
-- **Phase 3 (WD FDC + MZ-800 bus): READ PATH DONE — CP/M 4.1 boots to the prompt
-  from a physical disk.** Real-time WD179x bridge per
+- **Phase 3 (WD FDC + MZ-800 bus): READ AND WRITE PATHS DONE — CP/M 4.1 boots
+  from a physical disk and writes files back to it.** Real-time WD179x bridge per
   [docs/wd-fidelity.md](docs/wd-fidelity.md); core1 register/bus side, core0 disk
   side. Milestone detail in [docs/phase3-plan.md](docs/phase3-plan.md):
   - 3.0 shared-bus bring-up ✅, 3.1 Type I + STATUS ✅, 3.2 READ SECTOR
@@ -209,11 +211,24 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     enforces the WD ID **track compare**. `mzp_probe.py rddiag` now reports the
     whole position chain (Track reg → head_target → drive belief → disk cyl)
     plus cumulative `sec_ok`/`sec_crc_err`/`sec_rnf`/`sec_cyl_mismatch`.
-  - **3.3 WRITE SECTOR is the next milestone and the one real gap.** It is
-    currently a stub that fails the command with WRITE PROTECT — honest, but it
-    means CP/M cannot write at all. Note the host's positioning style (see the
-    head-position decision) matters far more here: a splice at the wrong
-    cylinder destroys data instead of merely returning garbage.
+  - **3.3 WRITE SECTOR: DONE (hardware-verified) -- CP/M 4.1 on the MZ-800
+    writes files to a physical disk and reads them back correct.** Measured over
+    two disks (13 and 3 host writes): every write completed, and `wrdiag`
+    reported zero RNF, zero wrong-cylinder, zero too-late and zero LOST DATA --
+    so the host's STEP/FORCE-INT positioning style, which is what makes a write
+    dangerous, never landed a splice off-target. A `scan` of a written track
+    shows all nine sectors still ID+data CRC clean: the splice stays inside its
+    own data field on both ends. In-place
+    data-field splice — a *live* MFM decoder finds the sector's ID as it passes
+    the head, then WGATE goes on for the Gap 2 window and the new data field is
+    written; nothing outside that one field is rewritten. core1 buffers the
+    whole sector from the host over DRQ first, so a stalling host stalls before
+    any flux is committed. Refused (before flux) on `~WPT`, on `wren 0`, and on
+    an ID **track compare** miss — the host's positioning style makes that last
+    one critical here, since a splice at the wrong cylinder destroys data
+    instead of merely returning garbage. Verify with
+    `mzp_probe.py PORT wrverify <track> <sector>` (writes, reads back, compares)
+    plus `wrdiag`, on a scratch disk, before letting the MZ-800 write.
   - 3.4 leftovers: READ TRACK, WRITE TRACK (format), density applied to
     `~DEN_RDY`, drive-select via `~DS0/DS1`.
 - **Phase 4 (robustness):** write-precomp if needed, multi-drive, error handling,

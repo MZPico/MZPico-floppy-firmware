@@ -38,6 +38,7 @@ struct SectorRead {
   bool deleted;      // the data mark was a deleted-DAM (0xF8)
   uint8_t cyl, head; // IDAM cylinder/head bytes of the matched sector (debug)
   uint16_t size;     // data-field size actually decoded (128 << N)
+  uint8_t size_n;    // the ID's size code N itself (what WRITE SECTOR caches)
   // Set when the requested sector number WAS on the track but every copy of it
   // carried a different cylinder byte -- i.e. the head is on the wrong track.
   // Reported separately from a plain "not found" because the two call for

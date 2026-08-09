@@ -50,6 +50,38 @@ size_t rp2040_flux_capture_drain(volatile uint8_t *dest, size_t dest_cap,
 // Stop sampling and release the PIO state machine/program claimed by start().
 void rp2040_flux_capture_stop(void);
 
+// ---- Live (real-time) capture, for the WRITE SECTOR splice ----
+// The drain() API above is for "capture now, decode later". Locating a sector
+// in order to overwrite it cannot work that way: by the time a buffer has been
+// decoded the sector has long since passed the head. These three let a caller
+// consume flux transition-by-transition AS THEY ARRIVE, decode the ID field on
+// the fly, and hit the Gap 2 window that follows it.
+
+// Next flux delta (in 24 MHz sample ticks, NOT clamped to 8 bits like the
+// buffered path), or -1 if none arrived within timeout_us. Requires a capture
+// started with rp2040_flux_capture_start(). Cheap enough to call at the ~350
+// kHz DD transition rate.
+int rp2040_flux_capture_next(uint32_t timeout_us);
+
+// Drain and sum whatever deltas are already queued in the FIFO, in 24 MHz
+// ticks. That backlog is disk time that has ALREADY passed under the head, so
+// a splice that measures its gap with a wall clock has to subtract it.
+uint32_t rp2040_flux_capture_backlog(void);
+
+// Stop sampling but keep the state machine/program claimed (unlike _stop()).
+// Used to silence the reader for the duration of a write without paying for a
+// PIO program reload afterwards.
+void rp2040_flux_capture_disable(void);
+
+// ---- Pre-armed write, for the WRITE SECTOR splice ----
+// rp2040_flux_write() claims a PIO state machine, writes, and releases it. A
+// splice cannot afford the claim/load inside its ~700 us window, so prepare()
+// does it up front and write_now() starts the flux immediately -- no index
+// wait, no allocation.
+bool rp2040_flux_write_prepare(int wrdata_pin);
+bool rp2040_flux_write_now(int wrgate_pin, const uint8_t *pulses, size_t n);
+void rp2040_flux_write_release(void);
+
 #ifdef __cplusplus
 }
 #endif

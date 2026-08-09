@@ -278,6 +278,42 @@ void rp2040_flux_capture_stop(void) {
   free_capture();
 }
 
+// ---- Live capture (write splice) ----
+
+int rp2040_flux_capture_next(uint32_t timeout_us) {
+  uint32_t t0 = time_us_32();
+  while (!data_available()) {
+    if ((time_us_32() - t0) > timeout_us) {
+      return -1;
+    }
+  }
+  int data = read_fifo();
+  int delta = g_stream_last - data;
+  if (delta < 0)
+    delta += 65536;
+  delta /= 2;
+  g_stream_last = data;
+  return delta;
+}
+
+uint32_t rp2040_flux_capture_backlog(void) {
+  uint32_t sum = 0;
+  while (data_available()) {
+    int d = rp2040_flux_capture_next(0);
+    if (d < 0) {
+      break;
+    }
+    sum += (uint32_t)d;
+  }
+  return sum;
+}
+
+void rp2040_flux_capture_disable(void) {
+  if (g_reader.pio) {
+    disable_capture();
+  }
+}
+
 // ---- Write ----
 
 static bool init_write(int wrdata_pin, bool is_apple2) {
@@ -371,6 +407,57 @@ static void free_write() {
   pio_sm_unclaim(g_writer.pio, g_writer.sm);
   pio_remove_program(g_writer.pio, g_writer.program, g_writer.offset);
   memset(&g_writer, 0, sizeof(g_writer));
+}
+
+// ---- Pre-armed write (splice) ----
+
+bool rp2040_flux_write_prepare(int wrdata_pin) {
+  return init_write(wrdata_pin, false);
+}
+
+void rp2040_flux_write_release(void) { free_write(); }
+
+bool rp2040_flux_write_now(int wrgate_pin, const uint8_t *pulses, size_t n) {
+  if (!g_writer.pio) {
+    return false;
+  }
+  const uint8_t *p = pulses;
+  const uint8_t *end = pulses + n;
+
+  gpio_set_dir(wrgate_pin, GPIO_OUT);
+  gpio_put(wrgate_pin, 0); // WGATE active low
+
+  pio_sm_set_enabled(g_writer.pio, g_writer.sm, false);
+  pio_sm_clear_fifos(g_writer.pio, g_writer.sm);
+  pio_sm_exec(g_writer.pio, g_writer.sm, g_writer.offset);
+  while (p != end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
+    unsigned value = *p++;
+    value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
+    pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
+  }
+  pio_sm_set_enabled(g_writer.pio, g_writer.sm, true);
+
+  while (p != end) {
+    while (p != end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
+      unsigned value = *p++;
+      value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
+      pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
+    }
+  }
+
+  // Let the FIFO drain and the last pulse actually reach the head before WGATE
+  // drops -- unlike the greaseweazle path (which ends at an index pulse, in the
+  // middle of a gap) a splice ends a few bytes past the data CRC, and cutting
+  // the tail short there truncates real data. The longest single pulse is ~4 us
+  // at DD; 32 us covers it with margin.
+  while (!pio_sm_is_tx_fifo_empty(g_writer.pio, g_writer.sm)) {
+  }
+  busy_wait_us_32(32);
+
+  pio_sm_set_enabled(g_writer.pio, g_writer.sm, false);
+  gpio_set_dir(wrgate_pin, GPIO_IN); // release WGATE (pull-up)
+  gpio_pull_up(wrgate_pin);
+  return true;
 }
 
 // ---- Public API ----

@@ -64,6 +64,9 @@
 #define MZP_CMD_SIDESWAP 0x8E // invert ROM side-select -> physical head
 #define MZP_CMD_INTMODE 0x8F  // how ~INT is driven: 0=off 1=INTRQ 2=INTRQ|DRQ
 #define MZP_CMD_IOTRACE 0x90  // ordered register-access trace (reads + writes)
+#define MZP_CMD_FDCWRITE 0x91 // bench: WRITE SECTOR via the FDC (splice)
+#define MZP_CMD_WRDIAG 0x92   // why the last WRITE SECTOR wrote / refused
+#define MZP_CMD_WREN 0x93     // enable/disable writes from the MZ-800
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1042,6 +1045,87 @@ void gw_task() {
       cdc_write_all(g_scan_scratch + sent, chunk);
       sent += chunk;
     }
+  }
+
+  else if (cmd == MZP_CMD_FDCWRITE) {
+    // Bench (no MZ-800): seek, then splice a generated pattern into one
+    // sector's data field. cmd_buffer[2]=track [3]=sector [4]=side
+    // [5]=size code N [6]=pattern mode [7]=seed.
+    // Reply: [cmd, ACK, wrote, flags, size_lo, size_hi].
+    //
+    // The payload is generated on this side rather than shipped over USB so the
+    // test needs no bulk transfer: the probe reproduces the same three
+    // generators and compares what MZP_CMD_FDCREAD gives back. Mode 2 (LFSR)
+    // is the one that matters -- ramps and constants are easy MFM, while
+    // pseudo-random data exercises the long and short flux intervals that a
+    // marginal splice or a mistimed write-current turn-on shows up in.
+    uint8_t track = cmd_buffer[2];
+    uint8_t sector = cmd_buffer[3];
+    uint8_t side = cmd_buffer[4];
+    uint8_t size_n = cmd_buffer[5] & 7;
+    uint8_t mode = cmd_buffer[6];
+    uint8_t seed = cmd_buffer[7];
+    uint16_t n = (uint16_t)(128u << size_n);
+    if (n > sizeof(g_scan_scratch))
+      n = sizeof(g_scan_scratch);
+
+    uint16_t lfsr = (uint16_t)((seed << 8) | 0xA5);
+    for (uint16_t k = 0; k < n; ++k) {
+      if (mode == 0) {
+        g_scan_scratch[k] = (uint8_t)(seed + k);
+      } else if (mode == 1) {
+        g_scan_scratch[k] = seed;
+      } else {
+        for (int b = 0; b < 8; ++b) {
+          uint16_t bit = (uint16_t)((lfsr ^ (lfsr >> 2) ^ (lfsr >> 3) ^
+                                     (lfsr >> 5)) & 1u);
+          lfsr = (uint16_t)((lfsr >> 1) | (bit << 15));
+        }
+        g_scan_scratch[k] = (uint8_t)(lfsr & 0xFF);
+      }
+    }
+
+    uint8_t flags = 0;
+    bool wrote =
+        fdc_bench_write_sector(track, sector, side, g_scan_scratch, n, &flags);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = wrote ? 1 : 0;
+    reply_buffer[i++] = flags;
+    reply_buffer[i++] = n & 0xFF;
+    reply_buffer[i++] = (n >> 8) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_WRDIAG) {
+    // [cmd, ACK, wr_flags, wr_last_result, ids_seen(2), splice_us(4),
+    //  attempts(4), refused(4), ok(4), rnf(4), cyl_mismatch(4),
+    //  size_mismatch(4), late(4), lost_data_events(4)]
+    FdcDebug d;
+    fdc_debug_snapshot(&d);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = d.wr_flags;
+    reply_buffer[i++] = d.wr_last_result;
+    reply_buffer[i++] = (uint8_t)(d.wr_ids_seen & 0xFF);
+    reply_buffer[i++] = (uint8_t)(d.wr_ids_seen >> 8);
+    const uint32_t w32[] = {d.wr_splice_us,     d.write_attempts,
+                            d.wr_refused,       d.wr_ok,
+                            d.wr_rnf,           d.wr_cyl_mismatch,
+                            d.wr_size_mismatch, d.wr_late,
+                            d.lost_data_events};
+    for (uint32_t v : w32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_WREN) {
+    // cmd_buffer[2]: 0 = read-only, 1 = writes enabled, 2 = query only.
+    if (cmd_buffer[2] < 2)
+      fdc_set_write_enable(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_write_enable() ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
   }
 
   else if (cmd == MZP_CMD_FDCLOG) {
