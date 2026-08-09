@@ -33,20 +33,21 @@ void fdc_init(FloppyDrive *drive);
 void fdc_reg_write(uint8_t addr, uint8_t raw);
 uint8_t fdc_reg_read(uint8_t addr);
 
-// core1 (bus): sample the MZ-800 bus RESET line (GPIO29, active HIGH, idles
-// low) and, on a confirmed assertion, release ~INT and drop any command in
-// flight. Call once per pass of the listen loop, off the critical path.
+// core1 (bus): arm the MZ-800 bus RESET interrupt (GPIO29, active HIGH, idles
+// low). Call ONCE from core1's entry point, before the listen loop -- arming it
+// there is what routes the interrupt to core1 rather than core0.
 //
-// This lives on core1 because it is safety-critical and core0 is not available:
-// core0 blocks for up to ~250 ms inside a flux capture with interrupts off, so
-// a reset arriving during a read would go unnoticed until it was far too late.
-// See the commentary at fdc_bus_reset_poll() for why the line's polarity is
-// established rather than assumed.
-void fdc_bus_reset_poll(void);
+// An interrupt rather than a poll, because polling this from the listen loop
+// measurably broke the machine: that loop has ~560 ns to answer a Z80 I/O
+// cycle, and even a couple of instructions per pass made core1 late enough that
+// the MZ-800 reported "no floppy driver detected". core1 rather than core0,
+// because core0 blocks for ~250 ms at a time inside a flux capture with
+// interrupts disabled. See fdc_bus_reset_isr() for the full reasoning.
+void fdc_bus_reset_irq_init(void);
 
-// Runtime enable for the above. It runs inside core1's hard real-time loop, so
-// it must be possible to remove it from that loop without a reflash when
-// diagnosing a bus-timing problem.
+// Runtime enable for the above. Kept even though the interrupt costs nothing
+// until the line moves: this line's handling has already broken the machine
+// once, so it must be possible to neutralise it without a reflash.
 void fdc_set_reset_poll(bool on);
 bool fdc_get_reset_poll(void);
 

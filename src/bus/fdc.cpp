@@ -8,7 +8,8 @@
 #include "mfm_encode.hpp"  // mfm_encode_format_image (WRITE TRACK)
 #include "mfm_splice.hpp"  // mfm_write_sector (in-place data-field splice)
 #include "mz_bus.hpp"      // bus_diag_reset
-#include "hardware/gpio.h" // gpio_get (index-edge sync)
+#include "hardware/gpio.h" // gpio_get (index-edge sync), RESET edge IRQ
+#include "hardware/irq.h"  // IO_IRQ_BANK0 (bus RESET)
 #include "pico/time.h"     // sleep_ms
 #include <cstring>         // memcpy
 
@@ -273,11 +274,12 @@ struct FdcState {
   // which direction, and for how long. Without it "resets seen: 0" cannot be
   // told apart from a line that never moves, one that pulses the other way, or
   // a pulse shorter than the debounce.
-  volatile uint32_t rst_samples = 0;
+  volatile uint32_t rst_samples = 0; // edge interrupts taken (was: polls)
+  volatile uint32_t rst_edge_us = 0;
   volatile uint32_t rst_rise = 0;         // low -> high transitions
   volatile uint32_t rst_fall = 0;         // high -> low
   volatile uint32_t rst_high_max_us = 0;  // longest completed HIGH excursion
-  volatile uint32_t rst_low_min_us = 0;   // shortest completed LOW excursion
+  volatile uint32_t rst_low_min_us = 0;   // (unused with edge IRQs)
   volatile uint32_t rst_last_high_us = 0; // most recent completed HIGH length
 
   volatile uint32_t pos_resyncs = 0;
@@ -567,34 +569,96 @@ ALWAYS_INLINE void fdc_refresh_int_line(void) {
 // this same MZ-800 bus does `wait 1 gpio 19` and then requires the line to stay
 // high for 31 further samples before it acts. A firmware that reboots on a
 // sustained high would reboot continuously if the line idled high, so the line
-// idles LOW and RESET is asserted HIGH. (bus_init() also pulls it down, so a
-// board on the bench with nothing attached reads "not in reset".)
+// idles LOW and RESET is asserted HIGH. Measured on hardware, the pulse is
+// 65 us (`mzp_probe.py resetdiag`).
 //
-// This runs on CORE1, not core0. It is the safety-critical one: ~INT goes
-// straight to expansion pin 38 with no buffer and the Z80's INT input is level
-// sensitive, so a machine that resets while we hold ~INT low comes back up into
-// an immediate, permanent interrupt at 0x0038 with no ISR installed -- a hard
-// hang that the reset button cannot clear, because EINT is a latch in OUR state
-// and the resetting host has no way to reach it.
+// An EDGE INTERRUPT, taken on core1, and both halves of that matter.
 //
-// core0 cannot do this job. It blocks for up to ~250 ms inside a flux capture
-// with interrupts disabled, so a poll there is neither timely nor evenly
-// spaced -- and the earlier attempt debounced by counting consecutive polls,
-// which measures nothing when the gap between polls can be a microsecond or a
-// quarter of a second. core1 never blocks for more than one Z80 I/O cycle, so
-// here the debounce can be what it should be: a duration.
+// Not a poll: this was first written as one, sampled from core1's listen loop,
+// and it broke the machine outright -- "no floppy driver detected". That loop
+// has ~560 ns to answer a Z80 I/O cycle, and measured by bisection on real
+// hardware, even a couple of instructions per pass was enough to make core1
+// late for cycles. A card that misses cycles looks exactly like a card that is
+// not there. An edge interrupt costs nothing at all until the line moves, and
+// when it does move the machine is being reset and is not issuing I/O.
 //
-// 20 us, and that number is measured rather than chosen. The MZ-800's reset
-// asserts this pin HIGH for **65 us** -- one clean rising edge and one falling
-// edge, no bounce (`mzp_probe.py resetdiag`). The first attempt used 100 us,
-// which is longer than the pulse the machine actually emits, so every reset was
-// seen and then discarded as a glitch: the line read low, the event counter
-// stayed at zero, and nothing distinguished that from a pin that never moved.
-// 20 us confirms the real pulse three times over while still rejecting the
-// sub-microsecond crosstalk an unbuffered bus line can pick up. core1 polls
-// this about every 1.4 us, so 20 us is ~14 consecutive samples.
+// Not core0: it blocks for up to ~250 ms inside a flux capture with interrupts
+// disabled, so a reset arriving during a read would be serviced far too late.
+// Arming the IRQ from core1 (see core1_entry) is what routes it there.
+//
+// The debounce lives inside the handler: on a rising edge, wait out
+// FDC_RESET_CONFIRM_US and re-read. That stalls core1 for 20 us, but only on an
+// edge -- a real reset, when nothing is talking to us, or a glitch, which is
+// exactly what we want to spend 20 us rejecting.
 static constexpr uint32_t FDC_RESET_CONFIRM_US = 20;
 
+RAM_FUNC static void fdc_bus_reset_isr(void) {
+  uint32_t events = gpio_get_irq_event_mask(RESET_PIN);
+  gpio_acknowledge_irq(RESET_PIN, events);
+  if (!g_reset_poll_enabled)
+    return;
+
+  S.rst_samples++;
+  uint32_t now = time_us_32();
+  if (events & GPIO_IRQ_EDGE_FALL) {
+    S.rst_fall++;
+    S.rst_last_high_us = now - S.rst_edge_us;
+    if (S.rst_last_high_us > S.rst_high_max_us)
+      S.rst_high_max_us = S.rst_last_high_us;
+    S.rst_edge_us = now;
+    S.reset_active = false;
+  }
+  if (!(events & GPIO_IRQ_EDGE_RISE))
+    return;
+  S.rst_rise++;
+  S.rst_edge_us = now;
+
+  // Debounce by duration, in the handler. The machine holds this for 65 us.
+  busy_wait_us_32(FDC_RESET_CONFIRM_US);
+  if (!gpio_get(RESET_PIN))
+    return; // glitch, not a reset
+
+  S.reset_active = true;
+  S.reset_events++;
+  S.reset_at_ms = to_ms_since_boot(get_absolute_time());
+
+  // 1. Release the interrupt. This is the part that must happen. ~INT reaches
+  //    expansion pin 38 unbuffered and the Z80's INT input is level sensitive,
+  //    so a machine that resets while we hold it low comes back up into an
+  //    immediate, permanent interrupt at 0x0038 with no ISR installed -- and
+  //    the reset button cannot clear it, because EINT is a latch in OUR state
+  //    that the resetting host has no way to reach.
+  S.eint = false;
+  S.force_int_latched = false;
+
+  // 2. Drop everything the host was waiting on. It is gone; holding BUSY or DRQ
+  //    serves nobody, and leaving them set means the machine comes back to a
+  //    controller claiming to be mid-command.
+  S.busy = false;
+  S.drq = false;
+  S.reading = false;
+  S.read_addr = false;
+  S.multi = false;
+  S.pending_force_int = false;
+  S.pending_force_since_us = 0;
+
+  // 3. Abandon writes that have not reached the media. One already in the
+  //    splice or laying a track down finishes -- that flux is going onto the
+  //    disk in real time and cannot be recalled, exactly as on a real WD.
+  S.writing = false;
+  S.wr_armed = false;
+  if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
+    S.trk_op = 0;
+
+  // 4. WD Master Reset also loads 01 into the Sector register. It additionally
+  //    executes a RESTORE, which we deliberately do NOT do: that would drive
+  //    the head on a signal the host never asked us to act on, and every host
+  //    we know of issues its own RESTORE at startup anyway.
+  S.sector = 1;
+  S.command = 0;
+
+  fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
+}
 
 // core0-only "last applied" shadow (no volatile needed — single core).
 bool g_applied_select = false;
@@ -980,85 +1044,10 @@ void fdc_init(FloppyDrive *drive) {
 // every pass puts an XIP cache miss in that path. Doing exactly that made the
 // machine report "no floppy driver detected" -- core1 was arriving late for bus
 // cycles, which looks nothing like a reset bug and everything like a dead card.
-RAM_FUNC void fdc_bus_reset_poll(void) {
-  if (!g_reset_poll_enabled)
-    return;
-  static uint32_t high_since = 0;
-  static bool acted = false;
-  static bool was_high = false;
-  static uint32_t edge_us = 0;
-
-  bool high = gpio_get(RESET_PIN);
-  uint32_t now = time_us_32();
-
-  // Edge telemetry first, and unconditionally: this has to record what the line
-  // does even when nothing below decides to act on it. "No reset seen" is not a
-  // diagnosis on its own.
-  S.rst_samples++;
-  if (high != was_high) {
-    uint32_t held = now - edge_us;
-    if (was_high) {
-      S.rst_fall++;
-      S.rst_last_high_us = held;
-      if (held > S.rst_high_max_us)
-        S.rst_high_max_us = held;
-    } else {
-      S.rst_rise++;
-      if (S.rst_low_min_us == 0 || held < S.rst_low_min_us)
-        S.rst_low_min_us = held;
-    }
-    was_high = high;
-    edge_us = now;
-  }
-
-  if (!high) {
-    high_since = 0;
-    acted = false;
-    S.reset_active = false;
-    return;
-  }
-  if (!high_since) {
-    high_since = now ? now : 1; // 0 is the "not high" sentinel
-    return;
-  }
-  if (acted || (now - high_since) < FDC_RESET_CONFIRM_US)
-    return;
-  acted = true;
-  S.reset_active = true;
-  S.reset_events++;
-  S.reset_at_ms = to_ms_since_boot(get_absolute_time());
-
-  // 1. Release the interrupt. This is the part that must happen.
-  S.eint = false;
-  S.force_int_latched = false;
-
-  // 2. Drop everything the host was waiting on. It is gone; holding BUSY or
-  //    DRQ serves nobody, and leaving them set means the machine comes back to
-  //    a controller that claims to be mid-command.
-  S.busy = false;
-  S.drq = false;
-  S.reading = false;
-  S.read_addr = false;
-  S.multi = false;
-  S.pending_force_int = false;
-  S.pending_force_since_us = 0;
-
-  // 3. Abandon writes that have not reached the media. One already in the
-  //    splice or laying a track down finishes -- the flux is going onto the
-  //    disk in real time and cannot be recalled, exactly as on a real WD.
-  S.writing = false;
-  S.wr_armed = false;
-  if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
-    S.trk_op = 0;
-
-  // 4. WD Master Reset also loads 01 into the Sector register. It additionally
-  //    executes a RESTORE, which we deliberately do NOT do: that would drive
-  //    the head on a signal the host has not asked us to act on, and every host
-  //    we know of issues its own RESTORE on startup anyway.
-  S.sector = 1;
-  S.command = 0;
-
-  fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
+void fdc_bus_reset_irq_init(void) {
+  gpio_set_irq_enabled(RESET_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+  irq_set_exclusive_handler(IO_IRQ_BANK0, fdc_bus_reset_isr);
+  irq_set_enabled(IO_IRQ_BANK0, true);
 }
 
 // ---- core1 (bus) hot path -------------------------------------------------

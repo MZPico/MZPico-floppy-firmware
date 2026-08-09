@@ -89,7 +89,6 @@ static inline bool port_is_ours(uint8_t addr) {
 // counters -- runs AFTER the bus access, never before it.
 RAM_FUNC static void listen_loop(void) {
   while (true) {
-    bool serviced = false; // did this pass touch the bus?
     // Drain BOTH FIFOs each pass. Under a tight OUT/IN loop, handling only one
     // entry per FIFO per iteration can still accumulate backlog and eventually
     // overflow one FIFO.
@@ -100,7 +99,6 @@ RAM_FUNC static void listen_loop(void) {
         g_bus_diag.wr_backlog++;
       first = false;
       if (port_is_ours(addr)) {
-        serviced = true;
         uint8_t idx = addr - FDC_PORT_BASE;
         set_exwait();
         // Only put the data '245 on C0..C7 while the cycle is actually live.
@@ -141,7 +139,6 @@ RAM_FUNC static void listen_loop(void) {
         g_bus_diag.rd_backlog++;
       first = false;
       if (port_is_ours(addr)) {
-        serviced = true;
         uint8_t idx = addr - FDC_PORT_BASE;
         set_exwait();
         // Same guard as the write path: if the cycle is already over, driving
@@ -176,18 +173,6 @@ RAM_FUNC static void listen_loop(void) {
       g_bus_hello.addr_high |= addr;
     }
 
-    // Bus RESET. Sampled here because core1 is the only thing that is always
-    // running: core0 spends up to ~250 ms at a time inside a flux capture with
-    // interrupts disabled.
-    //
-    // Only on a pass that did NOT service a bus cycle. This loop has ~560 ns to
-    // answer the Z80, and anything it does between cycles is time it might not
-    // have; skipping the poll whenever the machine is actively talking to us
-    // keeps it strictly out of that path. Nothing is lost -- the machine is not
-    // issuing I/O while it is being held in reset, and the pulse is 65 us
-    // against a poll interval of about 1.4 us.
-    if (!serviced)
-      fdc_bus_reset_poll();
   }
 }
 
@@ -209,7 +194,20 @@ void bus_diag_reset(void) {
   g_bus_diag.rd_backlog = 0;
 }
 
-static void core1_entry(void) { listen_loop(); }
+static void core1_entry(void) {
+  // Arm the bus-RESET interrupt from CORE1, so it is delivered here rather than
+  // on core0 -- core0 spends up to ~250 ms at a time inside a flux capture with
+  // interrupts disabled and would service it far too late.
+  //
+  // An interrupt, not a poll. Polling this line from the listen loop cost bus
+  // cycles: the loop has ~560 ns to answer a Z80 I/O cycle, and measured on
+  // hardware, even a couple of instructions per pass was enough to make the
+  // machine report "no floppy driver detected". An edge interrupt costs
+  // *nothing* until the line actually moves, and when it does move the machine
+  // is being reset and is not issuing I/O anyway.
+  fdc_bus_reset_irq_init();
+  listen_loop();
+}
 
 // Bench pin-READ test: sample the live C0..C7 inputs (bit0 = GPIO0 = C0).
 uint8_t bus_read_pins(bool isolate) {
