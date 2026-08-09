@@ -143,13 +143,19 @@ BUSY-polling covers latency instead, per the ROM driver).
       hold EINT cleared forever and silently kill interrupts for CP/M 4.1.
       `firstfail` now prints the live level so the assumption is checkable on a
       running machine rather than trusted.
-    - **On core1, because core0 cannot do it.** core0 blocks for up to ~250 ms
-      inside a flux capture with interrupts disabled, so a reset arriving
-      during a read would go unnoticed until far too late. The earlier attempt
-      also debounced by counting consecutive polls, which measures nothing when
-      the interval between them ranges from a microsecond to a quarter second;
-      core1 never blocks for more than one Z80 I/O cycle, so the debounce is
-      now a duration.
+    - **An edge interrupt on core1 — never a poll.** core0 cannot do the job
+      (it blocks for ~250 ms inside a flux capture with interrupts disabled),
+      but polling from core1's listen loop **breaks the machine**: that loop
+      has ~560 ns to answer a Z80 I/O cycle, and bisected on hardware, even a
+      couple of instructions per pass made core1 late enough that the MZ-800
+      reported "no floppy driver detected". Marking the poll `RAM_FUNC` and
+      skipping it on passes that serviced a cycle reduced the cost but did not
+      remove it. So the line is taken as a GPIO edge interrupt, armed from
+      core1's entry point so it is delivered there: zero cost until the line
+      moves, and when it moves the machine is being reset and is not issuing
+      I/O. The reference firmware reaches the same place with a dedicated PIO
+      state machine raising an IRQ. The 20 µs debounce lives in the handler —
+      on a rising edge, wait it out and re-read.
     - **The MZ-800's reset pulse on this pin is 65 µs** (measured with
       `mzp_probe.py resetdiag`: one rising edge, one falling, no bounce). The
       debounce is 20 µs. The first attempt used 100 µs — longer than the pulse

@@ -176,6 +176,27 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   track compare from a detector into a repair — which matters much more now
   that a mispositioned head can destroy data rather than just garble a read.
 
+## Hard-won rules
+
+- **Nothing goes in core1's listen loop.** Not a flash-resident call, not a
+  poll, not two instructions. It has ~560 ns to answer a Z80 I/O cycle, and
+  anything added per-pass makes core1 late — at which point the MZ-800 reports
+  **"no floppy driver detected"**, which is indistinguishable from dead
+  hardware and costs a session to diagnose. Bus RESET had to become an edge
+  interrupt for exactly this reason. Anything that must watch a line either
+  interrupts, or lives in PIO.
+- **Bisect before theorising.** When a known-good build exists and a new one
+  fails, build the midpoint and flash it. Reasoning from indirect evidence lost
+  most of a session here, through four wrong hypotheses, while two flashes
+  settled it. `build/known-good/` holds the uf2s from that bisect.
+- **Run `busdump` first when a working build breaks.** Its per-line bit
+  activity catches the recurring data-bus contact fault in one command, with
+  the machine just sitting at a failed boot. Note the summary only sees bytes
+  the ROM actually wrote, so a line reported "stuck" may simply never have
+  needed to be 1 — check the union of the observed `last_raw_write` values
+  before believing it. (ADDRESS bits 6/7 always read stuck high: every port we
+  own, 0xD8–0xDF, has both set.)
+
 ## Conventions (inherited from the reference firmware)
 
 - Pico-SDK, CMake, C11 / C++17. RP2040 (consider RP2350). Overclock (~180 MHz).
