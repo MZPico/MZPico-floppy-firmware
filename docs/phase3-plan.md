@@ -327,10 +327,75 @@ BUSY-polling covers latency instead, per the ROM driver).
       the write-channel commands for a sync mark and an ID address mark; a
       stream without them cannot be a format, and writing it would destroy the
       track just as thoroughly as a real one would.
-  - **Still to do:** drive-select via `~DS0`/`~DS1` and real multi-drive. Left
-    alone deliberately: it needs per-drive head positions, and with one drive
-    attached there is no way to test that a second select line does not simply
-    deselect the working drive.
+  - **Multi-drive via `~DS0`/`~DS1`. ✅ Implemented; UNTESTED against a second
+    drive.** Two `FloppyDrive` instances share every pin but `~DSn`, so the
+    per-drive state the class already holds — the head position and the TRK00
+    cross-check built on it — becomes per drive for free. Port 0xDC's drive
+    field picks between them; units 2/3, which this board has no select line
+    for, report **NOT READY** and actuate nothing rather than silently
+    answering for drive 0.
+    - **Only `~DSn` is per-drive.** `~HDSEL` and `~MOTOR_ON` are one wire each
+      reaching every drive (on J3 the board drives MOTOR onto pins 10 *and*
+      16), so the incoming instance's beliefs about them describe pins it does
+      not own. `adopt_shared_lines()` hands that state over on each select.
+      Without it, `side(0)` on a drive that already believes it is on side 0
+      short-circuits while the line sits where the *previous* drive left it —
+      a read off the wrong surface with every status bit clean.
+      `_is_index_seen` is deliberately not adopted: the motor line is shared,
+      the spindles are not.
+    - **A select can drop a queued Type I.** core1 folds a step into
+      `head_target[drive_sel]` immediately; core0 may still be running the
+      previous drive, so it executes that seek against the *old* drive's
+      target — a no-op — and marks `op_done`, consuming the request. The new
+      drive's head would never move while the Track register reported success.
+      A select therefore catches the incoming head up to its own target, for
+      any drive whose position is already known.
+    - **The size cache is per drive**, because its whole job is to know a
+      sector's length before the host's first byte arrives, and two drives can
+      hold different formats at the same cylinder number (a 16×256 boot track
+      against a 9×512 data track). One shared table would carry drive 0's
+      geometry onto drive 1 and the splice-time size compare would refuse every
+      write to it.
+    - **`~WPT`/`~TRK00` are refreshed on every select**, not only when the head
+      moves — they are shared lines gated by drive select, and a stale clear
+      write-protect bit from drive 0 is what would let a WRITE SECTOR reach a
+      protected disk in drive 1.
+    - Selects are applied only between operations: mid-read or mid-splice they
+      would move the flux path to another spindle inside a sector.
+    - Bench: `mzp_probe.py PORT drive [0|1]` points the whole bench path
+      (`fdcread`/`fdcwrite`/`scan`/`fdcformat`/`wrverify`/`fmtverify`) at a
+      unit. `mzp_probe.py PORT drvlock 1` pins everything to drive 0 and
+      ignores port 0xDC — the escape hatch, for the same reason the seek
+      self-correction and host formatting have theirs: if some host writes a
+      nonzero drive field we did not expect, multi-drive turns a machine that
+      boots into one selecting a drive that is not on the cable.
+    - **The motor line is not gated by drive select, and cannot be.** J3 drives
+      `~MOTOR_ON` onto floppy pins 10 *and* 16, so it reaches every drive on the
+      cable: selecting an absent drive still spins the present one. Confirmed on
+      hardware (selecting drive 1 with nothing on `~DS1` spun drive 0). One
+      spindle cannot be run without the other.
+    - **An absent or empty unit reports NOT READY**, from the index sighting
+      `spin_motor()` already returns and the code previously discarded. Index is
+      the only evidence the interface offers that a drive is there with a disk
+      in it; without this, selecting an empty unit left STATUS reporting a
+      perfectly ready drive that RNF'd every sector forever, after ~1.3 s per
+      attempt in the index wait. The flag starts *true* and is cleared only by
+      an observed timeout, re-evaluated per spin-up rather than latched — this
+      bit reaches the boot ROM, so a spuriously-set NOT READY on drive 0 would
+      stop the machine booting.
+    - **Single-drive bench result (hardware):** with one drive on `~DS0`,
+      `drive 1` + `fdcread` returns RNF with **0 flux transitions** and `scan`
+      finds nothing, while `drive 0` + `fdcread` returns a CRC-clean 512-byte
+      sector; the `drive` query shows exactly one select line asserted each
+      time. That is the check that mattered — it proves the two select lines are
+      independent and that asserting `~DS1` does not deselect the working drive.
+      (The `drive` query reports the *previous* select until the next actuating
+      command runs; the select is applied lazily by core0.)
+    - **What has NOT been shown:** anything with two drives physically
+      attached. Every claim above is a design property, not a measurement. The
+      first test is a bench one on a single drive — `drive 1` must fail to find
+      the disk that `drive 0` finds — because that alone proves the select
+      lines are independent and that neither one deselects the working drive.
 - **3.5 — Robustness.** Error/retry paths, edge-case timing, soak testing.
   - **Write precomp: not needed so far.** `wrsoak` verified 200/200 writes over
     tracks 0–76 (both sides, 5 passes, pseudo-random patterns), covering the

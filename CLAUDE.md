@@ -280,8 +280,25 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     decode correctly; one cosmetic quirk remains (data-field sync runs print as
     five 0xA1s rather than three) and is deliberately left.
     Density→DENSEL is closed as "not to be done" (the ROM never writes the
-    port, so its polarity is unknowable and nothing needs it); drive-select via
-    `~DS0/DS1` + multi-drive is deliberately left, needing per-drive head
-    positions and a second drive to test against.
+    port, so its polarity is unknowable and nothing needs it).
+  - **Multi-drive (`~DS0`/`~DS1`): implemented, untested on two drives.** Two
+    `FloppyDrive` instances sharing every pin but `~DSn`, selected by port
+    0xDC's drive field; per-drive head position, head target and sector-size
+    cache; shared-line handover on each select (`~HDSEL`/`~MOTOR_ON` are one
+    wire each, so the incoming drive's beliefs about them are stale by
+    definition). Units 2/3 report NOT READY. Bench: `mzp_probe.py drive [0|1]`,
+    escape hatch `drvlock 1`. An absent/empty unit reports NOT READY (from the
+    index sighting, which was previously discarded). **Verified single-drive on
+    hardware:** `drive 1` RNFs with 0 flux while `drive 0` reads clean, one
+    select line asserted at a time. Nothing here has met a *second* drive — see
+    [docs/phase3-plan.md](docs/phase3-plan.md).
+    - `~MOTOR_ON` reaches every drive on the cable (J3 wires it to floppy pins
+      10 *and* 16), so it is **not** gated by drive select: selecting an absent
+      drive still spins the present one. Not a bug — one spindle cannot be run
+      without the other on this board.
+    - **Bench commands must go through `fdc_bench_drive()`.** `scan`/`streamscan`
+      originally used the greaseweazle drive object, hardwired to `~DS0`, so
+      `drive 1; scan` silently read drive 0 — and `fmtverify` would have
+      formatted one disk and verified another.
 - **Phase 4 (robustness):** write-precomp if needed, multi-drive, error handling,
   soak testing.
