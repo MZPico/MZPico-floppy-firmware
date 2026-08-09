@@ -237,6 +237,7 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
   // until the first byte that is not one -- which is the address mark, the
   // thing the caller is actually looking for.
   bool eat_a1 = false;
+  unsigned since_fire = 4; // bytes decoded since the last mark (starts "far")
 
   while (!mfm_io_eof(&io) && n < out_size) {
     mfm_io_symbol_t s = mfm_io_read_symbol(&io);
@@ -245,13 +246,22 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
     if (mark == mfm_io_triple_mark_magic) {
       // Three 0xA1s with missing clock bits just went past. They are really on
       // the disk, so emit all three -- and more importantly, take the phase.
-      for (int k = 0; k < 3 && n < out_size; ++k)
-        out[n++] = 0xA1;
+      // One run of 0xA1s can match more than once: the window slides by one
+      // symbol at a time and the three sync bytes are identical, so a match at
+      // the second 0xA1 is followed by another at the third. Emitting on each
+      // reported five sync bytes where the disk has three. A second match
+      // within a few bytes is therefore the SAME run -- take its (better)
+      // phase, but do not announce it again.
+      if (since_fire >= 4) {
+        for (int k = 0; k < 3 && n < out_size; ++k)
+          out[n++] = 0xA1;
+      }
+      since_fire = 0;
       tmp = 0;
       weight = 0x8000;
       resync = true;
       eat_a1 = true; // see below
-      mark = 0;      // require a full fresh pattern before firing again
+      mark = 0;      // require a full fresh pattern before matching again
       continue;
     }
 
@@ -296,6 +306,8 @@ size_t mfm_read_track_raw(const uint8_t *flux, size_t n_flux,
       uint8_t b = (uint8_t)(tmp >> 8);
       tmp <<= 8;
       weight <<= 8;
+      if (since_fire < 0xFFFF)
+        since_fire++;
       if (eat_a1) {
         if (b == 0xA1)
           continue; // a sync byte already reported at the mark
