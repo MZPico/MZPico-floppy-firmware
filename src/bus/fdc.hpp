@@ -48,6 +48,16 @@ uint8_t fdc_get_drive(void);
 FloppyDrive *fdc_bench_drive(void);
 void fdc_bench_release(void);
 
+// Per-drive state for ALL units at once, selected or not. fdcdump only ever
+// shows the drive that happens to be selected, which makes the property this
+// whole subsystem rests on -- that two drives keep their head positions apart
+// across selects -- invisible from outside. Returns false for a unit index this
+// board has no select line for. `track` is the drive's own position belief
+// (-1 = unknown), `target` the head target core1 folds Type I steps into.
+// flags: b0 ready (index seen on the last spin-up), b1 ever spun up,
+//        b2 currently selected.
+bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags);
+
 // core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back
 // onto the bus (inversion already applied for 0xD8..0xDB).

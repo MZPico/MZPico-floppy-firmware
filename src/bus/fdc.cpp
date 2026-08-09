@@ -2295,6 +2295,26 @@ void fdc_bench_release(void) {
   g_applied_select = false;
 }
 
+bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags) {
+  if (unit < 0 || unit >= g_ndrives || !g_drives[unit])
+    return false;
+  if (track)
+    *track = g_drives[unit]->track();
+  if (target)
+    *target = (int)S.head_target[unit];
+  if (flags) {
+    uint8_t f = 0;
+    if (g_ready[unit])
+      f |= 0x01;
+    if (g_spun[unit])
+      f |= 0x02;
+    if (unit == g_cur_drive && g_applied_select)
+      f |= 0x04;
+    *flags = f;
+  }
+  return true;
+}
+
 void fdc_set_drive_lock(bool on) { g_drive_lock = on; }
 bool fdc_get_drive_lock(void) { return g_drive_lock; }
 void fdc_set_drive(uint8_t unit) { S.drive_sel = (uint8_t)(unit & 0x03); }

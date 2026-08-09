@@ -76,6 +76,7 @@
 #define MZP_CMD_FMTEN 0x9A     // enable/disable host-initiated WRITE TRACK
 #define MZP_CMD_DRVSEL 0x9B    // bench: which unit (~DS0/~DS1) the FDC drives
 #define MZP_CMD_DRVLOCK 0x9C   // pin every access to drive 0 (escape hatch)
+#define MZP_CMD_DRVSTAT 0x9D   // per-drive state for ALL units at once
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1229,6 +1230,27 @@ void gw_task() {
     // its select input) -- and those want completely different fixes.
     reply_buffer[i++] = (uint8_t)(gpio_get(PIN_DS0) ? 1 : 0);
     reply_buffer[i++] = (uint8_t)(gpio_get(PIN_DS1) ? 1 : 0);
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_DRVSTAT) {
+    // [cmd, ACK, cur_unit, ds0, ds1, then per unit: track, target, flags]
+    // Unselected units included: the property multi-drive rests on is that two
+    // heads stay in DIFFERENT places across selects, and fdcdump can only ever
+    // see the selected one.
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_drive();
+    reply_buffer[i++] = (uint8_t)(gpio_get(PIN_DS0) ? 1 : 0);
+    reply_buffer[i++] = (uint8_t)(gpio_get(PIN_DS1) ? 1 : 0);
+    for (int u = 0; u < 2; ++u) {
+      int trk = -1, tgt = 0;
+      uint8_t fl = 0;
+      if (!fdc_drive_state(u, &trk, &tgt, &fl))
+        trk = -1;
+      reply_buffer[i++] = (trk < 0) ? 0xFF : (uint8_t)trk; // 0xFF = unknown
+      reply_buffer[i++] = (uint8_t)tgt;
+      reply_buffer[i++] = fl;
+    }
     cdc_write_all(reply_buffer, i);
   }
 

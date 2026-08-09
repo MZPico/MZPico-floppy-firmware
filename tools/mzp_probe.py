@@ -30,6 +30,7 @@ Usage:
     python mzp_probe.py PORT fmten [0|1]                  # allow WRITE TRACK from the MZ-800 (default OFF)
     python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
     python mzp_probe.py PORT drvlock [0|1]                # pin every access to drive 0, ignoring port 0xDC (no arg = query)
+    python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -104,6 +105,7 @@ MZP_CMD_POSFIX = 0x99
 MZP_CMD_FMTEN = 0x9A
 MZP_CMD_DRVSEL = 0x9B
 MZP_CMD_DRVLOCK = 0x9C
+MZP_CMD_DRVSTAT = 0x9D
 
 
 REG_NAMES = {0xD8: "CMD/STATUS", 0xD9: "TRACK", 0xDA: "SECTOR", 0xDB: "DATA",
@@ -1300,6 +1302,25 @@ def main():
                     print("  note: neither line asserted (nothing has selected yet this session).")
                 if unit > 1:
                     print("  STATUS reports NOT READY and nothing is actuated.")
+        elif cmd == "drvstat":
+            s.write(bytes([MZP_CMD_DRVSTAT, 2]))
+            s.flush()
+            r = read_exact(s, 11)
+            if len(r) == 11:
+                print("selected unit %d   ~DS0=%d %s   ~DS1=%d %s"
+                      % (r[2], r[3], "ASSERTED" if r[3] == 0 else "released",
+                         r[4], "ASSERTED" if r[4] == 0 else "released"))
+                print("  unit  head  target  ready  spun  selected")
+                for u in range(2):
+                    trk, tgt, fl = r[5 + u * 3], r[6 + u * 3], r[7 + u * 3]
+                    print("   %d    %5s  %6d  %5s  %4s  %s"
+                          % (u, "?" if trk == 0xFF else trk, tgt,
+                             "yes" if fl & 1 else "NO",
+                             "yes" if fl & 2 else "no",
+                             "yes" if fl & 4 else ""))
+                h0, h1 = r[5], r[8]
+                if h0 != 0xFF and h1 != 0xFF and h0 == h1:
+                    print("  (both heads on the same cylinder -- park them apart to test independence)")
         elif cmd == "drvlock":
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
             s.write(bytes([MZP_CMD_DRVLOCK, 3, val & 0xFF]))
