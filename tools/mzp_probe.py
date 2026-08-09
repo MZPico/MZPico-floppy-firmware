@@ -328,7 +328,12 @@ def decode_cmd(c):
 
 
 STATUS_BITS_T1 = ["B", "-", "T00", "CRC", "Seek", "HL", "WP", "NRdy"]
-STATUS_BITS_T2 = ["B", "DRQ", "Lost", "CRC", "RNF", "Del", "-", "NRdy"]
+# b6 in the Type II/III layout is WRITE PROTECT on write commands (WD179x);
+# it reads 0 on reads, so labelling it is safe and never wrong. Left as "-" it
+# hid the decisive bit: a host WRITE TRACK refused for write-protect polls
+# STATUS forever on 0x40, and the trace rendered that as "[]" -- no reason
+# visible for a hang whose reason was sitting in the byte.
+STATUS_BITS_T2 = ["B", "DRQ", "Lost", "CRC", "RNF", "Del", "WP", "NRdy"]
 
 
 def fdc_line(r):
