@@ -555,7 +555,17 @@ ALWAYS_INLINE void fdc_refresh_int_line(void) {
 // which measures nothing when the gap between polls can be a microsecond or a
 // quarter of a second. core1 never blocks for more than one Z80 I/O cycle, so
 // here the debounce can be what it should be: a duration.
-static constexpr uint32_t FDC_RESET_CONFIRM_US = 100;
+//
+// 20 us, and that number is measured rather than chosen. The MZ-800's reset
+// asserts this pin HIGH for **65 us** -- one clean rising edge and one falling
+// edge, no bounce (`mzp_probe.py resetdiag`). The first attempt used 100 us,
+// which is longer than the pulse the machine actually emits, so every reset was
+// seen and then discarded as a glitch: the line read low, the event counter
+// stayed at zero, and nothing distinguished that from a pin that never moved.
+// 20 us confirms the real pulse three times over while still rejecting the
+// sub-microsecond crosstalk an unbuffered bus line can pick up. core1 polls
+// this about every 1.4 us, so 20 us is ~14 consecutive samples.
+static constexpr uint32_t FDC_RESET_CONFIRM_US = 20;
 
 
 // core0-only "last applied" shadow (no volatile needed — single core).

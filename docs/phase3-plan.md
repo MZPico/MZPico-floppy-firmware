@@ -149,7 +149,15 @@ BUSY-polling covers latency instead, per the ROM driver).
       also debounced by counting consecutive polls, which measures nothing when
       the interval between them ranges from a microsecond to a quarter second;
       core1 never blocks for more than one Z80 I/O cycle, so the debounce is
-      now a duration (100 µs).
+      now a duration.
+    - **The MZ-800's reset pulse on this pin is 65 µs** (measured with
+      `mzp_probe.py resetdiag`: one rising edge, one falling, no bounce). The
+      debounce is 20 µs. The first attempt used 100 µs — longer than the pulse
+      the machine emits — so every reset was seen and then discarded as a
+      glitch, and the symptom was indistinguishable from a pin that never
+      moves. That is why `resetdiag` records raw edges and pulse lengths with
+      no polarity assumption: the event counter alone cannot tell "never
+      moved" from "pulsed the other way" from "too short to confirm".
     - **What it does:** releases `~INT` and disarms EINT (the part that must
       happen — a machine that resets while we hold `~INT` low returns to a
       permanent interrupt at 0x0038 with no ISR, which the reset button cannot
