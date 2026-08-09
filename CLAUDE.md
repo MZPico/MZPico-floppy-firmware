@@ -148,16 +148,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   yet drive floppy pin 2 or pick the bit time. Deferred: MZ-800 media is DD.
 - **`~EXWAIT` budget** for putting a byte on the shared C0..C7 bus in time on a
   register access.
-- **Write soak + inner tracks.** WRITE SECTOR is verified (3.3) but only over
-  tens of writes on outer tracks. Still open: whether inner tracks need
-  write-precomp, and whether the +2-byte splice bias holds across drives and
-  media with more spindle-speed spread. First soak run: **95/95 writes verified
-  byte-for-byte** over tracks 0–36 (step 4), both sides, 5 passes, with no
-  clustering on high track numbers — so no evidence so far that inner tracks
-  need precomp. The five "failures" in that run were the size compare correctly
-  refusing to write 512 bytes into the boot track's 256-byte sectors;
-  `mzp_probe.py PORT wrsoak` now reads each track's geometry first and writes
-  what is actually there. Longer soaks and a second drive are still worth doing.
+- **Write-precomp: no longer suspected.** `mzp_probe.py PORT wrsoak` ran
+  **200/200 writes verified byte-for-byte** over tracks 0–76 (step 4), both
+  sides, 5 passes — including the innermost tracks, where flux density is
+  highest and precomp would show up first, and the 16×256 boot track, which is
+  the only 256-byte geometry we have. Zero failures, no clustering. Precomp
+  stays unimplemented until a drive or media actually misbehaves. What is still
+  worth doing: a long soak (hours, not minutes) and a second drive/disk, since
+  the +2-byte splice bias has only met one spindle.
 - **Rare `FD:Loading error` on boot** (~1 in 20; everything else reads clean).
   The **first-failure latch** it needed now exists (`mzp_probe.py firstfail`):
   it holds the first RNF/CRC/wrong-cylinder/Verify failure since power-up in

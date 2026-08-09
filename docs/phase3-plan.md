@@ -207,8 +207,22 @@ BUSY-polling covers latency instead, per the ROM driver).
   - **Still to do:** READ TRACK, WRITE TRACK (format), density applied to
     `~DEN_RDY` (decoded already — see wd-fidelity.md), drive-select via
     `~DS0/DS1`.
-- **3.5 — Robustness.** Error/retry paths, write precomp if inner tracks are
-  marginal, edge-case timing, soak testing.
+- **3.5 — Robustness.** Error/retry paths, edge-case timing, soak testing.
+  - **Write precomp: not needed so far.** `wrsoak` verified 200/200 writes over
+    tracks 0–76 (both sides, 5 passes, pseudo-random patterns), covering the
+    innermost tracks where precomp would show up first and the 16×256 boot
+    track. Left unimplemented deliberately — it is a fix for a problem this
+    hardware has not exhibited.
+  - **Head position is self-correcting** (see `fdc_resync_head`): a wrong
+    cylinder byte in an ID field is adopted as the truth and the head driven
+    back to target, so a lost step no longer persists. `firstfail` counts it as
+    `pos_resyncs`; that counter climbing while everything appears to work is
+    itself the signal that steps are being dropped.
+  - **First-failure latch** (`mzp_probe.py firstfail`) holds the first
+    RNF/CRC/wrong-cylinder/Verify failure since power-up, with the whole
+    position chain sampled at that instant. Built for the ~1-in-20 boot-time
+    `FD:Loading error`, which a host retry otherwise erases before anyone can
+    look. **Still needs to catch one.**
 
 ## Primary risks / unknowns
 
