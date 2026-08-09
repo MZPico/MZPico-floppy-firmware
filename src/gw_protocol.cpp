@@ -1327,11 +1327,20 @@ void gw_task() {
                             d.wr_refused,       d.wr_ok,
                             d.wr_rnf,           d.wr_cyl_mismatch,
                             d.wr_size_mismatch, d.wr_late,
-                            d.lost_data_events};
+                            d.lost_data_events,  d.wr_abandoned};
     for (uint32_t v : w32) {
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
     }
+    // ...and where the last abandoned write stopped: want vs got is the
+    // diagnosis in two numbers.
+    reply_buffer[i++] = (uint8_t)(d.wr_ab_want & 0xFF);
+    reply_buffer[i++] = (uint8_t)(d.wr_ab_want >> 8);
+    reply_buffer[i++] = (uint8_t)(d.wr_ab_got & 0xFF);
+    reply_buffer[i++] = (uint8_t)(d.wr_ab_got >> 8);
+    reply_buffer[i++] = d.wr_ab_track;
+    reply_buffer[i++] = d.wr_ab_side;
+    reply_buffer[i++] = d.wr_ab_sector;
     cdc_write_all(reply_buffer, i);
   }
 

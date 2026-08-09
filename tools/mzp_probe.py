@@ -816,15 +816,18 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 41)
-    if len(r) < 41 or r[1] != 0:
+    r = read_exact(s, 53)
+    if len(r) < 53 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
     ids_seen = r[4] | (r[5] << 8)
-    vals = [int.from_bytes(r[6 + 4 * k:10 + 4 * k], "little") for k in range(9)]
+    vals = [int.from_bytes(r[6 + 4 * k:10 + 4 * k], "little") for k in range(10)]
     (splice_us, attempts, refused, ok, rnf, cyl_mm, size_mm, late,
-     lost) = vals
+     lost, abandoned) = vals
+    ab_want = r[46] | (r[47] << 8)
+    ab_got = r[48] | (r[49] << 8)
+    ab_track, ab_side, ab_sector = r[50], r[51], r[52]
     print("WRITE SECTOR state:")
     print(f"  writing={bool(wr_flags & 1)} buffer_full={bool(wr_flags & 2)} "
           f"writes_enabled={bool(wr_flags & 4)} "
@@ -838,6 +841,14 @@ def do_wrdiag(s):
     print(f"  RNF={rnf}  of which wrong-cylinder={cyl_mm} wrong-size={size_mm} "
           f"too-late={late}")
     print(f"  LOST DATA (host stopped feeding mid-sector)={lost}")
+    print(f"  abandoned (ended before the buffer filled)={abandoned}")
+    if abandoned:
+        print(f"    last: wanted {ab_want} bytes, host sent {ab_got} "
+              f"(track {ab_track} side {ab_side} sector {ab_sector})")
+        if ab_got and ab_want != ab_got:
+            print("    ! want != got means the sector SIZE assumed for that "
+                  "cylinder+side is wrong, so the buffer never filled and no "
+                  "splice ran -- nothing was written and nothing else counted it")
     if cyl_mm:
         print("  ! wrong-cylinder aborts mean the head was not where the host "
               "believed -- see `rddiag` for the position chain")

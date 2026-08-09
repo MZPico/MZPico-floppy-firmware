@@ -203,6 +203,18 @@ struct FdcState {
   volatile uint32_t wr_cyl_mismatch = 0;  // found it, on the wrong cylinder
   volatile uint32_t wr_size_mismatch = 0; // found it, wrong recorded size
   volatile uint32_t wr_late = 0;          // ID decoded too late for its Gap 2
+  // A WRITE SECTOR that ended before its buffer filled. None of the counters
+  // above can describe it: the splice never ran, so there is no RNF, no
+  // too-late, no LOST DATA -- and it therefore left no trace at all. wrdiag
+  // read "commands=24 written=1" with every error counter zero, which is the
+  // worst possible report for 23 writes that did not happen, because the host's
+  // copy of the disk diverges from the disk with nothing to point at.
+  volatile uint32_t wr_abandoned = 0;
+  volatile uint16_t wr_ab_want = 0; // bytes we were waiting for
+  volatile uint16_t wr_ab_got = 0;  // ...and how many the host actually sent
+  volatile uint8_t wr_ab_sector = 0;
+  volatile uint8_t wr_ab_track = 0;
+  volatile uint8_t wr_ab_side = 0;
   volatile uint32_t wr_splice_us = 0;     // last splice: search time
   volatile uint16_t wr_ids_seen = 0;      // last splice: ID fields decoded
   volatile uint8_t wr_last_result = 0;    // b0 wrote b1 id_found b2 cyl_mismatch
@@ -450,7 +462,14 @@ int g_cur_drive = -1;
 // MZ-800 CP/M disk's 16x256 boot track against another disk's 9x512 at the same
 // cylinder number. Sharing one table would carry drive 0's geometry onto drive
 // 1, and the size compare at splice time would refuse every write to it.
-volatile uint8_t g_size_code[FDC_DRIVE_MAX][FDC_SIZE_CACHE_N];
+// Keyed by SIDE as well as cylinder: an MZ-800 CP/M master disk carries its
+// 16x256 boot track on cyl 0 / side 1 while every data track is 9x512, so one
+// slot per cylinder cannot describe cylinder 0 at all. Keyed by cylinder alone,
+// writing that boot track waited for 512 bytes while the host fed 256: the
+// buffer never filled, the splice never ran, and -- because an unfilled write
+// is not any of the failures we count -- it reported nothing. That is what made
+// copydisk fail on its logical track 1, which is precisely cyl 0 / side 1.
+volatile uint8_t g_size_code[FDC_DRIVE_MAX][2][FDC_SIZE_CACHE_N];
 
 // Index for the tables above. S.drive_sel is 2 bits but only 0/1 exist; a
 // nonexistent unit reports NOT READY and never actuates anything, so it needs
@@ -472,8 +491,9 @@ ALWAYS_INLINE int fdc_cur_idx(void) {
 
 ALWAYS_INLINE uint16_t fdc_sector_size_for(uint8_t trk) {
   int d = fdc_drive_idx();
+  int h = S.side1 ? 1 : 0;
   uint8_t n =
-      (trk < FDC_SIZE_CACHE_N) ? g_size_code[d][trk] : FDC_SIZE_CODE_DEFAULT;
+      (trk < FDC_SIZE_CACHE_N) ? g_size_code[d][h][trk] : FDC_SIZE_CODE_DEFAULT;
   return (uint16_t)(128u << (n & 7));
 }
 
@@ -481,7 +501,7 @@ ALWAYS_INLINE uint16_t fdc_sector_size_for(uint8_t trk) {
 // every decoded ID (read, READ ADDRESS and splice alike).
 inline void fdc_note_size_code(uint8_t trk, uint8_t n) {
   if (trk < FDC_SIZE_CACHE_N)
-    g_size_code[fdc_cur_idx()][trk] = (uint8_t)(n & 7);
+    g_size_code[fdc_cur_idx()][S.side1 ? 1 : 0][trk] = (uint8_t)(n & 7);
 }
 
 } // namespace
@@ -737,6 +757,23 @@ bool g_ready[FDC_DRIVE_MAX] = {true, true};
 // self-correction and host formatting have theirs: it must be possible to rule
 // this subsystem out without a reflash.
 bool g_drive_lock = false;
+
+// Record a WRITE SECTOR that is ending before its buffer filled. Call BEFORE
+// clearing S.writing, at every path that abandons a write: Force Interrupt, a
+// new command landing on top, bus RESET. `want` vs `got` is the diagnosis in
+// two numbers -- a host feeding 256 bytes into a 512-byte expectation says the
+// sector size we assumed for that cylinder AND SIDE is wrong, which is exactly
+// how an MZ-800 master disk's 16x256 boot track on cyl 0 / side 1 presents.
+ALWAYS_INLINE void fdc_note_write_abandoned(void) {
+  if (!S.writing || S.wr_armed)
+    return; // never started, or already handed to core0 -- not abandoned
+  S.wr_abandoned++;
+  S.wr_ab_want = S.xfer_len;
+  S.wr_ab_got = S.xfer_pos;
+  S.wr_ab_sector = S.wr_sector;
+  S.wr_ab_track = S.track;
+  S.wr_ab_side = S.side1 ? 1 : 0;
+}
 
 
 // core0-only decode scratch (one sector) + streaming-capture state.
@@ -1237,8 +1274,9 @@ void fdc_init(FloppyDrive *const *drives, int n) {
   DRV = nullptr;
   g_cur_drive = -1;
   for (int d = 0; d < FDC_DRIVE_MAX; ++d)
-    for (int i = 0; i < FDC_SIZE_CACHE_N; ++i)
-      g_size_code[d][i] = FDC_SIZE_CODE_DEFAULT;
+    for (int h = 0; h < 2; ++h)
+      for (int i = 0; i < FDC_SIZE_CACHE_N; ++i)
+        g_size_code[d][h][i] = FDC_SIZE_CODE_DEFAULT;
 }
 
 // RAM_FUNC is not optional here. listen_loop() is RAM_FUNC because it has ~560
@@ -1281,6 +1319,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // buffer collected for one cylinder must never be spliced onto another;
       // the size cache is per-cylinder too. (A read in flight is deliberately
       // left alone -- see the Force Interrupt notes on queued Type I commands.)
+      fdc_note_write_abandoned();
       S.writing = false;
       S.wr_armed = false;
       if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
@@ -1367,6 +1406,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // real time and there is no more stopping it than there is on a real
         // WD. core0 sees `writing` clear when it comes back and publishes
         // nothing further.
+        fdc_note_write_abandoned();
         S.writing = false;
         S.wr_armed = false;
         // A WRITE TRACK image collected but not yet laid down is dropped; one
@@ -1409,6 +1449,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // Without this a READ arriving on top of a half-collected write leaves
       // both `reading` and `writing` set, and core0 -- which checks writing
       // first -- would splice a stale buffer instead of serving the read.
+      fdc_note_write_abandoned();
       S.writing = false;
       S.wr_armed = false;
       if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
@@ -1482,6 +1523,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       S.type2 = true;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.err_write_protect = false; // cleared by the next Type II/III command
+      fdc_note_write_abandoned();
       S.writing = false;
       S.wr_armed = false;
       S.reading = true;
@@ -1507,6 +1549,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // ---- Type III READ TRACK (0xEX) / WRITE TRACK (0xFX) ----
       S.type2 = true; // both report in the Type II status layout
       S.reading = false;
+      fdc_note_write_abandoned();
       S.writing = false;
       S.wr_armed = false;
       S.read_addr = false;
@@ -1876,6 +1919,12 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->wr_refused = S.wr_refused;
   o->wr_ok = S.wr_ok;
   o->wr_rnf = S.wr_rnf;
+  o->wr_abandoned = S.wr_abandoned;
+  o->wr_ab_want = S.wr_ab_want;
+  o->wr_ab_got = S.wr_ab_got;
+  o->wr_ab_track = S.wr_ab_track;
+  o->wr_ab_side = S.wr_ab_side;
+  o->wr_ab_sector = S.wr_ab_sector;
   o->wr_cyl_mismatch = S.wr_cyl_mismatch;
   o->wr_size_mismatch = S.wr_size_mismatch;
   o->wr_late = S.wr_late;

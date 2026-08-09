@@ -154,6 +154,12 @@ struct FdcDebug {
   uint32_t wr_refused;       // ...refused before the disk (WP / writes off)
   uint32_t wr_ok;            // data fields actually spliced onto the media
   uint32_t wr_rnf;           // the sector's ID never passed the head
+  uint32_t wr_abandoned;     // write ended before its buffer filled
+  uint16_t wr_ab_want;       // bytes expected by the last abandoned write
+  uint16_t wr_ab_got;        // ...and how many the host actually sent
+  uint8_t wr_ab_track;
+  uint8_t wr_ab_side;
+  uint8_t wr_ab_sector;
   uint32_t wr_cyl_mismatch;  // found it, but on the wrong cylinder
   uint32_t wr_size_mismatch; // found it, but its size != the host's data
   uint32_t wr_late;          // ID decoded too late to hit its Gap 2 window
