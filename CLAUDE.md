@@ -348,9 +348,11 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
       formatted one disk and verified another.
   - **HD (500 kbit/s) support: implemented, not yet hardware-verified.** Target
     is 3.5" HD at 300 rpm — the revolution time is unchanged, only the bit
-    clock halves — so the capture window became **time-based** (~1.05 rev,
-    `FDC_READ_CAPTURE_WINDOW_US`) and the same captured flux serves either
-    density. Density is the firmware's own determination (`mzp_probe.py
+    clock halves. The capture window stays **byte-sized** (~1.05 rev:
+    45700 bytes DD / 91400 HD) — byte windows are rotation-relative, adapting
+    to the spindle's real speed, where a time window on a slightly-slow drive
+    captured 0.96 rev and threw phase-dependent CRC errors (a lesson learned
+    the hard way; see `fdc_read_capture_bytes`). Density is the firmware's own determination (`mzp_probe.py
     density dd|hd|auto`, default auto): a per-drive latch (default DD),
     flipped when a capture that decodes to nothing at the latched bit clock
     yields a CRC-valid ID at the other one — no recapture needed. A host

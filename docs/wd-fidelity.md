@@ -64,10 +64,12 @@ Revisit only if a host is found that writes the port; `iotrace` will show it.
 **Density (DD vs HD MFM) is instead the firmware's own determination** —
 `mzp_probe.py density dd|hd|auto`. In auto (the default) each drive carries a
 latched density (default DD, the machine's native format): a capture that
-decodes to *nothing* at the latched bit clock is re-decoded at the other one —
-the capture window is sized in time (a revolution is 200 ms at either density
-on a 300 rpm 3.5" drive), so the same flux serves both — and a CRC-valid ID
-field at the other clock flips the latch. A host WRITE TRACK infers density
+decodes to *nothing* at the latched bit clock is cheaply probed at the other
+one (first CRC-valid ID field), and a proven ID flips the latch. The capture
+window is byte-sized per density (~1.05 rev; byte windows are
+rotation-relative, so they hold on a spindle that runs slow) — a DD-sized
+capture of an HD disk still holds ~half an HD revolution, enough for the
+probe; the first retry then captures at the flipped density's full size. A host WRITE TRACK infers density
 from the format image's **sector census** — the sectors it declares and their
 size codes (~5.3k on-disk for 9×512 DD vs ~10.4k for 18×512 HD) — which is
 what lets a blank disk be formatted HD. Not from the image length: the host

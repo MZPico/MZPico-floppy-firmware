@@ -1039,21 +1039,37 @@ static bool wait_for_index_falling_edge_ms(uint32_t timeout_ms) {
   return true;
 }
 
-// The capture window is sized in TIME, not bytes: ~1.05 revolutions, so every
-// sector passes the head once with a small margin for spindle-speed variation.
-// Time rather than bytes because the byte rate depends on density (a DD
-// revolution is ~43.5k flux transitions, measured with `scan`; HD is about
-// double) while the revolution is 200 ms either way -- so one window serves
-// both, and auto-detect can re-decode the same capture at the other bit clock.
-// The host's measured patience after a READ is ~285 ms (25k STATUS polls, see
-// `rddiag`), so the window has to stay tight: 1.25 revolutions left only ~7 ms
-// of headroom for the decode. Used by both the Type II read window and the
+// The capture window is sized in BYTES -- ~1.05 revolutions at the effective
+// density -- and NOT in time. Byte-sizing is rotation-relative: flux bytes
+// arrive exactly as fast as disk content passes the head, so a byte target
+// spans the same fraction of a revolution on any spindle. A time window does
+// not: HD support briefly used 210 ms here (nominal 1.05 rev at 300.0 rpm),
+// and on a real drive turning slightly slow it captured 0.96 of a revolution
+// -- measured: 41765 bytes against the ~43.5k of one turn -- so any sector
+// straddling the window boundary decoded truncated, throwing spurious CRC
+// errors and RNFs whose victims moved with rotational phase. FORMAT4's
+// verify pass failed on half its tracks that way while bench scans (whose
+// window is longer) showed a perfectly formatted disk.
+//
+// A DD revolution is ~43.5k transitions (measured with `scan`); HD is about
+// double. The host's measured patience after a READ is ~285 ms (25k STATUS
+// polls, see `rddiag`), so the window must stay near 1.05 revolutions -- 1.25
+// left only ~7 ms of decode headroom. Used by the Type II read window and the
 // Type I Verify pass.
-static constexpr uint32_t FDC_READ_CAPTURE_WINDOW_US = 210000;
-// Byte backstop for that window -- 1.05 HD revolutions with margin. Never the
-// binding limit on a healthy capture; it exists so a runaway drain can't walk
-// past the buffer maths below.
-static constexpr size_t FDC_READ_CAPTURE_BYTES = 96000;
+//
+// Auto-detect note: a DD-sized capture of an HD disk holds ~half an HD
+// revolution -- plenty for the cheap first-ID probe that flips the latch; the
+// first re-decode may then miss its sector, and the host's retry recaptures
+// at the flipped density's full size.
+static constexpr size_t FDC_READ_CAPTURE_BYTES_DD = 45700;
+static constexpr size_t FDC_READ_CAPTURE_BYTES_HD = 91400;
+// Safety bound on any capture window (a revolution is ~200 ms); the byte
+// target is what normally ends it.
+static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
+
+ALWAYS_INLINE size_t fdc_read_capture_bytes(void) {
+  return fdc_is_hd() ? FDC_READ_CAPTURE_BYTES_HD : FDC_READ_CAPTURE_BYTES_DD;
+}
 
 static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
 
@@ -1128,10 +1144,10 @@ static bool fdc_verify_track(uint8_t track) {
   // The old loop also had no timeout: its only exit was `n < cap`, so a drive
   // producing no transitions at all (motor not up to speed, no disk) left it
   // spinning forever with BUSY held.
-  size_t want = (cap < FDC_READ_CAPTURE_BYTES) ? cap : FDC_READ_CAPTURE_BYTES;
+  size_t want = (cap < fdc_read_capture_bytes()) ? cap : fdc_read_capture_bytes();
   size_t n = 0;
   uint32_t t0 = time_us_32();
-  while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_WINDOW_US)
+  while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US)
     n = rp2040_flux_capture_drain(flux, want, n, /*store_greaseweazle=*/false);
   rp2040_flux_capture_stop();
 
@@ -1202,7 +1218,7 @@ static void fdc_capture_window(size_t want_bytes) {
   S.rd_capture_ok = g_stream_active;
   if (g_stream_active) {
     while (g_flux_n < want &&
-           (time_us_32() - t0) < FDC_READ_CAPTURE_WINDOW_US) {
+           (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US) {
       g_flux_n = rp2040_flux_capture_drain(flux, want, g_flux_n,
                                            /*store_greaseweazle=*/false);
     }
@@ -2733,7 +2749,7 @@ void fdc_disk_task(void) {
         size_t cap = 0;
         uint8_t *flux = mzp_flux_buffer(&cap);
         uint32_t t0 = time_us_32();
-        fdc_capture_window(FDC_READ_CAPTURE_BYTES);
+        fdc_capture_window(fdc_read_capture_bytes());
         if (!S.trk_op) // aborted while we were blocked capturing
           return;
         size_t n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
@@ -3169,7 +3185,7 @@ void fdc_disk_task(void) {
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);
       else
-        fdc_capture_window(FDC_READ_CAPTURE_BYTES);
+        fdc_capture_window(fdc_read_capture_bytes());
       S.rd_fresh = false;
       // core1 can have aborted us while we were blocked capturing.
       if (!S.reading)
