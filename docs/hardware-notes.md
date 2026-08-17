@@ -128,6 +128,15 @@ Missing:
 
 ### 4. Per-drive motor, and making J2/J3 two real ports
 
+**DECIDED for the next revision: `J3` gets separate motor signals for drive A
+and drive B** — pin 10 (MOTORA) and pin 16 (MOTORB) become two nets, derived
+from the existing signals through glue logic rather than new GPIOs (there are
+none spare). Default implementation is the zero-GPIO `74LVC2G32` option below
+(motor follows select, jumper to fall back to the shared net); step up to the
+one-GPIO or shift-register variant only if the respin-on-alternation cost shows
+up in practice. Route the new motor outputs through item 1's open-drain stage
+like every other output.
+
 `J3` already brings out both motor pins (10 = MOTORA, 16 = MOTORB); only the net
 is shared. `J2` (Shugart) has a single motor line for the whole cable, so
 per-drive motor is physically impossible there. That points at the clean answer:
