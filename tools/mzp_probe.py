@@ -6,6 +6,7 @@ Usage:
     python mzp_probe.py PORT enctest <n_sectors> <size_code> [dens]
     python mzp_probe.py PORT busdump                      # MZ-800 bus hello state
     python mzp_probe.py PORT gpioread [once]              # live C0..C7 input byte
+    python mzp_probe.py PORT pindrive <byte> [mode]       # bench: drive C0..C7 pads; `pindrive 0 0` restores the bus after gpioread
     python mzp_probe.py PORT pintest                     # per-pad pull-up/down self-test
     python mzp_probe.py PORT fdcdump [loop]              # WD FDC state (1 line; loop=on-change)
     python mzp_probe.py PORT fdclog                      # recent WD command opcodes
@@ -1428,7 +1429,11 @@ def main():
             dens = int(sys.argv[5]) if len(sys.argv) > 5 else 0
             capture_ms = int(sys.argv[6]) if len(sys.argv) > 6 else 220
             do_streamscan(s, track, side, dens, capture_ms)
-        elif cmd == "drive":
+        elif cmd == "pindrive":
+            # Bench C0..C7 pad-drive test (MZP_CMD_DRIVE). This was `drive`
+            # too, which made it unreachable behind the unit-select branch
+            # above -- and `pindrive 0 0` is the documented way to restore
+            # normal bus operation after `gpioread` isolates the pads.
             val = int(sys.argv[3], 0)
             mode = int(sys.argv[4]) if len(sys.argv) > 4 else 1
             s.write(bytes([MZP_CMD_DRIVE, 5, val & 0xFF, mode & 0xFF, 0]))
