@@ -47,7 +47,8 @@ Usage:
                  actually latched -- the only way to test the READ direction.
     python mzp_probe.py PORT <track> <side> [dens]        # shorthand for scan
 
-    dens: 0 = DD / 250 kbit/s (default), 1 = HD / 500 kbit/s
+    dens: 0 = DD / 250 kbit/s, 1 = HD / 500 kbit/s; when omitted, read
+          commands follow the firmware's effective density (see `density`)
     size_code: 0=128, 1=256, 2=512, 3=1024 bytes/sector
     write pattern mode: 0 = ramp from seed, 1 = constant seed,
                         2 = pseudo-random from seed (default; hardest MFM)
@@ -199,6 +200,28 @@ def print_sectors(s, ns):
         if id_ok and data_ok:
             good += 1
     return good
+
+
+def effective_density(s):
+    """The density the firmware will encode/decode with RIGHT NOW: a forced
+    mode wins; auto follows the selected unit's latched density. Bench read
+    commands default to this so a read-back always matches what the write
+    side just did -- an explicit dens argument still overrides. (fmtverify
+    once wrote a track at forced-HD and scanned it back at the DD default:
+    "MISSING sectors: [1..9]" on a perfectly good track.)"""
+    s.write(bytes([MZP_CMD_DENSITY, 3, 3]))  # 3 = query
+    s.flush()
+    r = read_exact(s, 9)
+    if len(r) != 9 or r[1] != 0:
+        return 0
+    mode = r[2]
+    if mode < 2:
+        return mode
+    s.write(bytes([MZP_CMD_DRVSEL, 3, 4]))  # 4 = query only
+    s.flush()
+    d = read_exact(s, 5)
+    unit = d[2] if len(d) == 5 else 0
+    return 1 if (unit < 2 and r[3 + unit]) else 0
 
 
 def do_scan(s, track, side, dens):
@@ -790,7 +813,8 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
         print("VERIFY SKIPPED (nothing was written)")
         return
     want = gen_pattern(mode, seed, n)
-    s.write(bytes([MZP_CMD_FDCREAD, 6, track, sector, side, 0]))
+    s.write(bytes([MZP_CMD_FDCREAD, 6, track, sector, side,
+                   effective_density(s)]))
     s.flush()
     hdr = read_exact(s, 5)
     if len(hdr) < 5 or hdr[1] != 0:
@@ -992,7 +1016,7 @@ def do_firstfail(s, clear=False):
               "sector number")
 
 
-def scan_geometry(s, track, side):
+def scan_geometry(s, track, side, dens=0):
     """Return [(sector_id, size_code), ...] actually recorded on a track.
 
     The soak cannot assume a geometry. An MZ-800 CP/M disk is 9x512 on its data
@@ -1001,7 +1025,7 @@ def scan_geometry(s, track, side):
     size compare -- which looks like a write failure but is the safety check
     working. Read the ID fields and use what is really there.
     """
-    s.write(bytes([MZP_CMD_SCAN, 5, track, side, 0]))
+    s.write(bytes([MZP_CMD_SCAN, 5, track, side, dens]))
     s.flush()
     hdr = read_exact(s, 7)
     if len(hdr) < 7 or hdr[1] != 0:
@@ -1037,7 +1061,7 @@ def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
     geom = {}
     for t in tracks:
         for sd in sides:
-            ids = scan_geometry(s, t, sd)
+            ids = scan_geometry(s, t, sd, effective_density(s))
             if not ids:
                 print(f"  track {t} side {sd}: no readable IDs -- skipping")
                 continue
@@ -1134,9 +1158,10 @@ def do_fmtverify(s, track, side, nsec, sizecode, interleave, fill):
     right, the data CRC proves the fill field and its CRC were laid down too."""
     if not do_fdcformat(s, track, side, nsec, sizecode, interleave, fill):
         return
-    ids = scan_geometry(s, track, side)
+    dens = effective_density(s)
+    ids = scan_geometry(s, track, side, dens)
     print(f"read back: {len(ids)} sectors with valid ID CRCs")
-    do_scan(s, track, side, 0)
+    do_scan(s, track, side, dens)
     got = sorted({r for r, _n in ids})
     want = list(range(1, nsec + 1))
     missing = [x for x in want if x not in got]
@@ -1207,7 +1232,8 @@ def main():
         cmd = sys.argv[2]
         if cmd == "scan":
             t, sd = int(sys.argv[3]), int(sys.argv[4])
-            dens = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+            dens = (int(sys.argv[5]) if len(sys.argv) > 5
+                    else effective_density(s))
             do_scan(s, t, sd, dens)
         elif cmd == "enctest":
             nsec, sc = int(sys.argv[3]), int(sys.argv[4])
@@ -1284,7 +1310,8 @@ def main():
             track = int(sys.argv[3])
             sector = int(sys.argv[4])
             side = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-            dens = int(sys.argv[6]) if len(sys.argv) > 6 else 0
+            dens = (int(sys.argv[6]) if len(sys.argv) > 6
+                    else effective_density(s))
             do_fdcread(s, track, sector, side, dens)
         elif cmd in ("fdcwrite", "wrverify"):
             # THESE WRITE TO THE DISK. args: track sector [side] [sizecode]
@@ -1449,7 +1476,8 @@ def main():
         elif cmd == "streamscan":
             track = int(sys.argv[3])
             side = int(sys.argv[4])
-            dens = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+            dens = (int(sys.argv[5]) if len(sys.argv) > 5
+                    else effective_density(s))
             capture_ms = int(sys.argv[6]) if len(sys.argv) > 6 else 220
             do_streamscan(s, track, side, dens, capture_ms)
         elif cmd == "pindrive":
@@ -1467,7 +1495,8 @@ def main():
                   f"(measure Pico pins 1..; mode 0 to release)")
         else:  # shorthand: PORT track side [dens]
             t, sd = int(sys.argv[2]), int(sys.argv[3])
-            dens = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            dens = (int(sys.argv[4]) if len(sys.argv) > 4
+                    else effective_density(s))
             do_scan(s, t, sd, dens)
 
 
