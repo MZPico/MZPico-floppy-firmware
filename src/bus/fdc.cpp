@@ -997,21 +997,26 @@ static void fdc_note_density(bool hd) {
 // recapture: the window is sized in time, so it holds a full revolution at
 // either density, and the deltas themselves are clock-agnostic.
 //
-// Only for auto mode, and only when the current decode saw NO IDs -- a
-// wrong-cylinder or wrong-sector result means the current clock is reading the
-// media fine and the problem is positional, not spectral.
+// Only for auto mode, and callers must gate it on the current density seeing
+// NO valid ID anywhere in the capture -- a wrong-cylinder or wrong-sector
+// result means the current clock is reading the media fine and the problem is
+// positional, not spectral.
+//
+// The proof is mfm_read_address -- the FIRST ID field with a valid CRC -- and
+// deliberately not a full track scan. This probe sits on failure paths with
+// real deadlines over them (Type I Verify under the boot ROM's status-poll
+// timeout, READ ADDRESS under CP/M's ~52 ms patience), and a scan decodes
+// every sector's data on top of the ID hunt. The first version used the scan,
+// and the added latency on every marginal capture broke booting outright --
+// "FD:Loading error" on most attempts. One CRC-valid ID is the same standard
+// of proof at a fraction of the cost, and on flux of the WRONG density it
+// terminates after a single cheap sync-hunt pass, since no ID can decode.
 static bool fdc_try_other_density(const uint8_t *flux, size_t n_flux) {
   if (g_density_mode != 2 || n_flux == 0)
     return false;
   float other = fdc_is_hd() ? FDC_DD_BIT_US : FDC_HD_BIT_US;
-  SectorInfo ids[4];
-  int ns = mfm_scan_track(flux, n_flux, other, ids, 4, g_secbuf,
-                          sizeof(g_secbuf));
-  bool proven = false;
-  for (int k = 0; k < ns; ++k)
-    if (ids[k].id_crc_ok)
-      proven = true;
-  if (!proven)
+  uint8_t id[6];
+  if (!mfm_read_address(flux, n_flux, other, id))
     return false;
   fdc_note_density(!fdc_is_hd());
   return true;
@@ -1132,12 +1137,8 @@ static bool fdc_verify_track(uint8_t track) {
 
   S.verify_n = (uint32_t)n;
   bool ok = (n > 0) && mfm_verify_track(flux, n, fdc_bit_us(), track);
-  // Nothing decodable at the latched density: check the other one before
-  // declaring a seek error -- a Verify is often the first thing to touch a
-  // freshly inserted disk, so this is where a DD->HD swap gets noticed.
-  if (!ok && n > 0 && fdc_try_other_density(flux, n))
-    ok = mfm_verify_track(flux, n, fdc_bit_us(), track);
 
+  bool any_valid_id = ok;
   if (!ok && n > 0) {
     // Compatibility fallback for ROM bring-up: some media/boot tracks can carry
     // non-canonical C bytes while still being readable. If strict WD-style
@@ -1149,11 +1150,23 @@ static bool fdc_verify_track(uint8_t track) {
                             sizeof(g_secbuf));
     for (int i = 0; i < ns; ++i) {
       if (ids[i].id_crc_ok) {
+        any_valid_id = true;
         ok = true;
         break;
       }
     }
   }
+
+  // Only a capture with NO valid ID at the latched clock justifies the
+  // other-density probe. The order matters: the boot ROM exercises the
+  // fallback above on marginal captures, under its own status-poll timeout,
+  // and the first version of HD support ran the (then much more expensive)
+  // probe BEFORE the fallback on every strict-verify miss -- which broke
+  // booting outright. A DD->HD disk swap still gets noticed here: the swapped
+  // disk yields no valid ID at the old clock, the probe proves the new one,
+  // and the verify is repeated at the flipped density.
+  if (!any_valid_id && n > 0 && fdc_try_other_density(flux, n))
+    ok = mfm_verify_track(flux, n, fdc_bit_us(), track);
 
   return ok; // capture already stopped above, before the decode
 }
@@ -2727,12 +2740,18 @@ void fdc_disk_task(void) {
                                       (uint8_t *)S.track_buf,
                                       FDC_TRACK_IMAGE_MAX);
         // Free-running decode yields SOMETHING at any clock, so "n == 0" is
-        // not the density-detect trigger here -- but a track that produced no
-        // ID fields at the latched clock and proves out at the other one
-        // should still flip the latch and be re-decoded.
-        if (g_flux_n > 0 && fdc_try_other_density(flux, g_flux_n))
-          n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
-                                 (uint8_t *)S.track_buf, FDC_TRACK_IMAGE_MAX);
+        // not the density-detect trigger here. Instead: no ID field at the
+        // latched clock (cheap first-ID check) but a proven one at the other
+        // -> flip the latch and re-decode.
+        {
+          uint8_t idtmp[6];
+          if (g_flux_n > 0 &&
+              !mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
+              fdc_try_other_density(flux, g_flux_n))
+            n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
+                                   (uint8_t *)S.track_buf,
+                                   FDC_TRACK_IMAGE_MAX);
+        }
         S.trk_last_us = time_us_32() - t0;
         S.trk_last_bytes = (uint16_t)n;
         if (n == 0) {
@@ -3196,11 +3215,17 @@ void fdc_disk_task(void) {
         // Re-decode the same window at the other bit clock before reporting
         // RNF; this is how a swapped-in disk of the other density gets noticed
         // mid-session. No recapture: the window is time-sized, so it already
-        // holds a full revolution at either density.
-        if (!sd.found && !sd.cyl_mismatch &&
-            fdc_try_other_density(flux, g_flux_n))
-          sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
-                               g_secbuf, sizeof(g_secbuf));
+        // holds a full revolution at either density. Gated on a cheap
+        // first-ID check at the CURRENT density: a genuine RNF on readable
+        // media (sector not on this track) must not pay for a probe, and the
+        // check stops at the first ID it finds -- a few ms of flux at most.
+        if (!sd.found && !sd.cyl_mismatch) {
+          uint8_t idtmp[6];
+          if (!mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
+              fdc_try_other_density(flux, g_flux_n))
+            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
+                                 g_secbuf, sizeof(g_secbuf));
+        }
       }
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;
