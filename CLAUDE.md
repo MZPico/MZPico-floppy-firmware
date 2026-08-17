@@ -354,10 +354,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     density dd|hd|auto`, default auto): a per-drive latch (default DD),
     flipped when a capture that decodes to nothing at the latched bit clock
     yields a CRC-valid ID at the other one — no recapture needed. A host
-    WRITE TRACK infers density from its image length (~6250 bytes DD vs
-    ~12500 HD), which is how a blank disk gets formatted HD; writes never
-    auto-detect (the splice uses the latch, established by the reads that
-    precede any write). Port `0xDE` stays untrusted; DENSEL is driven
+    WRITE TRACK infers density from the format image's **sector census**
+    (declared sectors × their size codes: ~5.3k on-disk for 9×512 DD vs
+    ~10.4k for 18×512 HD) — NOT from the image length, which measures only
+    how long the host kept streaming (a formatter feeds bytes while DRQ is
+    up; the index ends the command on a real WD, and CP/M's FORMAT4 fills
+    whatever buffer we offer even for DD). That census is how a blank disk
+    gets formatted HD; writes never auto-detect (the splice uses the latch,
+    established by the reads that precede any write). Port `0xDE` stays untrusted; DENSEL is driven
     best-effort (3.5" drives sense HD from the media hole). Buffers are
     HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
     capture buffer already fit a full HD revolution). Verify bench-first:

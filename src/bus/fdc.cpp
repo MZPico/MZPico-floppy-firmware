@@ -51,12 +51,19 @@ static constexpr int FDC_DRIVE_MAX = 2;
 // This bounds WRITE TRACK, so a host that never stops sending cannot run off
 // the end of it.
 static constexpr uint16_t FDC_TRACK_IMAGE_MAX = 13000;
-// A format image longer than any DD track can be is an HD format. The two
-// populations are far apart -- ~6250 vs ~12500 bytes, and every formatter
-// emits close to the full track -- so this single threshold is what lets a
-// host format a BLANK disk at the density it intends, which auto-detection
-// from the media cannot do (blank media decodes at no density).
-static constexpr uint16_t FDC_TRACK_IMAGE_HD_MIN = 9000;
+// A format image whose declared sectors need more on-disk room than any DD
+// track has (~6250 bytes) is an HD format. Measured from the image's SECTOR
+// CENSUS -- the IDAM preambles it contains and their size codes -- and never
+// from the image's raw length: the host is entitled to keep streaming bytes
+// for as long as DRQ stays up (on a real WD the index pulse ends WRITE TRACK,
+// not the host), so stream length says how patient the host is, not what it
+// means to write. CP/M's FORMAT4 does exactly that, filling whatever buffer we
+// offer even for a plain DD format. The census footprints are far apart --
+// ~5.3k for 9x512 DD, ~10.4k for 18x512 HD -- so one threshold separates them.
+// This is what lets a host format a BLANK disk at the density it intends,
+// which auto-detection from the media cannot do (blank media decodes at no
+// density).
+static constexpr uint32_t FDC_TRACK_CONTENT_HD_MIN = 8000;
 // The host has stopped shifting format bytes in. A real WD ends WRITE TRACK on
 // the index pulse and simply ignores anything still coming; we have to buffer
 // the image before writing it, so instead we take a gap in the byte stream as
@@ -2435,8 +2442,13 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
   // drive's latched density in auto mode) -- formatting is the one operation
   // where the media cannot say, so the knob is the authority on the bench.
   size_t limit = (cap < fdc_track_flux_max()) ? cap : fdc_track_flux_max();
-  size_t n_flux = mfm_encode_format_image(flux, limit, img, n, fdc_bit_us());
-  if (!n_flux) {
+  bool enc_overflow = false;
+  size_t n_flux =
+      mfm_encode_format_image(flux, limit, img, n, fdc_bit_us(), &enc_overflow);
+  // Unlike the host path, a bench format that does not fit is an ERROR: this
+  // path exists to validate exact geometry, so silently clipping the last
+  // sectors would report success for a track that scans back short.
+  if (!n_flux || enc_overflow) {
     if (out_result)
       *out_result = 2; // image would not fit
     return 0;
@@ -2808,24 +2820,31 @@ void fdc_disk_task(void) {
     // one 7200-byte image in ten thousand even for uniformly random bytes, and
     // this is not random bytes, it is a stream that only exists at all if a
     // command was already mis-decoded.
-    bool plausible = S.trk_len >= FDC_TRACK_IMAGE_MIN;
-    if (plausible) {
-      bool found = false;
+    // One pass does double duty: it is the plausibility gate (at least one
+    // real IDAM preamble) AND the sector census the density inference needs
+    // (see FDC_TRACK_CONTENT_HD_MIN). Each preamble's size code -- 4 bytes
+    // past the 0xFE, after cyl/side/sec -- says how much disk the sector will
+    // occupy; the per-sector 62 covers its ID field, presync runs, DAM, CRCs
+    // and Gap 2/3, and the 150 the index preamble and Gap 1.
+    int census_sectors = 0;
+    uint32_t census_disk_bytes = 150;
+    {
       uint16_t run = 0;
-      for (uint16_t k = 0; k < S.trk_len; ++k) {
+      for (uint16_t k = 0; k + 4 < S.trk_len; ++k) {
         uint8_t b = S.track_buf[k];
         if (b == 0xF5) {
           run++;
-        } else {
-          if (b == 0xFE && run >= 2) {
-            found = true;
-            break;
-          }
-          run = 0;
+          continue;
         }
+        if (b == 0xFE && run >= 2) {
+          census_sectors++;
+          census_disk_bytes +=
+              (uint32_t)(128u << (S.track_buf[k + 4] & 7)) + 62;
+        }
+        run = 0;
       }
-      plausible = found;
     }
+    bool plausible = S.trk_len >= FDC_TRACK_IMAGE_MIN && census_sectors > 0;
 
     bool ok = false;
     uint32_t t0 = time_us_32();
@@ -2834,16 +2853,21 @@ void fdc_disk_task(void) {
     } else if (!S.write_protect) {
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
-      // The image LENGTH decides the density in auto mode. Formatting is the
-      // one operation where the media cannot be asked (blank media decodes at
-      // no density), but the host has already told us: a formatter emits close
-      // to a full track, and a full DD track (~6250 bytes) and a full HD track
-      // (~12500) are far enough apart that one threshold separates them. This
-      // also flips the drive's latch, so the verify-read that every formatter
-      // does next decodes at the density it just wrote.
-      fdc_note_density(S.trk_len >= FDC_TRACK_IMAGE_HD_MIN);
+      // The image's SECTOR CENSUS decides the density in auto mode (see
+      // FDC_TRACK_CONTENT_HD_MIN for why it must not be the image length --
+      // that mistake formatted DD disks at the HD bit clock and failed every
+      // verify). Formatting is the one operation where the media cannot be
+      // asked, but the host has already said what it means by declaring its
+      // sectors. Flipping the drive's latch here is also what makes the
+      // verify-read every formatter does next decode at the density it just
+      // wrote.
+      fdc_note_density(census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN);
       // Cap the flux at a bit over one revolution: the write is terminated by
-      // the index pulse anyway, and encoding more is wasted time.
+      // the index pulse anyway, and encoding more is wasted time. An image
+      // needing more than the cap is fine for the same reason -- the encoder
+      // reports the overflow but fills the buffer with the image's first
+      // revolution-and-a-bit, which is all the index lets onto the disk. A
+      // real WD fed a too-long image behaves identically.
       size_t limit = (cap < fdc_track_flux_max()) ? cap : fdc_track_flux_max();
       size_t n_flux = mfm_encode_format_image(
           flux, limit, (const uint8_t *)S.track_buf, S.trk_len, fdc_bit_us());

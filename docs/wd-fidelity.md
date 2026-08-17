@@ -68,8 +68,11 @@ decodes to *nothing* at the latched bit clock is re-decoded at the other one —
 the capture window is sized in time (a revolution is 200 ms at either density
 on a 300 rpm 3.5" drive), so the same flux serves both — and a CRC-valid ID
 field at the other clock flips the latch. A host WRITE TRACK infers density
-from the format image's length (~6250 bytes DD vs ~12500 HD), which is what
-lets a blank disk be formatted HD. Writes never auto-detect: the splice uses
+from the format image's **sector census** — the sectors it declares and their
+size codes (~5.3k on-disk for 9×512 DD vs ~10.4k for 18×512 HD) — which is
+what lets a blank disk be formatted HD. Not from the image length: the host
+streams bytes for as long as DRQ is up (the index ends WRITE TRACK on a real
+WD), so length measures the host's patience, not its intent. Writes never auto-detect: the splice uses
 the latched density, which reading (or READ ADDRESS) will have established.
 DENSEL (the shared `~DEN_RDY` pin) is driven best-effort from the same model;
 nothing relies on it — the target 3.5" drives sense HD from the media hole.
