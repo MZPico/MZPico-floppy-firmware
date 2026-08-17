@@ -1204,7 +1204,7 @@ void gw_task() {
   }
 
   else if (cmd == MZP_CMD_FMTEN) {
-    // cmd_buffer[2]: 0 = off (default), 1 = on, 2 = query.
+    // cmd_buffer[2]: 0 = off, 1 = on (default), 2 = query.
     if (cmd_buffer[2] < 2)
       fdc_set_format_enable(cmd_buffer[2] != 0);
     reply_buffer[i++] = GW_ACK_OK;

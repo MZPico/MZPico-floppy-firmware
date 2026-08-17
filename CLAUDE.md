@@ -6,8 +6,9 @@ drive**. The Pico sits on the MZ-800 expansion bus, emulates the machine's
 floppy disk controller (FDC), and translates FDC sector reads/writes into
 flux-level operations on an attached Shugart/PC floppy drive.
 
-> This repo is new/empty. This file captures the design intent and the two
-> upstream codebases it is built from so work can start with full context.
+> This file captures the design intent, the two upstream codebases this repo
+> was built from, and the current state of the work (Phases 0–3 implemented
+> and hardware-verified — see Status at the bottom).
 
 ## What makes this different from the reference firmware
 
@@ -79,6 +80,11 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 > Full FDC spec: **[docs/wd-fidelity.md](docs/wd-fidelity.md)** (register map,
 > inverted bus, the ROM's polled-DRQ handshake, commands, architecture). The
 > MZ-800 side is derived from the Disk BASIC ROM `MZ2Z046.ASM` (in repo root).
+> Boot-ROM (9Z-504M) floppy port map and call flow:
+> [docs/9Z_504M_floppy_routines.md](docs/9Z_504M_floppy_routines.md).
+> ([docs/rom-first-validation.md](docs/rom-first-validation.md) +
+> `tools/rom_first_validation.sh` are historical — pre-3.2; e.g. the
+> index-synchronized read start described there was later removed.)
 
 - **Emulation goal:** ✅ be **as faithful as possible to the original WD FDC**
   — target the **WD179x / FD1791-02** register+command model (WD1773/WD2797 are
@@ -143,11 +149,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Build system:** ✅ Pico-SDK + CMake, pico-sdk 2.2.0 submodule (done, Phase 1).
 
 ### Still open
-- **Apply density to the DENSEL pin.** `0xDC`–`0xDF` bits are all decoded now
-  (see the register map in the spec), but `0xDE` is only latched — it does not
-  yet drive floppy pin 2 or pick the bit time. Deferred: MZ-800 media is DD.
-- **`~EXWAIT` budget** for putting a byte on the shared C0..C7 bus in time on a
-  register access.
+- ~~**Apply density to the DENSEL pin.**~~ — ✅ closed as **"not to be done"**:
+  the Disk BASIC ROM defines port `0xDE` but never writes it, so its polarity is
+  unknowable and nothing needs it (MZ-800 media is DD). The bit is latched only
+  (`density_single`), deliberately not driven onto DENSEL.
+- ~~**`~EXWAIT` budget**~~ — ✅ resolved: core1 comfortably services a register
+  access inside the ~560 ns Z80 I/O window without wait states (see
+  [docs/phase3-plan.md](docs/phase3-plan.md), risk #4).
 - **Write-precomp: no longer suspected.** `mzp_probe.py PORT wrsoak` ran
   **200/200 writes verified byte-for-byte** over tracks 0–76 (step 4), both
   sides, 5 passes — including the innermost tracks, where flux density is
@@ -211,12 +219,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   floppies over USB via the Adafruit greaseweazle Arduino sketch. See
   [docs/PHASE0.md](docs/PHASE0.md) and [docs/hardware-notes.md](docs/hardware-notes.md).
   One bodge in place: 1 kΩ pull-up on `~RDATA` (GPIO20) to 3.3 V.
-- **Phase 1 (Pico-SDK greaseweazle firmware): SCAFFOLDED** — a bare Pico-SDK +
+- **Phase 1 (Pico-SDK greaseweazle firmware): DONE** — a bare Pico-SDK +
   TinyUSB firmware that speaks the greaseweazle protocol, ported from
   Adafruit_Floppy. Builds to `mzpico_floppy.uf2`. See [README.md](README.md).
-  Layout:
+  Phase 1 layout:
   - `src/main.cpp` — clock/USB init + main loop
-  - `src/gw_protocol.*` — greaseweazle command loop (CDC)
+  - `src/gw_protocol.*` — greaseweazle command loop (CDC) + the `mzp_probe.py`
+    bench command handlers
   - `src/floppy.*` — drive control (select/motor/seek/side/sense)
   - `src/flux/arch_rp2.*` + `greasepack.h` — RP2040 PIO flux capture/write
   - `src/board_config.h` — verified GPIO map
@@ -224,14 +233,24 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   - `CMakeLists.txt`, `pico_sdk_import.cmake`
   - `external/pico-sdk` — git submodule pinned to **2.2.0** (its `lib/tinyusb`
     submodule is the only inner one needed).
-  **Builds clean** (pico-sdk 2.2.0 + arm-none-eabi-gcc 13.2 →
-  `mzpico_floppy.uf2`, 35 KB flash / 151 KB RAM) **and is hardware-verified**:
-  `gw` enumerates it and `rpm` / full `read` / `write` all work against real
-  disks — the complete flux read+write path runs on this firmware.
-- **Phase 2 (streaming MFM): NEXT** — vendor Adafruit `mfm_impl.h`; build a
-  **streaming** MFM data-separator (flux → sectors with ID/CRC + rotational
-  position) and encoder (sectors → flux, incl. in-place write-splice). Validate
-  over USB (dump/patch a sector) before any MZ-800. No cache.
+  **Builds clean** (pico-sdk 2.2.0 + arm-none-eabi-gcc 13.2) **and is
+  hardware-verified**: `gw` enumerates it and `rpm` / full `read` / `write` all
+  work against real disks — the complete flux read+write path runs on this
+  firmware.
+- **Phase 2 (streaming MFM): DONE** — Adafruit `mfm_impl.h` vendored
+  (`src/flux/mfm_impl.h`); the decode/encode/splice layer lives in:
+  - `src/mfm_decode.*` — flux → sectors with ID/CRC (`mfm_read_sector`,
+    `mfm_scan_track`, `mfm_read_address`, `mfm_verify_track`,
+    `mfm_read_track_raw`)
+  - `src/mfm_encode.*` — WRITE TRACK format-image → flux (WD write-channel
+    bytes `F5`/`F6`/`F7`), plus gap fill
+  - `src/mfm_splice.*` — in-place data-field write splice (`mfm_write_sector`)
+  Validated over USB (dump/patch a sector) before any MZ-800. No cache.
+- The MZ-800 side added in Phase 3 lives in `src/bus/`:
+  - `src/bus/mz_bus.*` + `bus.pio` + `board_bus.h` — shared-bus PIO, core1
+    listen loop, port decode, `~EXWAIT`
+  - `src/bus/fdc.*` — the WD179x bridge (core1 register file + core0 disk task)
+  - `tools/mzp_probe.py` — the USB bench/diagnostic probe
 - **Phase 3 (WD FDC + MZ-800 bus): READ AND WRITE PATHS DONE — CP/M 4.1 boots
   from a physical disk and writes files back to it.** Real-time WD179x bridge per
   [docs/wd-fidelity.md](docs/wd-fidelity.md); core1 register/bus side, core0 disk
@@ -266,10 +285,10 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   - **3.4 WRITE TRACK (format) + READ TRACK: DONE.** Bench path
     hardware-verified — formats a track that scans back with all sectors and
     CRCs valid; READ TRACK decodes ID fields, gaps and data correctly off real
-    media. The host command path is wired but unproven from the MZ-800, and
-    host formatting is gated **OFF** by default (`fmten`): the command register
-    is bus-inverted, so a raw 0x00 decodes to 0xFF = WRITE TRACK and one
-    glitched byte would reformat a track. WRITE TRACK obeys the WD write-channel bytes (`F5`
+    media. The host command path is **verified from the MZ-800**: CP/M 4.1's
+    `FORMAT4` formats a disk through us (see the multi-drive bullet below), and
+    host formatting defaults **ON** (`fmten`; see the defaults-ON bullet below
+    for why the old default-off gate was retired). WRITE TRACK obeys the WD write-channel bytes (`F5`
     0xA1+preset CRC, `F6` 0xC2, `F7` CRC, else literal) — the missing-clock
     sync marks it creates are the reason formatting cannot be expressed as a
     run of sector writes. It runs index-to-index, which makes it *safer* than
@@ -281,7 +300,8 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     five 0xA1s rather than three) and is deliberately left.
     Density→DENSEL is closed as "not to be done" (the ROM never writes the
     port, so its polarity is unknowable and nothing needs it).
-  - **Multi-drive (`~DS0`/`~DS1`): implemented, untested on two drives.** Two
+  - **Multi-drive (`~DS0`/`~DS1`): DONE — verified on two physical drives and
+    end-to-end under CP/M 4.1.** Two
     `FloppyDrive` instances sharing every pin but `~DSn`, selected by port
     0xDC's drive field; per-drive head position, head target and sector-size
     cache; shared-line handover on each select (`~HDSEL`/`~MOTOR_ON` are one
@@ -291,8 +311,8 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     index sighting, which was previously discarded). **Verified on two physical
     drives:** each unit reads its own media; `drvstat` shows the heads parked on
     different cylinders across selects (40 and 0) and drive 0 reads cylinder 40
-    afterwards without re-stepping; `wp` follows the write-protected disk across
-    selects. **Verified end-to-end under CP/M 4.1:** booted from drive A,
+    afterwards without re-stepping; the `wp` field in `drvstat` follows the
+    write-protected disk across selects. **Verified end-to-end under CP/M 4.1:** booted from drive A,
     `FORMAT4 B: /720` formats drive B, files copy to it, and `copydisk`
     completes. Only the catch-up seek on select is unproven — it needs host
     Type I commands to create the divergence. See
@@ -322,5 +342,6 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
       originally used the greaseweazle drive object, hardwired to `~DS0`, so
       `drive 1; scan` silently read drive 0 — and `fmtverify` would have
       formatted one disk and verified another.
-- **Phase 4 (robustness):** write-precomp if needed, multi-drive, error handling,
-  soak testing.
+- **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
+  testing (the `wrsoak` run so far is minutes, not hours, and has met only one
+  spindle), catching the rare boot `FD:Loading error` with `firstfail`.

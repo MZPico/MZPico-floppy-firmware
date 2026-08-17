@@ -556,14 +556,6 @@ volatile bool g_write_enable = true;
 // two things at once.
 volatile bool g_reset_poll_enabled = true;
 
-// Host-initiated WRITE TRACK (formatting), DEFAULT OFF -- unlike WRITE SECTOR.
-// The command register is bus-inverted, so a raw 0x00 on port 0xD8 decodes to
-// 0xFF: WRITE TRACK. Every other opcode a stray byte can land on is survivable
-// -- a spurious READ returns data nobody wanted, a spurious SEEK moves the head
-// and the ID track compare catches it -- but this one reformats a whole track,
-// and one glitched byte during a power-up transient would be enough. The bench
-// path (fdc_bench_format) is unaffected and is what the milestone is verified
-// with, so the default costs nothing. Enable with `mzp_probe.py fmten 1`.
 // Host-initiated WRITE TRACK. DEFAULT ON.
 //
 // It used to default off, on the grounds that the command register is
@@ -1607,12 +1599,11 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.trk_refuse_why =
             S.write_protect ? 1 : (!g_write_enable ? 2 : 3);
         S.trk_refused++;
-        // WRITE TRACK refused before anything is destroyed. This replaces an
-        // ENTIRE track, so on top of ~WPT and the write switch it needs its own
-        // enable: the command register is bus-inverted, so a raw 0x00 here
-        // decodes to 0xFF = WRITE TRACK, and a single glitched byte during a
-        // power-up transient would otherwise reformat a track. Every other
-        // opcode a stray byte can land on is survivable; this one is not.
+        // WRITE TRACK refused before anything is destroyed -- by ~WPT, the
+        // `wren` master switch, or the `fmten` escape hatch (default ON; see
+        // g_format_enable for why refusing by default cost more than it
+        // bought). The image plausibility check in fdc_disk_task is what
+        // guards against a glitched byte decoding to WRITE TRACK.
         S.trk_op = 0;
         S.drq = false;
         S.busy = false;
