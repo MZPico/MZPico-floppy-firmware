@@ -152,6 +152,13 @@ static void free_capture(void) {
   memset(&g_reader, 0, sizeof(g_reader));
 }
 
+// How long to wait for the FIRST flux transition after enabling the reader.
+// Any magnetized disk that is actually turning produces transitions
+// continuously, so one revolution (~200 ms at 300 rpm) plus margin is
+// generous; only "no disk", "spindle not turning" or virgin AC-erased media
+// can exhaust it -- and for all of those, failing is the correct answer.
+static constexpr uint32_t FLUX_FIRST_SAMPLE_TIMEOUT_US = 400000;
+
 static uint8_t *capture_foreground(int index_pin, uint8_t *start, uint8_t *end,
                                    int32_t *falling_index_offset,
                                    bool store_greaseweazle,
@@ -185,6 +192,17 @@ static uint8_t *capture_foreground(int index_pin, uint8_t *start, uint8_t *end,
   uint32_t irq = save_and_disable_interrupts();
   pio_sm_clear_fifos(g_reader.pio, g_reader.sm);
   pio_sm_set_enabled(g_reader.pio, g_reader.sm, true);
+  // Bounded prime -- same reasoning as in rp2040_flux_capture_start(): the
+  // fluxread program only pushes on transitions, so an unconditional blocking
+  // FIFO read hangs here forever, interrupts off, if the drive produces none.
+  uint32_t prime_t0 = time_us_32();
+  while (!data_available()) {
+    if (time_us_32() - prime_t0 > FLUX_FIRST_SAMPLE_TIMEOUT_US) {
+      restore_interrupts(irq);
+      disable_capture();
+      return ptr;
+    }
+  }
   int last = read_fifo();
   bool last_index = gpio_get(index_pin);
   while (ptr != end) {
@@ -242,8 +260,23 @@ bool rp2040_flux_capture_start(int index_pin, int rdpin) {
   pio_sm_clear_fifos(g_reader.pio, g_reader.sm);
   g_reader.half = 0;
   pio_sm_set_enabled(g_reader.pio, g_reader.sm, true);
-  g_stream_last = read_fifo();
   restore_interrupts(irq);
+  // Prime g_stream_last with the first sample -- BOUNDED. read_fifo() blocks
+  // on the RX FIFO and the fluxread program only pushes on flux transitions,
+  // so an unconditional read here hung the whole firmware (interrupts off, no
+  // USB, replug to recover) whenever the selected drive produced no flux:
+  // `streamscan` with no disk in the drive did exactly that. It also fired
+  // before mfm_splice's own no-flux timeout could ever run. Waiting with
+  // interrupts enabled is fine -- the delta arithmetic in drain() only cares
+  // about counter values, not when we picked the first one up.
+  uint32_t t0 = time_us_32();
+  while (!data_available()) {
+    if (time_us_32() - t0 > FLUX_FIRST_SAMPLE_TIMEOUT_US) {
+      disable_capture();
+      return false;
+    }
+  }
+  g_stream_last = read_fifo();
   return true;
 }
 
