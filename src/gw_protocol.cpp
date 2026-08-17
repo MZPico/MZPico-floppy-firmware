@@ -78,6 +78,7 @@
 #define MZP_CMD_DRVLOCK 0x9C   // pin every access to drive 0 (escape hatch)
 #define MZP_CMD_DRVSTAT 0x9D   // per-drive state for ALL units at once
 #define MZP_CMD_DENSITY 0x9E   // density: force DD/HD or auto-detect (default)
+#define MZP_CMD_IDXBIT 0x9F    // Type I STATUS Index bit on/off (default on)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1300,7 +1301,8 @@ void gw_task() {
 
   else if (cmd == MZP_CMD_DENSITY) {
     // cmd_buffer[2]: 0 = force DD, 1 = force HD, 2 = auto, 3 = query.
-    // Reply: [cmd, ACK, mode, unit0_hd, unit1_hd, flips(4 LE)].
+    // Reply: [cmd, ACK, mode, unit0_hd, unit1_hd, flips(4 LE),
+    //         host_valid, host_hd].
     if (cmd_buffer[2] < 3)
       fdc_set_density_mode(cmd_buffer[2]);
     reply_buffer[i++] = GW_ACK_OK;
@@ -1312,6 +1314,19 @@ void gw_task() {
     reply_buffer[i++] = (flips >> 8) & 0xFF;
     reply_buffer[i++] = (flips >> 16) & 0xFF;
     reply_buffer[i++] = (flips >> 24) & 0xFF;
+    bool hv = false, hh = false;
+    fdc_density_host(&hv, &hh);
+    reply_buffer[i++] = hv ? 1 : 0;
+    reply_buffer[i++] = hh ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_IDXBIT) {
+    // cmd_buffer[2]: 0 = off, 1 = on (default), 2 = query.
+    if (cmd_buffer[2] < 2)
+      fdc_set_index_bit(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_index_bit() ? 1 : 0;
     cdc_write_all(reply_buffer, i);
   }
 

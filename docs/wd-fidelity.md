@@ -54,14 +54,16 @@ booting CP/M: every MZ-800 CP/M image carries its 16×256 IPL track on
 cyl0/head1 as a PC reads it. Runtime-togglable for A/B testing via
 `mzp_probe.py sideswap`.
 
-**The `0xDE` port is decoded but deliberately not trusted** — it is latched and
-reported, but never used to pick the density. The Disk BASIC ROM defines
-`DE_REG = 0DEH` and **never writes it** (checked against `MZ2Z046.ASM`), so
-there is no observed traffic to infer the bit's polarity from — the two
-candidate readings ("b0=1 means HD" vs "b0=1 means single density") disagree.
-Revisit only if a host is found that writes the port; `iotrace` will show it.
+**The `0xDE` port is the host's density declaration, and its polarity is now
+OBSERVED: b0 = 1 means HD.** The Disk BASIC ROM never writes the port (checked
+against `MZ2Z046.ASM`), which long made the polarity unknowable — but CP/M 4.1
+writes it routinely: 608 writes of `0x00` counted across one ordinary DD
+session, then `0x80`/`0x81` at the exact moment FORMAT4 switched to an HD
+format (`iotrace`, 2026-08). In auto density mode a declaration on this port
+outranks the per-drive detected latch; it is cleared by bus RESET so the boot
+ROM starts from the latch (default DD) again.
 
-**Density (DD vs HD MFM) is instead the firmware's own determination** —
+**When no declaration exists, density is the firmware's own determination** —
 `mzp_probe.py density dd|hd|auto`. In auto (the default) each drive carries a
 latched density (default DD, the machine's native format): a capture that
 decodes to *nothing* at the latched bit clock is cheaply probed at the other

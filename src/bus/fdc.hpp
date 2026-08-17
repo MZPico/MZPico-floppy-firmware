@@ -69,6 +69,18 @@ void fdc_set_density_mode(uint8_t mode);
 uint8_t fdc_get_density_mode(void);
 bool fdc_drive_density_hd(int unit); // the per-drive latch
 uint32_t fdc_density_flips(void);    // auto-detect flips since power-up
+// The host's own 0xDE declaration (b0: 1 = HD -- polarity observed from CP/M
+// 4.1, which writes 0 all through DD operation and 1 for an HD format). In
+// auto mode a valid declaration outranks the per-drive latch; it is cleared
+// by bus RESET so the boot ROM (which never writes the port) starts from the
+// latch again.
+void fdc_density_host(bool *valid, bool *hd);
+
+// Type I STATUS Index bit (b1), live from ~INDEX. Required by HD-aware
+// formatters (FORMAT4 times the spindle with it); removable at runtime in
+// case the boot ROM's RESTORE check ever objects again (see compose_status).
+void fdc_set_index_bit(bool on);
+bool fdc_get_index_bit(void);
 
 // core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back

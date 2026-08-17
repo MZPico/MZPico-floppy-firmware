@@ -149,14 +149,17 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Build system:** ✅ Pico-SDK + CMake, pico-sdk 2.2.0 submodule (done, Phase 1).
 
 ### Still open
-- ~~**Apply density to the DENSEL pin.**~~ — ✅ superseded by **HD support**:
-  the `0xDE` port stays untrusted (the Disk BASIC ROM defines it but never
-  writes it, so its polarity is unknowable — still latched only), but density
-  itself is now the firmware's own determination (`density dd|hd|auto`, see the
-  Status entry) and DENSEL is driven best-effort from that model.
-- **HD support is implemented but not yet hardware-verified.** Bench first:
-  `density hd; fmtverify <track>` on a scratch HD disk, `enctest 18 2 1` for a
-  no-disk encoder round-trip, then a CP/M format/boot test.
+- ~~**Apply density to the DENSEL pin.**~~ — ✅ superseded by **HD support**,
+  and the `0xDE` mystery is solved by observation: CP/M 4.1 writes the port
+  (`0x00` all through DD work, `0x81` entering an HD format), so **b0 = 1 =
+  HD** and a host declaration now outranks the auto-detect latch. The Disk
+  BASIC ROM still never writes it, which is why the per-drive latch remains
+  the boot-time fallback. DENSEL is driven best-effort from the same model.
+- **HD support: write path hardware-verified** (HD `fmtverify` track scans
+  back CRC-clean at 500 kbit/s; `enctest 18 2 1` round-trips). A full CP/M HD
+  format ran up to FORMAT4's spindle-timing phase, which exposed the missing
+  Type I Index bit (now live — see the Status entry); the end-to-end HD
+  format is the remaining verification.
 - ~~**`~EXWAIT` budget**~~ — ✅ resolved: core1 comfortably services a register
   access inside the ~560 ns Z80 I/O window without wait states (see
   [docs/phase3-plan.md](docs/phase3-plan.md), risk #4).
@@ -363,8 +366,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     up; the index ends the command on a real WD, and CP/M's FORMAT4 fills
     whatever buffer we offer even for DD). That census is how a blank disk
     gets formatted HD; writes never auto-detect (the splice uses the latch,
-    established by the reads that precede any write). Port `0xDE` stays untrusted; DENSEL is driven
-    best-effort (3.5" drives sense HD from the media hole). Buffers are
+    established by the reads that precede any write). **Port `0xDE` is the
+    host's density declaration and outranks all of the above in auto mode** —
+    polarity observed from CP/M 4.1 (`0x00` throughout DD operation, `0x81`
+    entering an HD format): b0 = 1 = HD. Cleared on bus RESET so the boot ROM
+    falls back to the latch. The **Type I STATUS Index bit (b1) is now live
+    from `~INDEX`** (`idxbit 0` reverts): FORMAT4's HD path times the spindle
+    by polling it and froze forever against the old hardwired 0. DENSEL is
+    driven best-effort (3.5" drives sense HD from the media hole). Buffers are
     HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
     capture buffer already fit a full HD revolution). Verify bench-first:
     `enctest 18 2 1` (no disk), then `density hd; fmtverify` on a scratch HD

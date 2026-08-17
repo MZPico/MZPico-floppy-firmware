@@ -32,7 +32,8 @@ Usage:
     python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
     python mzp_probe.py PORT drvlock [0|1]                # pin every access to drive 0, ignoring port 0xDC (no arg = query)
     python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
-    python mzp_probe.py PORT density [dd|hd|auto]         # decode/encode density; auto = per-drive detect (no arg = query)
+    python mzp_probe.py PORT density [dd|hd|auto]         # density; auto = host 0xDE, else per-drive detect (no arg = query)
+    python mzp_probe.py PORT idxbit [0|1]                 # Type I STATUS Index bit from ~INDEX (no arg = query)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -84,6 +85,7 @@ MZP_CMD_ENCTEST = 0x81
 MZP_CMD_BUSDUMP = 0x82
 MZP_CMD_DRIVE = 0x83
 MZP_CMD_DENSITY = 0x9E
+MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -211,12 +213,14 @@ def effective_density(s):
     "MISSING sectors: [1..9]" on a perfectly good track.)"""
     s.write(bytes([MZP_CMD_DENSITY, 3, 3]))  # 3 = query
     s.flush()
-    r = read_exact(s, 9)
-    if len(r) != 9 or r[1] != 0:
+    r = read_exact(s, 11)
+    if len(r) != 11 or r[1] != 0:
         return 0
     mode = r[2]
     if mode < 2:
         return mode
+    if r[9]:  # the host has declared a density on 0xDE: it outranks the latch
+        return 1 if r[10] else 0
     s.write(bytes([MZP_CMD_DRVSEL, 3, 4]))  # 4 = query only
     s.flush()
     d = read_exact(s, 5)
@@ -1401,18 +1405,31 @@ def main():
                 raise SystemExit("density takes dd, hd or auto")
             s.write(bytes([MZP_CMD_DENSITY, 3, val & 0xFF]))
             s.flush()
-            r = read_exact(s, 9)
-            if len(r) == 9:
+            r = read_exact(s, 11)
+            if len(r) == 11:
                 mode = {0: "FORCED DD", 1: "FORCED HD",
-                        2: "auto (per-drive detect)"}.get(r[2], "?")
+                        2: "auto (host 0xDE, else per-drive detect)"}.get(r[2], "?")
                 flips = r[5] | (r[6] << 8) | (r[7] << 16) | (r[8] << 24)
                 print("density mode: %s" % mode)
+                print("  host 0xDE declaration: %s"
+                      % (("HD" if r[10] else "DD") if r[9]
+                         else "none since power-up/reset"))
                 print("  unit 0 latched: %s   unit 1 latched: %s"
                       % ("HD" if r[3] else "DD", "HD" if r[4] else "DD"))
                 print("  auto-detect flips since power-up: %d" % flips)
                 if flips > 4:
                     print("  ! many flips -- if this climbs on one disk, the "
                           "media is marginal at both clocks, not mixed-density")
+        elif cmd == "idxbit":
+            # Type I STATUS Index bit: 0 = off, 1 = on (default), no arg = query.
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            s.write(bytes([MZP_CMD_IDXBIT, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            print("Type I STATUS Index bit (b1): "
+                  + ("LIVE from ~INDEX (WD-faithful; HD formatters need it)"
+                     if len(r) == 3 and r[2] else
+                     "hardwired 0 (pre-HD behaviour)"))
         elif cmd == "drvlock":
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
             s.write(bytes([MZP_CMD_DRVLOCK, 3, val & 0xFF]))

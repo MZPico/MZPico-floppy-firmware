@@ -98,7 +98,15 @@ struct FdcState {
   volatile bool motor_on = false;
   volatile uint8_t drive_sel = 0;
   volatile bool side1 = false;
-  volatile bool density_single = false;
+  // Port 0xDE b0 as the host last wrote it, and whether it has EVER been
+  // written since power-up / bus reset. The polarity stopped being a guess
+  // the day CP/M 4.1's FORMAT4 was watched doing an HD format: 608 writes of
+  // 0x00 during ordinary DD operation, then 0x81 exactly as it switched to
+  // its HD phase -- b0 = 1 means HD, observed in both states. The valid flag
+  // is what keeps the boot ROM safe: it never writes the port, so boot-time
+  // density falls back to the per-drive latch (default DD).
+  volatile bool density_host_hd = false;
+  volatile bool density_host_valid = false;
 
   // Seek handshake core1 -> core0.
   volatile uint32_t op_seq = 0;  // bumped by core1 to request a physical move
@@ -600,6 +608,17 @@ volatile bool g_format_enable = true;
 // have to be removable without a reflash when the seek path is under suspicion.
 volatile bool g_posfix_enabled = true;
 
+// Type I STATUS Index bit (b1), live from the physical ~INDEX pin. A real
+// WD179x reports the raw IP input here and an HD-aware formatter NEEDS it:
+// FORMAT4's HD path times the spindle by polling this bit, and with it
+// hardwired to 0 the machine froze polling STATUS forever (65535+ reads of
+// 0x04, measured in `iotrace`). Runtime-switchable (`mzp_probe.py idxbit 0`)
+// because an earlier live-index experiment regressed the boot ROM's RESTORE
+// completion check into an infinite retry loop -- if that recurs, this must be
+// removable without a reflash, and the A/B settles whether that experiment's
+// polarity was simply wrong.
+volatile bool g_index_bit_enabled = true;
+
 namespace {
 
 // Record one register access. Values are stored exactly as they appear on the
@@ -755,6 +774,12 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   S.wr_armed = false;
   if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
     S.trk_op = 0;
+
+  // 3b. The resetting host's 0xDE density declaration dies with it: the
+  //     machine comes back up in the boot ROM, which never writes the port,
+  //     and must find the DD boot disk readable via the per-drive latch.
+  S.density_host_valid = false;
+  S.density_host_hd = false;
 
   // 4. WD Master Reset also loads 01 into the Sector register. It additionally
   //    executes a RESTORE, which we deliberately do NOT do: that would drive
@@ -969,6 +994,11 @@ ALWAYS_INLINE bool fdc_is_hd(void) {
     return false;
   if (g_density_mode == 1)
     return true;
+  // Auto: the host's own 0xDE declaration wins once it has made one (CP/M 4.1
+  // writes the port routinely -- 0 for DD, 1 for HD); the per-drive detected
+  // latch covers hosts that never do (the boot ROM).
+  if (S.density_host_valid)
+    return S.density_host_hd;
   return g_drive_hd[fdc_cur_idx()];
 }
 ALWAYS_INLINE float fdc_bit_us(void) {
@@ -1013,6 +1043,12 @@ static void fdc_note_density(bool hd) {
 // terminates after a single cheap sync-hunt pass, since no ID can decode.
 static bool fdc_try_other_density(const uint8_t *flux, size_t n_flux) {
   if (g_density_mode != 2 || n_flux == 0)
+    return false;
+  // Once the host has declared a density on 0xDE, do not second-guess it: a
+  // flip of our latch could not take effect anyway (the declaration
+  // outranks it), and a real WD given the wrong density by its host simply
+  // fails the read -- which is the honest answer here too.
+  if (S.density_host_valid)
     return false;
   float other = fdc_is_hd() ? FDC_DD_BIT_US : FDC_HD_BIT_US;
   uint8_t id[6];
@@ -1408,14 +1444,17 @@ inline uint8_t compose_status() {
       st |= 0x40; // WRITE PROTECT (b6 in the Type II layout, write commands
                   // only). Set only by the WRITE SECTOR stub -- see 3.3.
   } else {
-    // Type I layout: b2 Track00, b6 WriteProtect. Index (b1) intentionally left
-    // at 0 — tried tying it live to the physical ~INDEX pin, but the pulse is
-    // wide enough to persist across multiple STATUS polls, and the MZ-800 boot
-    // ROM's RESTORE-completion check turned out to be an exact/tight match that
-    // doesn't tolerate it toggling mid-check (unlike Disk BASIC's, which
-    // explicitly masks bit1 out of its own check) — regressed RESTORE into an
-    // infinite retry loop. A real WD presents Index as a one-shot edge-latched
-    // pulse, not a live level; revisit with that semantics if actually needed.
+    // Type I layout: b1 Index, b2 Track00, b6 WriteProtect.
+    // Index is the LIVE ~INDEX sense (active low -> bit set during the pulse,
+    // ~2% duty), which is what a real WD179x reports. It stopped being
+    // optional when FORMAT4's HD path was watched freezing on it: the
+    // formatter times the spindle by polling this bit. An earlier live-index
+    // attempt regressed the boot ROM's RESTORE check -- hence g_index_bit
+    // stays runtime-removable (`idxbit 0`) until a boot has been seen clean
+    // with it on. Gated on motor_on so an idle spindle shows no phantom
+    // pulses; one gpio_get on a STATUS read costs nothing that matters.
+    if (g_index_bit_enabled && S.motor_on && !gpio_get(PIN_INDEX))
+      st |= 0x02; // INDEX
     if (S.at_track0)
       st |= 0x04; // TRACK 00
     if (S.seek_error)
@@ -1829,13 +1868,15 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     S.side1 = g_invert_side ? !rom_side1 : rom_side1;
     break;
   }
-  case 0xDE: // DENSITY (not CPL'd): b0 = density select.
-    // Latched only -- deliberately not driven onto DENSEL. The Disk BASIC ROM
-    // defines this port and never writes it, so nothing has ever told us which
-    // way round b0 goes, and the two documented readings disagree. Guessing
-    // would risk a machine that currently boots in order to serve media this
-    // platform does not have. See docs/wd-fidelity.md.
-    S.density_single = (raw & 0x01) != 0;
+  case 0xDE: // DENSITY (not CPL'd): b0 = density select, 1 = HD.
+    // The polarity is OBSERVED, not guessed: CP/M 4.1 writes 0x00 here
+    // throughout ordinary DD operation (608 writes counted in one session)
+    // and 0x81 at the moment FORMAT4 switches to an HD format. This is the
+    // host's density declaration and, in auto mode, the primary source of
+    // truth -- see fdc_is_hd(). The Disk BASIC boot ROM never writes the
+    // port, which is what the valid flag is for.
+    S.density_host_hd = (raw & 0x01) != 0;
+    S.density_host_valid = true;
     // Bus-test read-back channel: during the 0xDF loopback the test program
     // writes here whatever it just read from 0xDF. Compare against the byte we
     // drove. (Purely additive -- density still applies as normal.)
@@ -2590,6 +2631,14 @@ void fdc_set_density_mode(uint8_t mode) {
     g_drive_hd[fdc_cur_idx()] = true;
 }
 uint8_t fdc_get_density_mode(void) { return g_density_mode; }
+void fdc_density_host(bool *valid, bool *hd) {
+  if (valid)
+    *valid = S.density_host_valid;
+  if (hd)
+    *hd = S.density_host_hd;
+}
+void fdc_set_index_bit(bool on) { g_index_bit_enabled = on; }
+bool fdc_get_index_bit(void) { return g_index_bit_enabled; }
 bool fdc_drive_density_hd(int unit) {
   return (unit >= 0 && unit < FDC_DRIVE_MAX) ? g_drive_hd[unit] : false;
 }
