@@ -2426,6 +2426,7 @@ void fdc_set_posfix(bool on) {
 }
 bool fdc_get_posfix(void) { return g_posfix_enabled; }
 bool fdc_get_write_enable(void) { return g_write_enable; }
+bool fdc_is_active(void) { return S.active; }
 
 // ---- core0 (disk) ---------------------------------------------------------
 

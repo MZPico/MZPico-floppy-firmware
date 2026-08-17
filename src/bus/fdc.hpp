@@ -101,6 +101,13 @@ bool fdc_get_posfix(void);
 // fights the greaseweazle/USB drive control when no machine is attached.
 void fdc_disk_task(void);
 
+// Has the MZ-800 ever touched an FDC port this power-up? The mirror of the
+// no-op rule above: once this is true, the FDC owns the (shared) FloppyDrive
+// instances, and the greaseweazle/USB side must keep its hands off them -- in
+// particular its idle watchdog, which would otherwise park the head and stop
+// the motor under a running machine every 10 s of USB silence.
+bool fdc_is_active(void);
+
 // Debug snapshot of the FDC state (for the USB probe). Call on core0.
 struct FdcDebug {
   uint8_t status;  // composed Type I STATUS (true, un-inverted)

@@ -187,14 +187,30 @@ static bool setbustype(int bustype) {
   return floppy->begin();
 }
 
-static uint8_t get_cmd(uint8_t *buff, uint8_t maxbuff) {
+// Read one framed command: [cmd, len, payload...] with len counting the whole
+// frame. Returns the frame length, 0 if no complete command is waiting, or -1
+// for a malformed frame -- which the caller answers with BADCMD.
+//
+// A malformed frame must still leave the stream FRAMED. The old version
+// returned with an oversized frame's payload unread (each payload byte was
+// then parsed as a fresh command -- one bad frame became a storm of BADCMDs
+// and, worse, whatever commands the payload happened to spell), and a len of 0
+// returned "no command" after consuming two bytes. So: an oversized frame's
+// declared payload is drained and discarded here, and both malformed shapes
+// are reported instead of half-handled.
+static int get_cmd(uint8_t *buff, uint8_t maxbuff) {
   if (cdc_avail() < 2)
     return 0;
   buff[0] = cdc_read1();
   buff[1] = cdc_read1();
   uint8_t len = buff[1];
-  if (len < 2 || len > maxbuff)
-    return len; // malformed; caller will BADCMD
+  if (len < 2)
+    return -1; // header alone is broken; nothing more of it to consume
+  if (len > maxbuff) {
+    for (int i = 2; i < len; i++)
+      (void)cdc_read1(); // keep the stream in sync; the frame itself is junk
+    return -1;
+  }
   for (int i = 2; i < len; i++)
     buff[i] = cdc_read1();
   return len;
@@ -222,17 +238,26 @@ void gw_init() {
 }
 
 void gw_task() {
-  uint8_t cmd_len = get_cmd(cmd_buffer, sizeof(cmd_buffer));
+  int cmd_len = get_cmd(cmd_buffer, sizeof(cmd_buffer));
   if (!cmd_len) {
-    // idle watchdog: park the head and stop the motor after 10s
+    // idle watchdog: park the head and stop the motor after 10s of USB
+    // silence -- but NEVER once the MZ-800 has spoken. The FDC bridge and this
+    // gw path share the same FloppyDrive instances, and `floppy` stays pointed
+    // at drive 0 after any USB session; without this guard, running `gw rpm`
+    // and then booting the machine (no power cycle) had the watchdog see the
+    // FDC's spinning motor every 10 s, park the head to track 0 and stop the
+    // spindle under CP/M. The mirror of fdc_disk_task's "idle until the MZ-800
+    // talks to us" rule.
     if ((millis() > timestamp) && ((millis() - timestamp) > 10000)) {
-      if (floppy && floppy->motor_is_spinning()) {
-        floppy->select(true);
-        floppy->goto_track(0);
-        floppy->spin_motor(false);
+      if (!fdc_is_active()) {
+        if (floppy && floppy->motor_is_spinning()) {
+          floppy->select(true);
+          floppy->goto_track(0);
+          floppy->spin_motor(false);
+        }
+        if (floppy && floppy->drive_is_selected())
+          floppy->select(false);
       }
-      if (floppy && floppy->drive_is_selected())
-        floppy->select(false);
       timestamp = millis();
     }
     return;
@@ -244,6 +269,12 @@ void gw_task() {
   uint8_t len = cmd_buffer[1];
   memset(reply_buffer, 0, sizeof(reply_buffer));
   reply_buffer[i++] = cmd; // echo the cmd byte
+
+  if (cmd_len < 0) { // malformed frame (see get_cmd); payload already drained
+    reply_buffer[i++] = GW_ACK_BADCMD;
+    cdc_write_all(reply_buffer, 2);
+    return;
+  }
 
   if (cmd == GW_CMD_GETINFO) {
     uint8_t sub_cmd = cmd_buffer[2];
@@ -281,6 +312,13 @@ void gw_task() {
   }
 
   else if (cmd == GW_CMD_GETPARAMS) {
+    // `floppy` is null until SETBUSTYPE; without this guard a host that asks
+    // for the delays first reads them from address 0.
+    if (!floppy) {
+      reply_buffer[i++] = GW_ACK_BADCMD;
+      cdc_write_all(reply_buffer, 2);
+      return;
+    }
     uint8_t sub_cmd = cmd_buffer[2];
     if (sub_cmd == GW_CMD_GETPARAMS_DELAYS) {
       reply_buffer[i++] = GW_ACK_OK;
@@ -530,6 +568,11 @@ void gw_task() {
   }
 
   else if (cmd == GW_CMD_GETPIN) {
+    if (!floppy) { // same guard as SETPIN: null until SETBUSTYPE
+      reply_buffer[i++] = GW_ACK_BADCMD;
+      cdc_write_all(reply_buffer, 2);
+      return;
+    }
     uint32_t pin = cmd_buffer[2];
     if (pin == GW_CMD_GETPIN_TRACK0) {
       reply_buffer[i++] = GW_ACK_OK;
