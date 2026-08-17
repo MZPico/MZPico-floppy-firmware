@@ -77,6 +77,7 @@
 #define MZP_CMD_DRVSEL 0x9B    // bench: which unit (~DS0/~DS1) the FDC drives
 #define MZP_CMD_DRVLOCK 0x9C   // pin every access to drive 0 (escape hatch)
 #define MZP_CMD_DRVSTAT 0x9D   // per-drive state for ALL units at once
+#define MZP_CMD_DENSITY 0x9E   // density: force DD/HD or auto-detect (default)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1294,6 +1295,23 @@ void gw_task() {
       reply_buffer[i++] = (uint8_t)tgt;
       reply_buffer[i++] = fl;
     }
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_DENSITY) {
+    // cmd_buffer[2]: 0 = force DD, 1 = force HD, 2 = auto, 3 = query.
+    // Reply: [cmd, ACK, mode, unit0_hd, unit1_hd, flips(4 LE)].
+    if (cmd_buffer[2] < 3)
+      fdc_set_density_mode(cmd_buffer[2]);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_density_mode();
+    reply_buffer[i++] = fdc_drive_density_hd(0) ? 1 : 0;
+    reply_buffer[i++] = fdc_drive_density_hd(1) ? 1 : 0;
+    uint32_t flips = fdc_density_flips();
+    reply_buffer[i++] = flips & 0xFF;
+    reply_buffer[i++] = (flips >> 8) & 0xFF;
+    reply_buffer[i++] = (flips >> 16) & 0xFF;
+    reply_buffer[i++] = (flips >> 24) & 0xFF;
     cdc_write_all(reply_buffer, i);
   }
 

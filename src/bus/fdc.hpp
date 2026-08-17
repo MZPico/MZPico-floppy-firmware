@@ -55,8 +55,20 @@ void fdc_bench_release(void);
 // board has no select line for. `track` is the drive's own position belief
 // (-1 = unknown), `target` the head target core1 folds Type I steps into.
 // flags: b0 ready (index seen on the last spin-up), b1 ever spun up,
-//        b2 currently selected.
+//        b2 currently selected, b3 latched density is HD.
 bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags);
+
+// Density (DD 250 kbit/s vs HD 500 kbit/s, both 300 rpm). mode 0 = force DD,
+// 1 = force HD, 2 = auto (default): per-drive latched density, flipped when a
+// capture that decodes to nothing at the latched bit clock proves out at the
+// other one (CRC-valid ID field required). Forcing a mode also writes the
+// current drive's latch, so returning to auto starts from the proven density.
+// The host never signals density (the ROM defines port 0xDE but nothing writes
+// it), so this knob + the auto-detect are the only sources of truth.
+void fdc_set_density_mode(uint8_t mode);
+uint8_t fdc_get_density_mode(void);
+bool fdc_drive_density_hd(int unit); // the per-drive latch
+uint32_t fdc_density_flips(void);    // auto-detect flips since power-up
 
 // core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back

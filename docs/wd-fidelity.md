@@ -54,16 +54,26 @@ booting CP/M: every MZ-800 CP/M image carries its 16×256 IPL track on
 cyl0/head1 as a PC reads it. Runtime-togglable for A/B testing via
 `mzp_probe.py sideswap`.
 
-**Density is decoded but deliberately not applied** — `0xDE` is latched and
-reported, but not wired to the DENSEL pin and not used to pick the bit time, and
-that is now a decision rather than a to-do. The Disk BASIC ROM defines
+**The `0xDE` port is decoded but deliberately not trusted** — it is latched and
+reported, but never used to pick the density. The Disk BASIC ROM defines
 `DE_REG = 0DEH` and **never writes it** (checked against `MZ2Z046.ASM`), so
 there is no observed traffic to infer the bit's polarity from — the two
-candidate readings ("b0=1 means HD" vs "b0=1 means single density") disagree,
-and driving DENSEL on a guess would break a machine that currently boots, to
-serve media that does not exist for this platform. MZ-800 media is DD
-throughout. Revisit only if a host is found that writes the port; `iotrace`
-will show it.
+candidate readings ("b0=1 means HD" vs "b0=1 means single density") disagree.
+Revisit only if a host is found that writes the port; `iotrace` will show it.
+
+**Density (DD vs HD MFM) is instead the firmware's own determination** —
+`mzp_probe.py density dd|hd|auto`. In auto (the default) each drive carries a
+latched density (default DD, the machine's native format): a capture that
+decodes to *nothing* at the latched bit clock is re-decoded at the other one —
+the capture window is sized in time (a revolution is 200 ms at either density
+on a 300 rpm 3.5" drive), so the same flux serves both — and a CRC-valid ID
+field at the other clock flips the latch. A host WRITE TRACK infers density
+from the format image's length (~6250 bytes DD vs ~12500 HD), which is what
+lets a blank disk be formatted HD. Writes never auto-detect: the splice uses
+the latched density, which reading (or READ ADDRESS) will have established.
+DENSEL (the shared `~DEN_RDY` pin) is driven best-effort from the same model;
+nothing relies on it — the target 3.5" drives sense HD from the media hole.
+FM/single density remains out of scope.
 
 ## Interrupts — DRQ-driven, not INTRQ-driven
 

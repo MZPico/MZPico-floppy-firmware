@@ -32,6 +32,7 @@ Usage:
     python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
     python mzp_probe.py PORT drvlock [0|1]                # pin every access to drive 0, ignoring port 0xDC (no arg = query)
     python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
+    python mzp_probe.py PORT density [dd|hd|auto]         # decode/encode density; auto = per-drive detect (no arg = query)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -81,6 +82,7 @@ MZP_CMD_SCAN = 0x80
 MZP_CMD_ENCTEST = 0x81
 MZP_CMD_BUSDUMP = 0x82
 MZP_CMD_DRIVE = 0x83
+MZP_CMD_DENSITY = 0x9E
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -1352,17 +1354,38 @@ def main():
                 print("selected unit %d   ~DS0=%d %s   ~DS1=%d %s"
                       % (r[2], r[3], "ASSERTED" if r[3] == 0 else "released",
                          r[4], "ASSERTED" if r[4] == 0 else "released"))
-                print("  unit  head  target  ready  spun  selected")
+                print("  unit  head  target  ready  spun  dens  selected")
                 for u in range(2):
                     trk, tgt, fl = r[5 + u * 3], r[6 + u * 3], r[7 + u * 3]
-                    print("   %d    %5s  %6d  %5s  %4s  %s"
+                    print("   %d    %5s  %6d  %5s  %4s  %4s  %s"
                           % (u, "?" if trk == 0xFF else trk, tgt,
                              "yes" if fl & 1 else "NO",
                              "yes" if fl & 2 else "no",
+                             "HD" if fl & 8 else "DD",
                              "yes" if fl & 4 else ""))
                 h0, h1 = r[5], r[8]
                 if h0 != 0xFF and h1 != 0xFF and h0 == h1:
                     print("  (both heads on the same cylinder -- park them apart to test independence)")
+        elif cmd == "density":
+            # 0 = force DD, 1 = force HD, 2 = auto (default), 3 = query.
+            names = {"dd": 0, "hd": 1, "auto": 2}
+            val = names.get(sys.argv[3].lower(), None) if len(sys.argv) > 3 else 3
+            if val is None:
+                raise SystemExit("density takes dd, hd or auto")
+            s.write(bytes([MZP_CMD_DENSITY, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 9)
+            if len(r) == 9:
+                mode = {0: "FORCED DD", 1: "FORCED HD",
+                        2: "auto (per-drive detect)"}.get(r[2], "?")
+                flips = r[5] | (r[6] << 8) | (r[7] << 16) | (r[8] << 24)
+                print("density mode: %s" % mode)
+                print("  unit 0 latched: %s   unit 1 latched: %s"
+                      % ("HD" if r[3] else "DD", "HD" if r[4] else "DD"))
+                print("  auto-detect flips since power-up: %d" % flips)
+                if flips > 4:
+                    print("  ! many flips -- if this climbs on one disk, the "
+                          "media is marginal at both clocks, not mixed-density")
         elif cmd == "drvlock":
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
             s.write(bytes([MZP_CMD_DRVLOCK, 3, val & 0xFF]))

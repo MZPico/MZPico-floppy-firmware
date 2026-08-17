@@ -149,10 +149,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Build system:** ✅ Pico-SDK + CMake, pico-sdk 2.2.0 submodule (done, Phase 1).
 
 ### Still open
-- ~~**Apply density to the DENSEL pin.**~~ — ✅ closed as **"not to be done"**:
-  the Disk BASIC ROM defines port `0xDE` but never writes it, so its polarity is
-  unknowable and nothing needs it (MZ-800 media is DD). The bit is latched only
-  (`density_single`), deliberately not driven onto DENSEL.
+- ~~**Apply density to the DENSEL pin.**~~ — ✅ superseded by **HD support**:
+  the `0xDE` port stays untrusted (the Disk BASIC ROM defines it but never
+  writes it, so its polarity is unknowable — still latched only), but density
+  itself is now the firmware's own determination (`density dd|hd|auto`, see the
+  Status entry) and DENSEL is driven best-effort from that model.
+- **HD support is implemented but not yet hardware-verified.** Bench first:
+  `density hd; fmtverify <track>` on a scratch HD disk, `enctest 18 2 1` for a
+  no-disk encoder round-trip, then a CP/M format/boot test.
 - ~~**`~EXWAIT` budget**~~ — ✅ resolved: core1 comfortably services a register
   access inside the ~560 ns Z80 I/O window without wait states (see
   [docs/phase3-plan.md](docs/phase3-plan.md), risk #4).
@@ -342,6 +346,23 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
       originally used the greaseweazle drive object, hardwired to `~DS0`, so
       `drive 1; scan` silently read drive 0 — and `fmtverify` would have
       formatted one disk and verified another.
+  - **HD (500 kbit/s) support: implemented, not yet hardware-verified.** Target
+    is 3.5" HD at 300 rpm — the revolution time is unchanged, only the bit
+    clock halves — so the capture window became **time-based** (~1.05 rev,
+    `FDC_READ_CAPTURE_WINDOW_US`) and the same captured flux serves either
+    density. Density is the firmware's own determination (`mzp_probe.py
+    density dd|hd|auto`, default auto): a per-drive latch (default DD),
+    flipped when a capture that decodes to nothing at the latched bit clock
+    yields a CRC-valid ID at the other one — no recapture needed. A host
+    WRITE TRACK infers density from its image length (~6250 bytes DD vs
+    ~12500 HD), which is how a blank disk gets formatted HD; writes never
+    auto-detect (the splice uses the latch, established by the reads that
+    precede any write). Port `0xDE` stays untrusted; DENSEL is driven
+    best-effort (3.5" drives sense HD from the media hole). Buffers are
+    HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
+    capture buffer already fit a full HD revolution). Verify bench-first:
+    `enctest 18 2 1` (no disk), then `density hd; fmtverify` on a scratch HD
+    disk. See [docs/wd-fidelity.md](docs/wd-fidelity.md).
 - **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
   testing (the `wrsoak` run so far is minutes, not hours, and has met only one
   spindle), catching the rare boot `FD:Loading error` with `firstfail`.

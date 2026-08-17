@@ -46,10 +46,17 @@ static constexpr int FDC_SIZE_CACHE_N = FDC_MAX_CYLINDER + 1;
 // hardware has no select line for; those report NOT READY.
 static constexpr int FDC_DRIVE_MAX = 2;
 // One track's worth of host-visible bytes. A DD track at 250 kbit/s and 300 rpm
-// is ~6250 bytes; the margin covers a slow spindle and READ TRACK's inserted
-// sync-mark bytes. This bounds WRITE TRACK, so a host that never stops sending
-// cannot run off the end of it.
-static constexpr uint16_t FDC_TRACK_IMAGE_MAX = 7200;
+// is ~6250 bytes; an HD track at 500 kbit/s is ~12500. Sized for HD plus the
+// margin that covers a slow spindle and READ TRACK's inserted sync-mark bytes.
+// This bounds WRITE TRACK, so a host that never stops sending cannot run off
+// the end of it.
+static constexpr uint16_t FDC_TRACK_IMAGE_MAX = 13000;
+// A format image longer than any DD track can be is an HD format. The two
+// populations are far apart -- ~6250 vs ~12500 bytes, and every formatter
+// emits close to the full track -- so this single threshold is what lets a
+// host format a BLANK disk at the density it intends, which auto-detection
+// from the media cannot do (blank media decodes at no density).
+static constexpr uint16_t FDC_TRACK_IMAGE_HD_MIN = 9000;
 // The host has stopped shifting format bytes in. A real WD ends WRITE TRACK on
 // the index pulse and simply ignores anything still coming; we have to buffer
 // the image before writing it, so instead we take a gap in the byte stream as
@@ -60,10 +67,12 @@ static constexpr uint32_t FDC_TRACK_IDLE_US = 4000;
 // bytes and even a minimal one-sector format runs far longer; this bound exists
 // to reject glitches, not to validate geometry.
 static constexpr uint16_t FDC_TRACK_IMAGE_MIN = 256;
-// Flux budget for one formatted track. A revolution is ~43.5k transitions
-// (measured); 48k leaves the write with flux still queued when the terminating
-// index pulse arrives, which is what stops it running out early.
-static constexpr size_t FDC_TRACK_FLUX_MAX = 48000;
+// Flux budget for one formatted track. A DD revolution is ~43.5k transitions
+// (measured) and an HD one about double; the margin leaves the write with flux
+// still queued when the terminating index pulse arrives, which is what stops
+// it running out early.
+static constexpr size_t FDC_TRACK_FLUX_MAX_DD = 48000;
+static constexpr size_t FDC_TRACK_FLUX_MAX_HD = 96000;
 
 // Size code N means 128 << N bytes, so 512 is 2. MZ-800 CP/M data tracks are
 // 9x512 (N=2); the boot track is 16x256 (N=1).
@@ -754,6 +763,7 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
 bool g_applied_select = false;
 bool g_applied_motor = false; // physical motor state (may lag S.motor_on)
 int g_applied_side = -1;
+int g_applied_density = -1; // DENSEL pin shadow: -1 unknown, 0 DD, 1 HD
 bool g_timing_set = false;
 uint32_t g_motor_off_at = 0; // deferred motor-stop deadline (ms; 0 = none)
 // Has this drive's spindle been confirmed turning (index seen) since boot?
@@ -916,9 +926,89 @@ static bool fdc_apply_drive_select(void) {
   return true;
 }
 
-// MZ-800 disks are MFM double-density: 250 kbit/s -> 2.0 µs nominal bit time.
-// (FM/single-density decode is out of scope until 3.4; see 0xDE density port.)
+// MZ-800 native disks are MFM double-density: 250 kbit/s -> 2.0 µs nominal bit
+// time. HD (3.5" 1.44M-style) is 500 kbit/s -> 1.0 µs at the same 300 rpm --
+// only the bit clock changes, the revolution time does not, which is what lets
+// one time-based capture window serve both. (FM/single density remains out of
+// scope; see the 0xDE density port.)
 static constexpr float FDC_DD_BIT_US = 2.0f;
+static constexpr float FDC_HD_BIT_US = 1.0f;
+
+// ---- Density (DD vs HD) ----------------------------------------------------
+//
+// Nothing on the MZ-800 side reliably says which density a disk is: the Disk
+// BASIC ROM never writes the density port (0xDE), and its bit polarity is
+// unknowable from the ROM alone. So the density used for decode/encode is OURS
+// to determine:
+//   mode 0 = force DD, 1 = force HD (bench/probe override, `density dd|hd`),
+//   mode 2 = AUTO (default): each drive has a latched density, and a capture
+//     that decodes to nothing at the latched bit clock is re-decoded at the
+//     other one -- same flux, no extra revolution, because the capture window
+//     is sized in TIME (a revolution is 200 ms at either density). An ID field
+//     with a valid CRC at the other clock flips the latch.
+// The latch is per drive for the same reason the size cache is: two drives can
+// hold different media. Default DD -- the machine's native format, and what
+// every boot must assume. Writes never auto-detect: a splice rides the disk
+// live, so it uses the latched density, which any host will have established
+// by reading (or READ ADDRESS) before it writes. Formatting a blank disk
+// cannot auto-detect from media; the format IMAGE length decides instead (see
+// FDC_TRACK_IMAGE_HD_MIN).
+volatile uint8_t g_density_mode = 2;
+volatile bool g_drive_hd[FDC_DRIVE_MAX] = {false, false};
+volatile uint32_t g_dens_flips = 0;
+
+ALWAYS_INLINE bool fdc_is_hd(void) {
+  if (g_density_mode == 0)
+    return false;
+  if (g_density_mode == 1)
+    return true;
+  return g_drive_hd[fdc_cur_idx()];
+}
+ALWAYS_INLINE float fdc_bit_us(void) {
+  return fdc_is_hd() ? FDC_HD_BIT_US : FDC_DD_BIT_US;
+}
+ALWAYS_INLINE size_t fdc_track_flux_max(void) {
+  return fdc_is_hd() ? FDC_TRACK_FLUX_MAX_HD : FDC_TRACK_FLUX_MAX_DD;
+}
+
+// Record an observed density for the drive core0 is driving (auto mode only --
+// a forced mode is a bench statement of fact and must not be second-guessed).
+static void fdc_note_density(bool hd) {
+  if (g_density_mode != 2)
+    return;
+  int d = fdc_cur_idx();
+  if (g_drive_hd[d] != hd) {
+    g_drive_hd[d] = hd;
+    g_dens_flips++;
+  }
+}
+
+// A decode at the latched bit clock found NOTHING -- is the disk written at
+// the other density? Re-scan the same flux at the other clock; an ID field
+// with a valid CRC there (the CRC is what stops noise flipping the latch) is
+// proof, so flip the latch and tell the caller to re-decode. The flux needs no
+// recapture: the window is sized in time, so it holds a full revolution at
+// either density, and the deltas themselves are clock-agnostic.
+//
+// Only for auto mode, and only when the current decode saw NO IDs -- a
+// wrong-cylinder or wrong-sector result means the current clock is reading the
+// media fine and the problem is positional, not spectral.
+static bool fdc_try_other_density(const uint8_t *flux, size_t n_flux) {
+  if (g_density_mode != 2 || n_flux == 0)
+    return false;
+  float other = fdc_is_hd() ? FDC_DD_BIT_US : FDC_HD_BIT_US;
+  SectorInfo ids[4];
+  int ns = mfm_scan_track(flux, n_flux, other, ids, 4, g_secbuf,
+                          sizeof(g_secbuf));
+  bool proven = false;
+  for (int k = 0; k < ns; ++k)
+    if (ids[k].id_crc_ok)
+      proven = true;
+  if (!proven)
+    return false;
+  fdc_note_density(!fdc_is_hd());
+  return true;
+}
 
 // Index is active-low. Waiting for a falling edge aligns capture close to the
 // start of a revolution (sector 1 conventionally follows index).
@@ -937,16 +1027,21 @@ static bool wait_for_index_falling_edge_ms(uint32_t timeout_ms) {
   return true;
 }
 
-// Type-I Verify can tolerate a longer pre-capture wait.
-// One disk revolution is ~43.5k flux transitions at DD (measured with `scan`).
-// Capture ~1.05 revolutions: enough that every sector passes the head once,
-// with a small margin for spindle-speed variation. The host's measured patience
-// after a READ is ~285 ms (25k STATUS polls, see `rddiag`) and a revolution is
-// ~200 ms, so this window has to stay tight -- 1.25 revolutions left only ~7 ms
-// of headroom. Used by both the Type II read window and the Type I Verify pass.
-static constexpr size_t FDC_READ_CAPTURE_BYTES = 45700;
-// Safety bound on any capture window (a revolution is ~200 ms).
-static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
+// The capture window is sized in TIME, not bytes: ~1.05 revolutions, so every
+// sector passes the head once with a small margin for spindle-speed variation.
+// Time rather than bytes because the byte rate depends on density (a DD
+// revolution is ~43.5k flux transitions, measured with `scan`; HD is about
+// double) while the revolution is 200 ms either way -- so one window serves
+// both, and auto-detect can re-decode the same capture at the other bit clock.
+// The host's measured patience after a READ is ~285 ms (25k STATUS polls, see
+// `rddiag`), so the window has to stay tight: 1.25 revolutions left only ~7 ms
+// of headroom for the decode. Used by both the Type II read window and the
+// Type I Verify pass.
+static constexpr uint32_t FDC_READ_CAPTURE_WINDOW_US = 210000;
+// Byte backstop for that window -- 1.05 HD revolutions with margin. Never the
+// binding limit on a healthy capture; it exists so a runaway drain can't walk
+// past the buffer maths below.
+static constexpr size_t FDC_READ_CAPTURE_BYTES = 96000;
 
 static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
 
@@ -1024,12 +1119,17 @@ static bool fdc_verify_track(uint8_t track) {
   size_t want = (cap < FDC_READ_CAPTURE_BYTES) ? cap : FDC_READ_CAPTURE_BYTES;
   size_t n = 0;
   uint32_t t0 = time_us_32();
-  while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US)
+  while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_WINDOW_US)
     n = rp2040_flux_capture_drain(flux, want, n, /*store_greaseweazle=*/false);
   rp2040_flux_capture_stop();
 
   S.verify_n = (uint32_t)n;
-  bool ok = (n > 0) && mfm_verify_track(flux, n, FDC_DD_BIT_US, track);
+  bool ok = (n > 0) && mfm_verify_track(flux, n, fdc_bit_us(), track);
+  // Nothing decodable at the latched density: check the other one before
+  // declaring a seek error -- a Verify is often the first thing to touch a
+  // freshly inserted disk, so this is where a DD->HD swap gets noticed.
+  if (!ok && n > 0 && fdc_try_other_density(flux, n))
+    ok = mfm_verify_track(flux, n, fdc_bit_us(), track);
 
   if (!ok && n > 0) {
     // Compatibility fallback for ROM bring-up: some media/boot tracks can carry
@@ -1038,7 +1138,7 @@ static bool fdc_verify_track(uint8_t track) {
     // is visible on-track. This keeps the ROM path moving while preserving
     // strict read CRC/RNF checks in Type II data transfer.
     SectorInfo ids[32];
-    int ns = mfm_scan_track(flux, n, FDC_DD_BIT_US, ids, 32, g_secbuf,
+    int ns = mfm_scan_track(flux, n, fdc_bit_us(), ids, 32, g_secbuf,
                             sizeof(g_secbuf));
     for (int i = 0; i < ns; ++i) {
       if (ids[i].id_crc_ok) {
@@ -1082,7 +1182,7 @@ static void fdc_capture_window(size_t want_bytes) {
   S.rd_capture_ok = g_stream_active;
   if (g_stream_active) {
     while (g_flux_n < want &&
-           (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US) {
+           (time_us_32() - t0) < FDC_READ_CAPTURE_WINDOW_US) {
       g_flux_n = rp2040_flux_capture_drain(flux, want, g_flux_n,
                                            /*store_greaseweazle=*/false);
     }
@@ -1122,10 +1222,15 @@ static bool fdc_read_address_search(uint8_t *id_out) {
         g_flux_n = rp2040_flux_capture_drain(flux, limit, g_flux_n,
                                              /*store_greaseweazle=*/false);
       }
-      found = mfm_read_address(flux, g_flux_n, FDC_DD_BIT_US, id_out);
+      found = mfm_read_address(flux, g_flux_n, fdc_bit_us(), id_out);
     }
     rp2040_flux_capture_stop();
     g_stream_active = false;
+    // No ID inside the whole search budget: try the other density on what was
+    // captured. READ ADDRESS is how CP/M probes a disk it knows nothing about,
+    // so this is the auto-detect path an HD disk usually takes first.
+    if (!found && fdc_try_other_density(flux, g_flux_n))
+      found = mfm_read_address(flux, g_flux_n, fdc_bit_us(), id_out);
   }
   S.rd_capture_us = time_us_32() - t0;
   S.rd_flux_n = g_flux_n;
@@ -1136,7 +1241,7 @@ static bool fdc_read_address_search(uint8_t *id_out) {
 // wanted 3" is a diagnosis; "RNF" is not.
 static void fdc_note_track_ids(const uint8_t *flux, size_t n_flux) {
   SectorInfo ids[40];
-  int ns = mfm_scan_track(flux, n_flux, FDC_DD_BIT_US, ids, 40, g_secbuf,
+  int ns = mfm_scan_track(flux, n_flux, fdc_bit_us(), ids, 40, g_secbuf,
                           sizeof(g_secbuf));
   S.rd_ids_seen = (ns < 0) ? 0 : (uint8_t)ns;
   for (int k = 0; k < 16; ++k)
@@ -2227,7 +2332,7 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
 
   SpliceResult sr =
       mfm_write_sector(sector, (int)track, data, n, /*deleted=*/false,
-                       FDC_DD_BIT_US, FDC_WRITE_SEARCH_TIMEOUT_US);
+                       fdc_bit_us(), FDC_WRITE_SEARCH_TIMEOUT_US);
   fdc_record_splice(sr);
   if (sr.id_found) {
     fdc_note_size_code(track, sr.size_n);
@@ -2326,14 +2431,17 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
 
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
-  size_t limit = (cap < FDC_TRACK_FLUX_MAX) ? cap : FDC_TRACK_FLUX_MAX;
-  size_t n_flux = mfm_encode_format_image(flux, limit, img, n, FDC_DD_BIT_US);
+  // Encoded at the EFFECTIVE density (`density dd|hd` from the probe, or the
+  // drive's latched density in auto mode) -- formatting is the one operation
+  // where the media cannot say, so the knob is the authority on the bench.
+  size_t limit = (cap < fdc_track_flux_max()) ? cap : fdc_track_flux_max();
+  size_t n_flux = mfm_encode_format_image(flux, limit, img, n, fdc_bit_us());
   if (!n_flux) {
     if (out_result)
       *out_result = 2; // image would not fit
     return 0;
   }
-  n_flux = mfm_encode_gap_fill(flux, n_flux, limit, FDC_DD_BIT_US);
+  n_flux = mfm_encode_gap_fill(flux, n_flux, limit, fdc_bit_us());
   bool ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
                              /*use_index=*/true);
   if (out_result)
@@ -2366,7 +2474,7 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
   size_t nflux = DRV->capture_track(flux_buf, flux_cap, &idx,
                                     /*store_greaseweazle=*/false,
                                     /*capture_ms=*/220, /*index_wait_ms=*/250);
-  size_t n = mfm_read_track_raw(flux_buf, nflux, FDC_DD_BIT_US,
+  size_t n = mfm_read_track_raw(flux_buf, nflux, fdc_bit_us(),
                                 (uint8_t *)S.track_buf, FDC_TRACK_IMAGE_MAX);
   S.trk_last_bytes = (uint16_t)n;
   return (uint16_t)n;
@@ -2404,6 +2512,8 @@ bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags) {
       f |= 0x02;
     if (unit == g_cur_drive && g_applied_select)
       f |= 0x04;
+    if (g_drive_hd[unit])
+      f |= 0x08; // latched density: HD (auto-detected or bench-forced)
     *flags = f;
   }
   return true;
@@ -2427,6 +2537,22 @@ void fdc_set_posfix(bool on) {
 bool fdc_get_posfix(void) { return g_posfix_enabled; }
 bool fdc_get_write_enable(void) { return g_write_enable; }
 bool fdc_is_active(void) { return S.active; }
+
+void fdc_set_density_mode(uint8_t mode) {
+  g_density_mode = (mode > 2) ? 2 : mode;
+  // Forcing a density also teaches the latch: when the mode later returns to
+  // auto, the drive starts from the density the bench just proved, not from a
+  // stale guess.
+  if (g_density_mode == 0)
+    g_drive_hd[fdc_cur_idx()] = false;
+  else if (g_density_mode == 1)
+    g_drive_hd[fdc_cur_idx()] = true;
+}
+uint8_t fdc_get_density_mode(void) { return g_density_mode; }
+bool fdc_drive_density_hd(int unit) {
+  return (unit >= 0 && unit < FDC_DRIVE_MAX) ? g_drive_hd[unit] : false;
+}
+uint32_t fdc_density_flips(void) { return g_dens_flips; }
 
 // ---- core0 (disk) ---------------------------------------------------------
 
@@ -2495,6 +2621,19 @@ void fdc_disk_task(void) {
     g_applied_side = want_side;
     // Side changed: any captured flux belongs to the old head.
     g_flux_n = 0;
+  }
+  // Drive DENSEL from the effective density. Best-effort: the target 3.5"
+  // drives sense HD from the media hole and most ignore pin 2 entirely, and
+  // this board's ~DEN_RDY net is shared/direction-ambiguous between J2 and J3
+  // (see hardware-notes) -- so nothing here RELIES on the pin. The captured
+  // flux is deliberately NOT dropped on a change: flux deltas are
+  // clock-agnostic, the density only tells the decoder how to read them.
+  {
+    int want_dens = fdc_is_hd() ? 1 : 0;
+    if (want_dens != g_applied_density) {
+      DRV->set_density(want_dens != 0);
+      g_applied_density = want_dens;
+    }
   }
 
   // Execute a pending physical seek.
@@ -2572,9 +2711,16 @@ void fdc_disk_task(void) {
         fdc_capture_window(FDC_READ_CAPTURE_BYTES);
         if (!S.trk_op) // aborted while we were blocked capturing
           return;
-        size_t n = mfm_read_track_raw(flux, g_flux_n, FDC_DD_BIT_US,
+        size_t n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
                                       (uint8_t *)S.track_buf,
                                       FDC_TRACK_IMAGE_MAX);
+        // Free-running decode yields SOMETHING at any clock, so "n == 0" is
+        // not the density-detect trigger here -- but a track that produced no
+        // ID fields at the latched clock and proves out at the other one
+        // should still flip the latch and be re-decoded.
+        if (g_flux_n > 0 && fdc_try_other_density(flux, g_flux_n))
+          n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
+                                 (uint8_t *)S.track_buf, FDC_TRACK_IMAGE_MAX);
         S.trk_last_us = time_us_32() - t0;
         S.trk_last_bytes = (uint16_t)n;
         if (n == 0) {
@@ -2688,18 +2834,26 @@ void fdc_disk_task(void) {
     } else if (!S.write_protect) {
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
+      // The image LENGTH decides the density in auto mode. Formatting is the
+      // one operation where the media cannot be asked (blank media decodes at
+      // no density), but the host has already told us: a formatter emits close
+      // to a full track, and a full DD track (~6250 bytes) and a full HD track
+      // (~12500) are far enough apart that one threshold separates them. This
+      // also flips the drive's latch, so the verify-read that every formatter
+      // does next decodes at the density it just wrote.
+      fdc_note_density(S.trk_len >= FDC_TRACK_IMAGE_HD_MIN);
       // Cap the flux at a bit over one revolution: the write is terminated by
       // the index pulse anyway, and encoding more is wasted time.
-      size_t limit = (cap < FDC_TRACK_FLUX_MAX) ? cap : FDC_TRACK_FLUX_MAX;
+      size_t limit = (cap < fdc_track_flux_max()) ? cap : fdc_track_flux_max();
       size_t n_flux = mfm_encode_format_image(
-          flux, limit, (const uint8_t *)S.track_buf, S.trk_len, FDC_DD_BIT_US);
+          flux, limit, (const uint8_t *)S.track_buf, S.trk_len, fdc_bit_us());
       if (n_flux) {
         // Pad to the end of the buffer with gap bytes. A short image would
         // otherwise leave the tail of the OLD track standing past the end of
         // the new one -- half of each format, spliced wherever the host
         // happened to stop. The index pulse cuts the write off at the right
         // place; our job is only to have flux ready to write until it comes.
-        n_flux = mfm_encode_gap_fill(flux, n_flux, limit, FDC_DD_BIT_US);
+        n_flux = mfm_encode_gap_fill(flux, n_flux, limit, fdc_bit_us());
         // use_index: start at the index pulse and stop at the next one. That
         // is what makes this a *track* write rather than a very long splice --
         // there is no timing window to hit, which is why formatting is the
@@ -2825,7 +2979,7 @@ void fdc_disk_task(void) {
 
     SpliceResult sr =
         mfm_write_sector(want, (int)S.track, g_secbuf, n, S.wr_deleted,
-                         FDC_DD_BIT_US, FDC_WRITE_SEARCH_TIMEOUT_US);
+                         fdc_bit_us(), FDC_WRITE_SEARCH_TIMEOUT_US);
 
     fdc_record_splice(sr);
     if (sr.id_found)
@@ -3011,8 +3165,18 @@ void fdc_disk_task(void) {
         }
       } else if (g_flux_n > 0) {
         // WD ID track compare against the Track register -- see MFM_ANY_CYL.
-        sd = mfm_read_sector(flux, g_flux_n, FDC_DD_BIT_US, want, S.track,
+        sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                              g_secbuf, sizeof(g_secbuf));
+        // Nothing AT ALL at the latched density -- not even a wrong-cylinder
+        // ID, which would prove the clock is right and the problem positional.
+        // Re-decode the same window at the other bit clock before reporting
+        // RNF; this is how a swapped-in disk of the other density gets noticed
+        // mid-session. No recapture: the window is time-sized, so it already
+        // holds a full revolution at either density.
+        if (!sd.found && !sd.cyl_mismatch &&
+            fdc_try_other_density(flux, g_flux_n))
+          sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
+                               g_secbuf, sizeof(g_secbuf));
       }
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;
