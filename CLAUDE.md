@@ -370,7 +370,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     host's density declaration and outranks all of the above in auto mode** —
     polarity observed from CP/M 4.1 (`0x00` throughout DD operation, `0x81`
     entering an HD format): b0 = 1 = HD. Cleared on bus RESET so the boot ROM
-    falls back to the latch. The **Type I STATUS Index bit (b1) is now live
+    falls back to the latch — and a WRITE TRACK whose census **contradicts**
+    the standing declaration invalidates it (the image being shifted in is the
+    host's freshest statement: FORMAT4 declares HD only in its media-detect
+    phase, which runs *after* the first track is formatted, so that track was
+    being encoded DD under the leftover declaration and failing its verify).
+    A status-only verify read (host drains nothing — FORMAT4's idiom, legal on
+    a real WD) completes after 15 ms instead of the 250 ms LOST-DATA budget,
+    which is what made an HD format ~11 min. The **Type I STATUS Index bit (b1) is now live
     from `~INDEX`** (`idxbit 0` reverts): FORMAT4's HD path times the spindle
     by polling it and froze forever against the old hardwired 0. DENSEL is
     driven best-effort (3.5" drives sense HD from the media hole). Buffers are

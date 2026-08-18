@@ -1133,6 +1133,17 @@ static constexpr uint32_t FDC_FORCE_INT_DEFER_IDLE_US = 2000;
 // that a host which never reads DATA at all recovers promptly instead of
 // deadlocking.
 static constexpr uint32_t FDC_DRQ_STALL_TIMEOUT_US = 250000;
+// ...but a READ whose host never takes even the FIRST byte is not a slow
+// drainer, it is a status-only verifier: FORMAT4 checks each sector's CRC via
+// STATUS and lets the data spill, which a real WD permits (it clocks the
+// sector past regardless and sets LOST DATA; the command still completes in
+// one sector time). Holding DRQ for the full generous budget above turned
+// that idiom into 250 ms PER SECTOR -- an 18-sector HD verify spent 4.5 s a
+// track waiting for a drain that was never coming, most of an 11-minute
+// format. A draining host takes its first byte within microseconds of DRQ
+// (it is polling STATUS at ~11 us), so an untouched buffer after 15 ms --
+// ~1000 byte times -- is unambiguous. Mid-drain stalls keep the full budget.
+static constexpr uint32_t FDC_READ_DRQ_FIRSTBYTE_US = 15000;
 
 // DRQ window for READ ADDRESS. Long enough that any polling host notices DRQ and
 // takes all six ID bytes (the boot ROM polls STATUS every ~11 us), short enough
@@ -2945,7 +2956,24 @@ void fdc_disk_task(void) {
       // sectors. Flipping the drive's latch here is also what makes the
       // verify-read every formatter does next decode at the density it just
       // wrote.
-      fdc_note_density(census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN);
+      //
+      // And the census outranks a STALE 0xDE declaration. The declaration is
+      // only as fresh as the host's last write: CP/M leaves 0x00 (DD) there
+      // from ordinary operation, and FORMAT4's HD path does not write 0x81
+      // until its media-detect phase -- which runs AFTER the first track is
+      // formatted. Track 1 of every HD format was therefore encoded at DD
+      // under the leftover declaration and failed its verify, while every
+      // later track (formatted after 0x81 appeared) was fine. An image the
+      // host is shifting in RIGHT NOW is its most recent statement of
+      // intent, so a contradiction invalidates the old declaration; the next
+      // 0xDE write re-establishes it (and will then agree).
+      {
+        bool img_hd = census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN;
+        if (g_density_mode == 2 && S.density_host_valid &&
+            S.density_host_hd != img_hd)
+          S.density_host_valid = false;
+        fdc_note_density(img_hd);
+      }
       // Cap the flux at a bit over one revolution: the write is terminated by
       // the index pulse anyway, and encoding more is wasted time. An image
       // needing more than the cap is fine for the same reason -- the encoder
@@ -3182,8 +3210,10 @@ void fdc_disk_task(void) {
     // took the bytes. Holding BUSY until a drain that never comes deadlocks that
     // host -- observed as CP/M 4.1 looping RESTORE / READ ADDRESS forever, 27031
     // STATUS polls per attempt and xfer=0/6 every time.
-    uint32_t drq_budget =
-        S.read_addr ? FDC_READADDR_DRQ_WINDOW_US : FDC_DRQ_STALL_TIMEOUT_US;
+    uint32_t drq_budget = S.read_addr ? FDC_READADDR_DRQ_WINDOW_US
+                          : (S.xfer_pos == 0)
+                              ? FDC_READ_DRQ_FIRSTBYTE_US
+                              : FDC_DRQ_STALL_TIMEOUT_US;
     if (S.reading && S.drq && !S.pending_force_int &&
         (time_us_32() - S.last_data_read_us) > drq_budget) {
       // Completing an undrained READ ADDRESS is normal, not an error: do not
