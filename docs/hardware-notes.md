@@ -215,6 +215,20 @@ per-port split fixes it. Currently harmless: the MZ-800 ROM never writes the
 density port, so DENSEL is unused and density→DENSEL is closed as
 "not to be done".
 
+### 6b. Edge-connector fingers — plating and wipe — **recurring field failure**
+
+The cartridge fingers are a live reliability problem on v0.0.1: intermittent
+`FD:Loading error`s (and command bytes corrupted into shapes that impersonate
+firmware bugs — the D7 incident, twice) that clear after reseating the card or
+cleaning the fingers with IPA. For the next revision: **hard-gold (ENEPIG or
+30µ" hard gold) plated fingers with a proper 20–30° chamfer**, maximum finger
+length the slot allows (wipe), and no soldermask pullback ambiguity over the
+contact area. HASL fingers oxidize and shed into the slot — they are the
+cheapest part of this board and the most frequent failure. Until then:
+`mzp_probe.py PORT health` screens for the symptom, and IPA plus reseat is the
+field fix. Consider cleaning the MZ-800 slot springs too — the other half of
+every contact.
+
 ### 7. Silkscreen / documentation
 Label the headers by form factor (`J2` = 5.25" Shugart, `J3` = 3.5" PC) and
 state that with v0.0.1 they are **one port** — do not populate both. Note the
