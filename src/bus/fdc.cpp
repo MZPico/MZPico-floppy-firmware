@@ -1109,11 +1109,20 @@ ALWAYS_INLINE size_t fdc_read_capture_bytes(void) {
 
 static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
 
-// How long the write splice hunts for its sector's ID field. One revolution is
-// ~200 ms, so 1.25 of them guarantees every sector on the track passes the head
-// at least once -- if it is there at all, we have seen it. Longer would only
-// delay the RNF; the host is polling BUSY throughout.
-static constexpr uint32_t FDC_WRITE_SEARCH_TIMEOUT_US = 250000;
+// How long the write splice hunts for its sector's ID field. This was 250 ms
+// on the reasoning that 1.25 revolutions sees every sector once -- but the
+// real spindle turns in 218.7 ms (measured), making that only 1.14 rev, and a
+// host writes MICROSECONDS after its seek, so the hunt's first stretch runs
+// over head-settle garble; lose decoder sync there and the wanted ID slips
+// through the remainder. Measured cost: 35 splice RNFs in 476 write commands
+// (7.4%) while CP/M copied files to an HD disk -- and a host BIOS that does
+// not retry leaves each one as a hole of format fill in the file, which is
+// exactly a .COM that "runs" and does nothing. A real WD1793 hunts for FIVE
+// index pulses before Write-RNF; ~2.3 revolutions is still less patient than
+// the chip we emulate. The host polls BUSY throughout, and a host that gives
+// up mid-hunt (Force Interrupt) costs nothing: the splice result is only
+// published if the command is still live.
+static constexpr uint32_t FDC_WRITE_SEARCH_TIMEOUT_US = 500000;
 // NOTE: a set of "ROM bring-up workarounds" used to live here -- command
 // aliases 0x14->0x94 and 0x58->0xD8, a relaxed Verify seek-error gate, an
 // any-sector read fallback, and a BUSY hold. They existed because the ROM
