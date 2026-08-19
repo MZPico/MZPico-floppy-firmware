@@ -3077,47 +3077,31 @@ void fdc_disk_task(void) {
     } else if (!S.write_protect) {
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
-      // The image's SECTOR CENSUS decides the density in auto mode (see
-      // FDC_TRACK_CONTENT_HD_MIN for why it must not be the image length --
-      // that mistake formatted DD disks at the HD bit clock and failed every
-      // verify). Formatting is the one operation where the media cannot be
-      // asked, but the host has already said what it means by declaring its
-      // sectors. Flipping the drive's latch here is also what makes the
-      // verify-read every formatter does next decode at the density it just
-      // wrote.
+      // Density for the encode: a valid 0xDE declaration is trusted OUTRIGHT,
+      // exactly as a real WD trusts its DENSEL input -- the controller never
+      // second-guesses density. The track-write ring settled this in one
+      // instrumented format run: this BIOS declares before EVERY operation,
+      // always correctly, and on an HD disk it deliberately declares DD for
+      // the 16x256 BOOT track (cyl 0 / head 1) so the DD-only boot ROM can
+      // still boot the disk -- HD data tracks, DD boot track, one disk, by
+      // design.
       //
-      // And the census outranks a STALE 0xDE declaration. The declaration is
-      // only as fresh as the host's last write: CP/M leaves 0x00 (DD) there
-      // from ordinary operation, and FORMAT4's HD path does not write 0x81
-      // until its media-detect phase -- which runs AFTER the first track is
-      // formatted. Track 1 of every HD format was therefore encoded at DD
-      // under the leftover declaration and failed its verify, while every
-      // later track (formatted after 0x81 appeared) was fine. An image the
-      // host is shifting in RIGHT NOW is its most recent statement of
-      // intent, so a contradiction invalidates the old declaration; the next
-      // 0xDE write re-establishes it (and will then agree).
+      // Two earlier generations of this code overrode the declaration with
+      // the image's sector census, and each broke a different track. The
+      // census is measured over the WHOLE 13000-byte collection, and we hold
+      // DRQ up for all of it -- MORE than the host's real image (a real WD
+      // stops clocking bytes in at the index pulse), so the tail is host
+      // memory junk that can carry phantom F5F5+FE patterns. Ring-recorded:
+      // the DD boot image censused as '22 sectors, 8938 bytes' -- over the HD
+      // threshold -- so the override invalidated the host's own FRESH DD
+      // declaration and encoded the boot track at the HD clock: sectors
+      // missing on readback, FORMAT4 stuck retrying track 1 forever.
       //
-      // ...and the census is ASYMMETRIC evidence. A census over the threshold
-      // PROVES HD -- no DD track can physically hold that many declared
-      // bytes -- so it outranks a stale DD declaration. A census under the
-      // threshold proves NOTHING: an underfilled HD format looks identical
-      // to a DD one, and FORMAT4's 16x256 boot-track image (~5.2k on-disk,
-      // the MZ master-disk convention on cyl 0 / head 1) is exactly that.
-      // The first symmetric version of this rule let that boot image
-      // "contradict" a perfectly valid HD declaration and dragged its encode
-      // to DD -- found as a hybrid track on the media: 16x256 sectors sitting
-      // on the un-erased tail of the previous 18x512 format.
-      {
-        bool img_hd = census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN;
-        if (img_hd) {
-          if (g_density_mode == 2 && S.density_host_valid &&
-              !S.density_host_hd)
-            S.density_host_valid = false; // stale DD declaration, proven wrong
-          fdc_note_density(true);
-        }
-        // img_hd == false: no evidence either way -- follow the standing
-        // declaration or latch unchanged.
-      }
+      // The census's one legitimate job is hosts that never write 0xDE at
+      // all (Disk BASIC-era software) -- there it sets the latch, and
+      // imperfect evidence beats none.
+      if (!S.density_host_valid)
+        fdc_note_density(census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN);
       // Cap the flux at a bit over one revolution: the write is terminated by
       // the index pulse anyway, and encoding more is wasted time. An image
       // needing more than the cap is fine for the same reason -- the encoder

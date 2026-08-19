@@ -71,13 +71,18 @@ one (first CRC-valid ID field), and a proven ID flips the latch. The capture
 window is byte-sized per density (~1.05 rev; byte windows are
 rotation-relative, so they hold on a spindle that runs slow) — a DD-sized
 capture of an HD disk still holds ~half an HD revolution, enough for the
-probe; the first retry then captures at the flipped density's full size. A host WRITE TRACK infers density
-from the format image's **sector census** — the sectors it declares and their
-size codes (~5.3k on-disk for 9×512 DD vs ~10.4k for 18×512 HD) — which is
-what lets a blank disk be formatted HD. Not from the image length: the host
-streams bytes for as long as DRQ is up (the index ends WRITE TRACK on a real
-WD), so length measures the host's patience, not its intent. Writes never auto-detect: the splice uses
-the latched density, which reading (or READ ADDRESS) will have established.
+probe; the first retry then captures at the flipped density's full size. A
+host WRITE TRACK under a valid 0xDE declaration follows it unconditionally —
+the census is ignored, because the collection tail (we clock in more bytes
+than a real WD, whose DRQ stops at the index) is host memory junk that can
+carry phantom IDAMs; it once inflated a 16×256 DD boot image past the HD
+threshold and got the boot track encoded at the wrong clock. Only with **no**
+declaration does the image's **sector census** — declared sectors × size
+codes (~5.3k on-disk for 9×512 DD vs ~10.4k for 18×512 HD), never the image
+length — pick the density. Layout fact this exposed: **an MZ-800 HD disk
+carries a DD 16×256 boot track on cyl 0 / head 1**; FORMAT4 declares DD for
+exactly that one track so the DD-only boot ROM can boot the disk. Writes
+never auto-detect: the splice uses the effective density.
 DENSEL (the shared `~DEN_RDY` pin) is driven best-effort from the same model;
 nothing relies on it — the target 3.5" drives sense HD from the media hole.
 FM/single density remains out of scope.

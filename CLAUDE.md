@@ -358,23 +358,24 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     the hard way; see `fdc_read_capture_bytes`). Density is the firmware's own determination (`mzp_probe.py
     density dd|hd|auto`, default auto): a per-drive latch (default DD),
     flipped when a capture that decodes to nothing at the latched bit clock
-    yields a CRC-valid ID at the other one — no recapture needed. A host
-    WRITE TRACK infers density from the format image's **sector census**
-    (declared sectors × their size codes: ~5.3k on-disk for 9×512 DD vs
-    ~10.4k for 18×512 HD) — NOT from the image length, which measures only
-    how long the host kept streaming (a formatter feeds bytes while DRQ is
-    up; the index ends the command on a real WD, and CP/M's FORMAT4 fills
-    whatever buffer we offer even for DD). That census is how a blank disk
-    gets formatted HD; writes never auto-detect (the splice uses the latch,
-    established by the reads that precede any write). **Port `0xDE` is the
-    host's density declaration and outranks all of the above in auto mode** —
-    polarity observed from CP/M 4.1 (`0x00` throughout DD operation, `0x81`
-    entering an HD format): b0 = 1 = HD. Cleared on bus RESET so the boot ROM
-    falls back to the latch — and a WRITE TRACK whose census **contradicts**
-    the standing declaration invalidates it (the image being shifted in is the
-    host's freshest statement: FORMAT4 declares HD only in its media-detect
-    phase, which runs *after* the first track is formatted, so that track was
-    being encoded DD under the leftover declaration and failing its verify).
+    yields a CRC-valid ID at the other one — no recapture needed. **Port
+    `0xDE` is the host's density declaration and, when valid, is trusted
+    OUTRIGHT in auto mode** — a real WD never second-guesses its DENSEL
+    input. Polarity observed from CP/M 4.1 (`0x00` throughout DD operation,
+    `0x81` entering an HD format): b0 = 1 = HD; cleared on bus RESET so the
+    boot ROM falls back to the latch. The instrumented track-write ring
+    proved this BIOS declares before **every** operation, always correctly —
+    including deliberately declaring **DD for the 16×256 boot track (cyl 0 /
+    head 1) of an HD disk**, so the DD-only boot ROM can still boot it: HD
+    data tracks, DD boot track, one disk, by design. Two generations of
+    census-outranks-declaration logic each broke a track before that was
+    understood (the collection tail is host memory junk that can carry
+    phantom IDAMs and inflate the census past the HD threshold — we clock in
+    more bytes than a real WD, whose DRQ stops at the index). A host WRITE
+    TRACK therefore uses the image's **sector census** (declared sectors ×
+    size codes, ~5.3k for 9×512 DD vs ~10.4k for 18×512 HD; never the image
+    length) only when **no** declaration exists — Disk BASIC-era software.
+    Writes never auto-detect (the splice uses the effective density).
     A status-only verify read (host drains nothing — FORMAT4's idiom, legal on
     a real WD) completes after 15 ms instead of the 250 ms LOST-DATA budget,
     which is what made an HD format ~11 min. The **Type I STATUS Index bit (b1) is now live
