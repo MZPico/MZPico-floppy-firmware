@@ -2750,12 +2750,25 @@ void fdc_disk_task(void) {
     return; // idle until the MZ-800 talks to us (don't fight USB/gw drive use)
 
   // Apply drive select FIRST -- everything below actuates DRV, which does not
-  // exist until this has run once. Only between operations: a switch hands over
-  // the shared lines and drops any captured flux, so doing it under a read or a
-  // splice would move the flux path to another spindle mid-sector. A select
-  // that arrives during a transfer simply takes effect when that transfer ends,
-  // which is also what a real drive does with a select line that moves while
-  // its head is over data.
+  // exist until this has run once. Only between operations here: a switch
+  // hands over the shared lines and drops any captured flux, so doing it
+  // mid-transfer would move the flux path to another spindle mid-sector.
+  //
+  // BUT this idle-path gate alone is not enough, and the gap cost weeks: the
+  // host's per-command setup (density, track, DRIVE, sector, side, command)
+  // executes in microseconds, so when core0 is still busy finishing the
+  // PREVIOUS operation -- a 240 ms capture on drive A, say -- the new
+  // command's reading/writing flag is already set by the time core0 returns,
+  // this gate never opens, and the operation runs against the OLD drive.
+  // Measured: every blind write hunt during a CP/M A:->B: copy (clk=HD,
+  // decl=HD, motor on, flux flowing, ZERO ids in 2.3 revolutions -- HD decode
+  // of drive A's DD flux), deterministic at the file layout's A/B alternation
+  // points, ending in CP/M's own "Disk Select Error"; and both head strands,
+  // which were seeks executed against the wrong drive's head walking the two
+  // positions apart until a recalibrate died at an end stop. So each
+  // operation-execution block below ALSO applies the select at its start --
+  // the point where nothing is in flight for the new command yet, which is
+  // exactly where a select is safe.
   if (!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) {
     if (!fdc_apply_drive_select())
       return; // no such unit; STATUS already reports NOT READY
@@ -2831,6 +2844,13 @@ void fdc_disk_task(void) {
     uint32_t rseq = S.restore_req;
     bool verify = S.op_verify;
 
+    // The select may be stale if this seek landed while core0 was busy (see
+    // the select-gate comment above). Stepping the WRONG drive's head is how
+    // the two units' positions walked apart until a recalibrate stranded one
+    // at an end stop.
+    if (!fdc_apply_drive_select() || !DRV)
+      return;
+
     // NEVER step with the spindle down. This drive does not step reliably
     // unless the disk is turning (the documented spin-up quirk: TRK00 is
     // never reached from a cold spindle), and a host is entitled to command
@@ -2905,6 +2925,11 @@ void fdc_disk_task(void) {
     // write may not -- and for WRITE TRACK the stakes are a whole track, not
     // one sector's data field.
     if (S.op_done != S.op_seq)
+      return;
+    // Stale-select check (see the select-gate comment above): a track op is
+    // positionally blind, so running it against the wrong DRIVE would format
+    // or dump another disk entirely.
+    if (!fdc_apply_drive_select() || !DRV)
       return;
 
     if (S.trk_op == 1) { // READ TRACK
@@ -3214,6 +3239,14 @@ void fdc_disk_task(void) {
     if (S.op_done != S.op_seq)
       return;
 
+    // Stale-select check (see the select-gate comment above). This is the
+    // exact site of the blind write hunts: the splice was searching drive A's
+    // DD flux at the HD clock -- zero IDs in 2.3 revolutions, deterministic
+    // at the copy's A/B alternation points, surfacing as CP/M's
+    // "Disk Select Error".
+    if (!fdc_apply_drive_select() || !DRV)
+      return;
+
     uint32_t seq = S.wr_seq; // snapshot
     uint8_t want = S.wr_sector;
     uint16_t n = S.xfer_len;
@@ -3414,6 +3447,11 @@ void fdc_disk_task(void) {
       return;
 
     if (S.rd_fresh) {
+      // Stale-select check (see the select-gate comment above): capturing the
+      // other drive's flux cost a retry per A/B alternation. Only on a FRESH
+      // window -- mid-command (multi-sector reuse) the select must not move.
+      if (!fdc_apply_drive_select() || !DRV)
+        return;
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
       // sync -- a 1.25-revolution window contains every sector regardless of
