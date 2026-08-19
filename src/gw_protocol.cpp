@@ -3,6 +3,7 @@
 // millis()/yield() -> Pico-SDK time / tud_task(); floppy-> -> FloppyDrive.
 #include "hardware/gpio.h"
 #include "gw_protocol.hpp"
+#include "gitver.h"
 
 #include "board_config.h"
 #include "floppy.hpp"
@@ -79,6 +80,7 @@
 #define MZP_CMD_DRVSTAT 0x9D   // per-drive state for ALL units at once
 #define MZP_CMD_DENSITY 0x9E   // density: force DD/HD or auto-detect (default)
 #define MZP_CMD_IDXBIT 0x9F    // Type I STATUS Index bit on/off (default on)
+#define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1318,6 +1320,19 @@ void gw_task() {
     fdc_density_host(&hv, &hh);
     reply_buffer[i++] = hv ? 1 : 0;
     reply_buffer[i++] = hh ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FWVER) {
+    // [cmd, ACK, len, hash bytes]. Exists because a whole hardware test
+    // session was once diagnosed against the wrong firmware: several stamped
+    // uf2s in circulation, no way to ask the board which one it was.
+    static const char ver[] = FW_GIT_HASH;
+    uint8_t n = (uint8_t)(sizeof(ver) - 1);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = n;
+    for (uint8_t k = 0; k < n; k++)
+      reply_buffer[i++] = (uint8_t)ver[k];
     cdc_write_all(reply_buffer, i);
   }
 

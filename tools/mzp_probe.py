@@ -34,6 +34,7 @@ Usage:
     python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
     python mzp_probe.py PORT density [dd|hd|auto]         # density; auto = host 0xDE, else per-drive detect (no arg = query)
     python mzp_probe.py PORT idxbit [0|1]                 # Type I STATUS Index bit from ~INDEX (no arg = query)
+    python mzp_probe.py PORT fwver                        # git hash of the RUNNING firmware
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -86,6 +87,7 @@ MZP_CMD_BUSDUMP = 0x82
 MZP_CMD_DRIVE = 0x83
 MZP_CMD_DENSITY = 0x9E
 MZP_CMD_IDXBIT = 0x9F
+MZP_CMD_FWVER = 0xA0
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -1475,6 +1477,15 @@ def main():
                 if flips > 4:
                     print("  ! many flips -- if this climbs on one disk, the "
                           "media is marginal at both clocks, not mixed-density")
+        elif cmd == "fwver":
+            s.write(bytes([MZP_CMD_FWVER, 2]))
+            s.flush()
+            hdr = read_exact(s, 3)
+            if len(hdr) == 3 and hdr[1] == 0:
+                v = read_exact(s, hdr[2])
+                print("firmware build: %s" % v.decode("ascii", "replace"))
+            else:
+                print("firmware predates the fwver command (pre-101d57f+)")
         elif cmd == "idxbit":
             # Type I STATUS Index bit: 0 = off, 1 = on (default), no arg = query.
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2

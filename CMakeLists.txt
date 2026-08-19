@@ -35,10 +35,21 @@ add_executable(mzpico_floppy
 # Generate the MZ-800 bus PIO header (bus.pio.h) and add it to the include path.
 pico_generate_pio_header(mzpico_floppy ${CMAKE_CURRENT_LIST_DIR}/src/bus/bus.pio)
 
+# Bake the git hash into the firmware (mzp_probe.py fwver) -- regenerated on
+# every build so a bench session can always prove which build it is talking to.
+add_custom_target(gitver ALL
+    COMMAND ${CMAKE_COMMAND}
+        -DGIT_DIR=${CMAKE_CURRENT_LIST_DIR}
+        -DOUT=${CMAKE_CURRENT_BINARY_DIR}/generated/gitver.h
+        -P ${CMAKE_CURRENT_LIST_DIR}/cmake/gitver.cmake
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/gitver.h)
+add_dependencies(mzpico_floppy gitver)
+
 # src/ is on the include path so TinyUSB finds tusb_config.h.
 target_include_directories(mzpico_floppy PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src
     ${CMAKE_CURRENT_LIST_DIR}/src/flux
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 # -O3 for reliable PIO flux timing (per Adafruit_Floppy guidance).
