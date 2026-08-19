@@ -35,6 +35,7 @@ Usage:
     python mzp_probe.py PORT density [dd|hd|auto]         # density; auto = host 0xDE, else per-drive detect (no arg = query)
     python mzp_probe.py PORT idxbit [0|1]                 # Type I STATUS Index bit from ~INDEX (no arg = query)
     python mzp_probe.py PORT fwver                        # git hash of the RUNNING firmware
+    python mzp_probe.py PORT health                       # session sanity check: build + passive bus/contact screen (run FIRST)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -963,6 +964,113 @@ FF_KINDS = {0: "(none)", 1: "RNF -- sector not on this track",
             4: "Verify/seek error"}
 
 
+def do_health(s):
+    """One-shot session sanity check. Run FIRST each session and after any
+    strange failure. Exists because this project has repeatedly burned days
+    chasing firmware ghosts that were really the cartridge edge connector: the
+    D7 data line has failed twice from a marginal joint, and flaky fingers
+    (cured by reseating / IPA) corrupt commands into shapes that look exactly
+    like impossible firmware bugs. This is the passive half of the bus rule
+    ('run busdump first'); the definitive active measure is still the bustest
+    Z80 program."""
+    warns = []
+
+    # 1. Which firmware is this, really? (A test cycle was once spent against
+    # the wrong build.)
+    s.write(bytes([MZP_CMD_FWVER, 2]))
+    s.flush()
+    hdr = read_exact(s, 3)
+    if len(hdr) == 3 and hdr[1] == 0:
+        v = read_exact(s, hdr[2]).decode("ascii", "replace")
+        print(f"firmware : {v}")
+        if v.endswith("+dirty"):
+            warns.append("firmware built from a dirty tree -- not a committed state")
+    else:
+        print("firmware : (predates fwver -- OLD build!)")
+        warns.append("firmware predates fwver: flash a current build before "
+                     "trusting any result")
+
+    # 2. Bus line health from the passive counters.
+    s.write(bytes([MZP_CMD_BUSDUMP, 2]))
+    s.flush()
+    r = read_exact(s, 78)
+    if len(r) < 78 or r[1] != 0:
+        print("busdump  : bad reply")
+        warns.append("busdump unreadable")
+        r = None
+    if r:
+        wr = [int.from_bytes(r[10 + 4 * k:14 + 4 * k], "little") for k in range(8)]
+        rd = [int.from_bytes(r[42 + 4 * k:46 + 4 * k], "little") for k in range(8)]
+        addr_low, addr_high, dat_low, dat_high = r[74], r[75], r[76], r[77]
+        total = sum(wr) + sum(rd)
+        print(f"bus      : {total} register accesses since power-up")
+        if total == 0:
+            print("           (machine has not talked yet -- bus checks skipped)")
+        else:
+            # ADDRESS bits 6/7 read constant-high BY DESIGN (every port we own,
+            # 0xD8-0xDF, has both set) -- only bits 0-5 are meaningful here.
+            for k in range(6):
+                m = 1 << k
+                if not (addr_low & m):
+                    warns.append(f"ADDRESS bit C{k} never sampled low")
+                if not (addr_high & m):
+                    warns.append(f"ADDRESS bit C{k} never sampled high")
+            # WRITE-DATA union: a line that never moved MAY simply never have
+            # needed to -- but with thousands of varied writes that gets
+            # unlikely, so grade by traffic.
+            if sum(wr) > 500:
+                for k in range(8):
+                    m = 1 << k
+                    if not (dat_low & m):
+                        warns.append(f"DATA bit C{k} never written low "
+                                     f"({sum(wr)} writes) -- the D7-class "
+                                     f"stuck-high signature")
+                    if not (dat_high & m):
+                        warns.append(f"DATA bit C{k} never written high "
+                                     f"({sum(wr)} writes)")
+
+    # 3. Command-byte corruption: across the last 16 command writes the RAW
+    # (CPL'd) bytes are varied, so a bit that is CONSTANT across all of them
+    # is suspicious -- a stuck line turns Type II/III commands into aliased
+    # Type I ones (0x94 arrived as 0x14 in the documented D7 incident).
+    s.write(bytes([MZP_CMD_FDCLOG, 2]))
+    s.flush()
+    hdr = read_exact(s, 5)
+    if len(hdr) == 5 and hdr[1] == 0:
+        count = hdr[2] | (hdr[3] << 8)
+        n = hdr[4]
+        payload = read_exact(s, n * 2)
+        raws = payload[n:n * 2]
+        print(f"commands : {count} total; analysing last {n}")
+        if n >= 8:
+            u_and, u_or = 0xFF, 0x00
+            for b in raws:
+                u_and &= b
+                u_or |= b
+            for k in range(8):
+                m = 1 << k
+                if u_and & m:
+                    warns.append(f"command-byte bit C{k} was 1 in ALL of the "
+                                 f"last {n} commands -- stuck-high suspect")
+                if not (u_or & m):
+                    warns.append(f"command-byte bit C{k} was 0 in ALL of the "
+                                 f"last {n} commands -- stuck-low suspect")
+
+    # 4. Verdict.
+    print()
+    if warns:
+        print(f"HEALTH: {len(warns)} warning(s)")
+        for w in warns:
+            print(f"  ! {w}")
+        print("  -> before blaming firmware: power down, RESEAT the cartridge,")
+        print("     clean the edge fingers with IPA, and re-run `health`.")
+        print("     Definitive bus measure: the `bustest` Z80 test program.")
+    else:
+        print("HEALTH: no bus anomalies in the passive counters.")
+        print("  (Contacts can still fail intermittently; if symptoms persist")
+        print("   with clean health, the fault is likely real firmware/media.)")
+
+
 def do_resetdiag(s, clear=False):
     """What the bus-RESET pin actually does, with no polarity assumed.
 
@@ -1477,6 +1585,8 @@ def main():
                 if flips > 4:
                     print("  ! many flips -- if this climbs on one disk, the "
                           "media is marginal at both clocks, not mixed-density")
+        elif cmd == "health":
+            do_health(s)
         elif cmd == "fwver":
             s.write(bytes([MZP_CMD_FWVER, 2]))
             s.flush()

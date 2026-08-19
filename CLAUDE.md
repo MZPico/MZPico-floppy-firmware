@@ -204,9 +204,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   fails, build the midpoint and flash it. Reasoning from indirect evidence lost
   most of a session here, through four wrong hypotheses, while two flashes
   settled it. `build/known-good/` holds the uf2s from that bisect.
-- **Run `busdump` first when a working build breaks.** Its per-line bit
-  activity catches the recurring data-bus contact fault in one command, with
-  the machine just sitting at a failed boot. Note the summary only sees bytes
+- **Run `mzp_probe.py PORT health` first, every session.** It verifies which
+  firmware build is actually running (`fwver` — a whole test cycle was once
+  spent against the wrong uf2) and screens the passive counters for the
+  recurring **edge-connector contact faults**: random `FD:Loading error`s
+  cured by reseating the cartridge or cleaning the fingers with IPA are
+  contacts, not code, and corrupted command bytes mimic impossible firmware
+  bugs (the D7 incident). `busdump` remains the detailed per-line view; the
+  `bustest` Z80 program the definitive active measure. Note the summary only sees bytes
   the ROM actually wrote, so a line reported "stuck" may simply never have
   needed to be 1 — check the union of the observed `last_raw_write` values
   before believing it. (ADDRESS bits 6/7 always read stuck high: every port we
