@@ -847,8 +847,8 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 152)
-    if len(r) < 152 or r[1] != 0:
+    r = read_exact(s, 244)
+    if len(r) < 244 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
@@ -917,6 +917,31 @@ def do_wrdiag(s):
             us = int.from_bytes(r[off + 5:off + 9], "little")
             print(f"    trk={trk:3d} side={side} sec={sec:2d}  "
                   f"ids_seen={ids:2d}  hunted {us / 1000:.1f} ms")
+    # Track-write ring: every host WRITE TRACK, with the position belief and
+    # the density decision it was made under. A format writes BLIND at the
+    # believed position, so 'phys=?' here is a mislabeled track on the media.
+    twr_n = int.from_bytes(r[152:156], "little")
+    if twr_n:
+        shown = min(twr_n, 8)
+        print(f"track writes: {twr_n} total; last {shown} (oldest -> newest):")
+        for e in range(shown):
+            off = 156 + e * 11
+            ds = r[off] | (r[off + 1] << 8)
+            trk, side, phys, nsec, fl = (r[off + 2], r[off + 3], r[off + 4],
+                                         r[off + 5], r[off + 6])
+            census = r[off + 7] | (r[off + 8] << 8)
+            length = r[off + 9] | (r[off + 10] << 8)
+            dens = "HD" if fl & 1 else "DD"
+            decl = ("decl=" + ("HD" if fl & 4 else "DD")) if fl & 2 \
+                else "decl=none"
+            print(f"    t={ds / 10:7.1f}s  trk={trk:3d} side={side} "
+                  f"phys={'?' if phys == 0xFE else phys}  "
+                  f"{nsec:2d} sectors ~{census}B  img={length}B  "
+                  f"enc={dens} {decl} censusHD={bool(fl & 8)} "
+                  f"{'OK' if fl & 0x10 else 'FAILED'}")
+            if phys == 0xFE:
+                print("      ^ position belief UNKNOWN at a blind track write "
+                      "-- this track landed on an unverified cylinder")
 
 
 FF_KINDS = {0: "(none)", 1: "RNF -- sector not on this track",
@@ -975,23 +1000,24 @@ def do_firstfail(s, clear=False):
     """
     s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
     s.flush()
-    r = read_exact(s, 65)
-    if len(r) < 65 or r[1] != 0:
+    r = read_exact(s, 67)
+    if len(r) < 67 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     valid, kind = r[2], r[3]
     count = int.from_bytes(r[4:8], "little")
     at_ms = int.from_bytes(r[8:12], "little")
-    (want, trk, tgt, phys, side, seen_c, seen_h, cap_ok) = r[12:20]
-    flux_n = int.from_bytes(r[20:24], "little")
-    cap_us = int.from_bytes(r[24:28], "little")
-    ids_seen = r[28]
-    ids = list(r[29:49])  # FDC_IDS_N = 20
-    resyncs = int.from_bytes(r[49:53], "little")
-    rs_from, rs_to = r[53], r[54]
-    reset_events = int.from_bytes(r[55:59], "little")
-    reset_at_ms = int.from_bytes(r[59:63], "little")
-    reset_line, reset_active = r[63], r[64]
+    (want, trk, tgt, phys, side, seen_c, seen_h) = r[12:19]
+    ff_drive, ff_motor, cap_ok = r[19], r[20], r[21]
+    flux_n = int.from_bytes(r[22:26], "little")
+    cap_us = int.from_bytes(r[26:30], "little")
+    ids_seen = r[30]
+    ids = list(r[31:51])  # FDC_IDS_N = 20
+    resyncs = int.from_bytes(r[51:55], "little")
+    rs_from, rs_to = r[55], r[56]
+    reset_events = int.from_bytes(r[57:61], "little")
+    reset_at_ms = int.from_bytes(r[61:65], "little")
+    reset_line, reset_active = r[65], r[66]
 
     # Read this first. The bus-RESET handling assumes the line idles LOW; if a
     # running machine shows it high, that assumption is wrong for this board and
@@ -1016,6 +1042,9 @@ def do_firstfail(s, clear=False):
           f"{'?' if phys == 0xFE else phys}"
           + (f"  disk said cyl={seen_c} head={seen_h}"
              if seen_c != 0xFF else ""))
+    print(f"  drive     : {'?' if ff_drive == 0xFF else ff_drive}"
+          f"   motor: host={'on' if ff_motor & 1 else 'OFF'}"
+          f" spindle={'applied' if ff_motor & 2 else 'NOT APPLIED'}")
     print(f"  capture   : {'started' if cap_ok else 'DID NOT START'}, "
           f"{flux_n} flux bytes in {cap_us / 1000:.1f} ms")
     print(f"  ids on trk: {ids[:ids_seen] if ids_seen else '(none decoded)'}")

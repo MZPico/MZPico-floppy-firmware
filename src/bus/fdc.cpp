@@ -268,6 +268,24 @@ struct FdcState {
   volatile uint32_t wrf_us[8] = {0};   // ...and how long it hunted
   volatile uint8_t wrf_pos = 0;
   volatile uint32_t wrf_n = 0; // total failed host writes (ring wraps)
+  // Ring of the last 8 host WRITE TRACKs. A format is positionally BLIND --
+  // index-to-index at wherever the head is, no ID field to compare -- so
+  // when tracks turn up mislabeled or hybrid on the media, the questions are
+  // WHEN each track went down, at which believed position, with what census
+  // and what density decision. FORMAT4's sequencing (when the 16x256 boot
+  // track is written, what 0xDE said at that moment) is otherwise invisible.
+  volatile uint32_t twr_ms[8] = {0};  // ms since boot
+  volatile uint8_t twr_trk[8] = {0};  // Track register at the write
+  volatile uint8_t twr_side[8] = {0};
+  volatile uint8_t twr_phys[8] = {0}; // drive's position belief (0xFE unknown)
+  volatile uint8_t twr_nsec[8] = {0}; // census: sectors declared
+  volatile uint16_t twr_census[8] = {0}; // census: on-disk bytes estimate
+  volatile uint16_t twr_len[8] = {0};    // image length collected
+  // flags: b0 encoded HD, b1 declaration valid, b2 declaration said HD,
+  //        b3 census said HD, b4 write reached the media
+  volatile uint8_t twr_flags[8] = {0};
+  volatile uint8_t twr_pos = 0;
+  volatile uint32_t twr_n = 0;
   volatile uint8_t wr_last_result = 0;    // b0 wrote b1 id_found b2 cyl_mismatch
                                           // b3 size_mismatch b4 late b5 no_flux
   // One-sector transfer buffer. core0 fills it and raises `drq`; core1 hands the
@@ -382,6 +400,8 @@ struct FdcState {
   volatile uint8_t ff_side = 0;
   volatile uint8_t ff_seen_cyl = 0xFF; // what the disk said instead
   volatile uint8_t ff_seen_head = 0xFF;
+  volatile uint8_t ff_drive = 0xFF; // unit core0 was driving at the failure
+  volatile uint8_t ff_motor = 0;    // b0 host motor bit, b1 spindle applied
   volatile uint8_t ff_capture_ok = 0;
   volatile uint32_t ff_flux_n = 0;
   volatile uint32_t ff_capture_us = 0;
@@ -1385,6 +1405,8 @@ static void fdc_note_failure(uint8_t kind, uint8_t want_sec, uint8_t seen_cyl,
   S.ff_side = S.side1 ? 1 : 0;
   S.ff_seen_cyl = seen_cyl;
   S.ff_seen_head = seen_head;
+  S.ff_drive = (g_cur_drive < 0) ? 0xFF : (uint8_t)g_cur_drive;
+  S.ff_motor = (uint8_t)((S.motor_on ? 1 : 0) | (g_applied_motor ? 2 : 0));
   S.ff_capture_ok = S.rd_capture_ok ? 1 : 0;
   S.ff_flux_n = S.rd_flux_n;
   S.ff_capture_us = S.rd_capture_us;
@@ -2196,6 +2218,23 @@ void fdc_debug_snapshot(FdcDebug *o) {
       o->wrf_us[k] = S.wrf_us[idx];
     }
   }
+  // Track-write ring, same ordering.
+  o->twr_n = S.twr_n;
+  {
+    uint8_t n = (S.twr_n < 8) ? (uint8_t)S.twr_n : 8;
+    uint8_t start = (uint8_t)((S.twr_pos - n) & 7);
+    for (uint8_t k = 0; k < 8; ++k) {
+      uint8_t idx = (uint8_t)((start + k) & 7);
+      o->twr_ms[k] = S.twr_ms[idx];
+      o->twr_trk[k] = S.twr_trk[idx];
+      o->twr_side[k] = S.twr_side[idx];
+      o->twr_phys[k] = S.twr_phys[idx];
+      o->twr_nsec[k] = S.twr_nsec[idx];
+      o->twr_flags[k] = S.twr_flags[idx];
+      o->twr_census[k] = S.twr_census[idx];
+      o->twr_len[k] = S.twr_len[idx];
+    }
+  }
   o->wr_last_result = S.wr_last_result;
   o->wr_flags = (uint8_t)((S.writing ? 0x01 : 0) | (S.wr_armed ? 0x02 : 0) |
                           (g_write_enable ? 0x04 : 0) |
@@ -2232,6 +2271,8 @@ void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->side = S.ff_side;
   o->seen_cyl = S.ff_seen_cyl;
   o->seen_head = S.ff_seen_head;
+  o->drive = S.ff_drive;
+  o->motor = S.ff_motor;
   o->capture_ok = S.ff_capture_ok;
   o->flux_n = S.ff_flux_n;
   o->capture_us = S.ff_capture_us;
@@ -2780,6 +2821,23 @@ void fdc_disk_task(void) {
     uint32_t rseq = S.restore_req;
     bool verify = S.op_verify;
 
+    // NEVER step with the spindle down. This drive does not step reliably
+    // unless the disk is turning (the documented spin-up quirk: TRK00 is
+    // never reached from a cold spindle), and a host is entitled to command
+    // motor-off and then seek -- FORMAT4's detect phase does exactly that
+    // (0xDC = 0x00 mid-flow, caught in iotrace). A motor-off seek is how a
+    // head gets STRANDED: the recalibrate fails, position belief goes
+    // unknown, and the next positionally-blind WRITE TRACK formats the wrong
+    // cylinder. Measured aftermath: head found sitting over cylinder 19 with
+    // head_target=0 and phys_track unknown. Spin up for the move; the normal
+    // motor logic re-schedules the deferred stop afterwards if the host
+    // still wants the motor off.
+    if (!g_applied_motor) {
+      g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+      g_applied_motor = true;
+      g_motor_off_at = 0;
+    }
+
     // Do NOT write S.track back from the physical position: the Track register
     // is the host's belief and
     // core1 has already updated it per the WD rules. Overwriting it here forced
@@ -3051,6 +3109,26 @@ void fdc_disk_task(void) {
     }
     S.trk_last_us = time_us_32() - t0;
     S.trk_last_bytes = S.trk_len;
+    {
+      uint8_t p = S.twr_pos;
+      S.twr_ms[p] = to_ms_since_boot(get_absolute_time());
+      S.twr_trk[p] = S.track;
+      S.twr_side[p] = S.side1 ? 1 : 0;
+      int pt = DRV ? DRV->track() : -1;
+      S.twr_phys[p] = (pt < 0) ? 0xFE : (uint8_t)pt;
+      S.twr_nsec[p] = (census_sectors > 255) ? 255 : (uint8_t)census_sectors;
+      S.twr_census[p] = (census_disk_bytes > 0xFFFF)
+                            ? 0xFFFF
+                            : (uint16_t)census_disk_bytes;
+      S.twr_len[p] = S.trk_len;
+      S.twr_flags[p] = (uint8_t)(
+          (fdc_is_hd() ? 0x01 : 0) | (S.density_host_valid ? 0x02 : 0) |
+          (S.density_host_hd ? 0x04 : 0) |
+          ((census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN) ? 0x08 : 0) |
+          (ok ? 0x10 : 0));
+      S.twr_pos = (uint8_t)((p + 1) & 7);
+      S.twr_n++;
+    }
     if (ok) {
       S.trk_ok++;
     } else {

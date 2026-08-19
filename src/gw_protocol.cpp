@@ -1345,7 +1345,7 @@ void gw_task() {
     //  head_target, phys_track, side, seen_cyl, seen_head, capture_ok,
     //  flux_n(4), capture_us(4), ids_seen, ids[FDC_IDS_N=20], pos_resyncs(4),
     //  resync_from, resync_to, reset_events(4), reset_at_ms(4),
-    //  reset_line, reset_active] -- 65 bytes.
+    //  reset_line, reset_active] -- 67 bytes (drive+motor follow seen_head).
     FdcFirstFail f;
     fdc_firstfail_snapshot(&f);
     reply_buffer[i++] = GW_ACK_OK;
@@ -1363,6 +1363,8 @@ void gw_task() {
     reply_buffer[i++] = f.side;
     reply_buffer[i++] = f.seen_cyl;
     reply_buffer[i++] = f.seen_head;
+    reply_buffer[i++] = f.drive;
+    reply_buffer[i++] = f.motor;
     reply_buffer[i++] = f.capture_ok;
     const uint32_t f32[] = {f.flux_n, f.capture_us};
     for (uint32_t v : f32) {
@@ -1440,6 +1442,27 @@ void gw_task() {
       reply_buffer[i++] = (uint8_t)(d.wrf_ids[e] >> 8);
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (d.wrf_us[e] >> (8 * k)) & 0xFF;
+    }
+    // Track-write ring: twr_n(4), then 8 x [ds(2), trk, side, phys, nsec,
+    // flags, census(2), len(2)] with timestamps in DECISECONDS (u16 covers
+    // 109 min) so the whole reply stays inside the 256-byte buffer. 244 total.
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.twr_n >> (8 * k)) & 0xFF;
+    for (int e = 0; e < 8; e++) {
+      uint32_t ds = d.twr_ms[e] / 100;
+      if (ds > 0xFFFF)
+        ds = 0xFFFF;
+      reply_buffer[i++] = (uint8_t)(ds & 0xFF);
+      reply_buffer[i++] = (uint8_t)(ds >> 8);
+      reply_buffer[i++] = d.twr_trk[e];
+      reply_buffer[i++] = d.twr_side[e];
+      reply_buffer[i++] = d.twr_phys[e];
+      reply_buffer[i++] = d.twr_nsec[e];
+      reply_buffer[i++] = d.twr_flags[e];
+      reply_buffer[i++] = (uint8_t)(d.twr_census[e] & 0xFF);
+      reply_buffer[i++] = (uint8_t)(d.twr_census[e] >> 8);
+      reply_buffer[i++] = (uint8_t)(d.twr_len[e] & 0xFF);
+      reply_buffer[i++] = (uint8_t)(d.twr_len[e] >> 8);
     }
     cdc_write_all(reply_buffer, i);
   }

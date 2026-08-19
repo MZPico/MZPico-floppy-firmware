@@ -223,6 +223,20 @@ struct FdcDebug {
   uint8_t wrf_side[8];
   uint16_t wrf_ids[8];
   uint32_t wrf_us[8];
+  // Ring of the last 8 host WRITE TRACKs, oldest -> newest (twr_n = total).
+  // A format writes blind at the believed head position, so this is the only
+  // record of where each track actually went down and with which density
+  // decision. flags: b0 encoded HD, b1 declaration valid, b2 declaration HD,
+  // b3 census HD, b4 reached the media.
+  uint32_t twr_n;
+  uint32_t twr_ms[8];
+  uint8_t twr_trk[8];
+  uint8_t twr_side[8];
+  uint8_t twr_phys[8]; // position belief at the write (0xFE = unknown!)
+  uint8_t twr_nsec[8];
+  uint8_t twr_flags[8];
+  uint16_t twr_census[8];
+  uint16_t twr_len[8];
   uint8_t wr_last_result;    // b0 wrote b1 id_found b2 cyl b3 size b4 late
                              // b5 no_flux
   uint8_t wr_flags;          // b0 writing b1 armed b2 writes enabled b3 ~WPT
@@ -265,6 +279,10 @@ struct FdcFirstFail {
   uint8_t side;
   uint8_t seen_cyl;    // what the disk said instead (0xFF = it said nothing)
   uint8_t seen_head;
+  uint8_t drive;       // unit core0 was driving (0xFF = none) -- a failure on
+                       // the boot drive and one on the target drive tell very
+                       // different stories, and this used to be unrecorded
+  uint8_t motor;       // b0 host's motor bit, b1 spindle actually applied
   uint8_t capture_ok;
   uint32_t flux_n;
   uint32_t capture_us;
