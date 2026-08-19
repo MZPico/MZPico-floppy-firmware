@@ -3003,12 +3003,27 @@ void fdc_disk_task(void) {
       // host is shifting in RIGHT NOW is its most recent statement of
       // intent, so a contradiction invalidates the old declaration; the next
       // 0xDE write re-establishes it (and will then agree).
+      //
+      // ...and the census is ASYMMETRIC evidence. A census over the threshold
+      // PROVES HD -- no DD track can physically hold that many declared
+      // bytes -- so it outranks a stale DD declaration. A census under the
+      // threshold proves NOTHING: an underfilled HD format looks identical
+      // to a DD one, and FORMAT4's 16x256 boot-track image (~5.2k on-disk,
+      // the MZ master-disk convention on cyl 0 / head 1) is exactly that.
+      // The first symmetric version of this rule let that boot image
+      // "contradict" a perfectly valid HD declaration and dragged its encode
+      // to DD -- found as a hybrid track on the media: 16x256 sectors sitting
+      // on the un-erased tail of the previous 18x512 format.
       {
         bool img_hd = census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN;
-        if (g_density_mode == 2 && S.density_host_valid &&
-            S.density_host_hd != img_hd)
-          S.density_host_valid = false;
-        fdc_note_density(img_hd);
+        if (img_hd) {
+          if (g_density_mode == 2 && S.density_host_valid &&
+              !S.density_host_hd)
+            S.density_host_valid = false; // stale DD declaration, proven wrong
+          fdc_note_density(true);
+        }
+        // img_hd == false: no evidence either way -- follow the standing
+        // declaration or latch unchanged.
       }
       // Cap the flux at a bit over one revolution: the write is terminated by
       // the index pulse anyway, and encoding more is wasted time. An image
