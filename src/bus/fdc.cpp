@@ -255,6 +255,19 @@ struct FdcState {
   volatile uint8_t wr_ab_side = 0;
   volatile uint32_t wr_splice_us = 0;     // last splice: search time
   volatile uint16_t wr_ids_seen = 0;      // last splice: ID fields decoded
+  // Ring of the last 8 FAILED host writes. The cumulative counters said "37
+  // splice RNFs while CP/M copied files" and could not say WHICH writes --
+  // whether the failures cluster on a sector number, a track, a side, or
+  // scatter randomly is precisely what separates 'geometry mismatch' from
+  // 'marginal decode', and a rate that ignored a doubled search window says
+  // they are deterministic, i.e. the WHICH is the whole diagnosis.
+  volatile uint8_t wrf_trk[8] = {0};
+  volatile uint8_t wrf_sec[8] = {0};
+  volatile uint8_t wrf_side[8] = {0};
+  volatile uint16_t wrf_ids[8] = {0};  // IDs the failed hunt decoded
+  volatile uint32_t wrf_us[8] = {0};   // ...and how long it hunted
+  volatile uint8_t wrf_pos = 0;
+  volatile uint32_t wrf_n = 0; // total failed host writes (ring wraps)
   volatile uint8_t wr_last_result = 0;    // b0 wrote b1 id_found b2 cyl_mismatch
                                           // b3 size_mismatch b4 late b5 no_flux
   // One-sector transfer buffer. core0 fills it and raises `drq`; core1 hands the
@@ -2169,6 +2182,20 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->wr_late = S.wr_late;
   o->wr_splice_us = S.wr_splice_us;
   o->wr_ids_seen = S.wr_ids_seen;
+  // Failed-write ring, emitted oldest -> newest so the probe prints it as-is.
+  o->wrf_n = S.wrf_n;
+  {
+    uint8_t n = (S.wrf_n < 8) ? (uint8_t)S.wrf_n : 8;
+    uint8_t start = (uint8_t)((S.wrf_pos - n) & 7);
+    for (uint8_t k = 0; k < 8; ++k) {
+      uint8_t idx = (uint8_t)((start + k) & 7);
+      o->wrf_trk[k] = S.wrf_trk[idx];
+      o->wrf_sec[k] = S.wrf_sec[idx];
+      o->wrf_side[k] = S.wrf_side[idx];
+      o->wrf_ids[k] = S.wrf_ids[idx];
+      o->wrf_us[k] = S.wrf_us[idx];
+    }
+  }
   o->wr_last_result = S.wr_last_result;
   o->wr_flags = (uint8_t)((S.writing ? 0x01 : 0) | (S.wr_armed ? 0x02 : 0) |
                           (g_write_enable ? 0x04 : 0) |
@@ -3145,6 +3172,16 @@ void fdc_disk_task(void) {
       // Everything that is not a completed write is RNF to the host: the WD has
       // exactly one "the sector I was told to write is not under this head"
       // status bit. fdc_record_splice's counters are what tell the causes apart.
+      {
+        uint8_t p = S.wrf_pos;
+        S.wrf_trk[p] = S.track;
+        S.wrf_sec[p] = want;
+        S.wrf_side[p] = S.side1 ? 1 : 0;
+        S.wrf_ids[p] = sr.ids_seen;
+        S.wrf_us[p] = sr.search_us;
+        S.wrf_pos = (uint8_t)((p + 1) & 7);
+        S.wrf_n++;
+      }
       S.err_rnf = true;
       if (sr.cyl_mismatch) {
         S.sec_cyl_mismatch++;

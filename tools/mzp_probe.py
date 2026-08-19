@@ -847,8 +847,8 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 76)
-    if len(r) < 76 or r[1] != 0:
+    r = read_exact(s, 152)
+    if len(r) < 152 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
@@ -903,6 +903,20 @@ def do_wrdiag(s):
     if late:
         print("  ! 'too late' means the ID decoded after its Gap 2 had passed; "
               "the splice was skipped rather than risk the next ID field")
+    # Failed-write ring: WHICH writes failed. Clustering on a sector number /
+    # track / side = geometry mismatch; scattered = marginal decode.
+    wrf_n = int.from_bytes(r[76:80], "little")
+    if wrf_n:
+        shown = min(wrf_n, 8)
+        print(f"failed writes: {wrf_n} total; last {shown} "
+              f"(oldest -> newest):")
+        for e in range(shown):  # snapshot emits oldest -> newest in slots 0..n-1
+            off = 80 + e * 9
+            trk, sec, side = r[off], r[off + 1], r[off + 2]
+            ids = r[off + 3] | (r[off + 4] << 8)
+            us = int.from_bytes(r[off + 5:off + 9], "little")
+            print(f"    trk={trk:3d} side={side} sec={sec:2d}  "
+                  f"ids_seen={ids:2d}  hunted {us / 1000:.1f} ms")
 
 
 FF_KINDS = {0: "(none)", 1: "RNF -- sector not on this track",

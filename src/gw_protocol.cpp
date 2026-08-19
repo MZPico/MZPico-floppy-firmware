@@ -1428,6 +1428,19 @@ void gw_task() {
     reply_buffer[i++] = (uint8_t)(d.trk_pos >> 8);
     reply_buffer[i++] = (uint8_t)(d.trk_last_bytes & 0xFF);
     reply_buffer[i++] = (uint8_t)(d.trk_last_bytes >> 8);
+    // Failed-write ring: wrf_n(4), then 8 x [trk, sec, side, ids(2), us(4)],
+    // oldest -> newest. 76 bytes -> 152 total.
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.wrf_n >> (8 * k)) & 0xFF;
+    for (int e = 0; e < 8; e++) {
+      reply_buffer[i++] = d.wrf_trk[e];
+      reply_buffer[i++] = d.wrf_sec[e];
+      reply_buffer[i++] = d.wrf_side[e];
+      reply_buffer[i++] = (uint8_t)(d.wrf_ids[e] & 0xFF);
+      reply_buffer[i++] = (uint8_t)(d.wrf_ids[e] >> 8);
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (d.wrf_us[e] >> (8 * k)) & 0xFF;
+    }
     cdc_write_all(reply_buffer, i);
   }
 

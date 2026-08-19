@@ -213,6 +213,16 @@ struct FdcDebug {
   uint32_t wr_late;          // ID decoded too late to hit its Gap 2 window
   uint32_t wr_splice_us;     // last splice: search time
   uint16_t wr_ids_seen;      // last splice: ID fields decoded
+  // Ring of the last 8 FAILED host writes, oldest -> newest (wrf_n = total
+  // failures ever; min(wrf_n, 8) entries are valid). Which writes fail --
+  // clustered on a sector number, a track, a side, or scattered -- is what
+  // separates a geometry mismatch from a marginal decode.
+  uint32_t wrf_n;
+  uint8_t wrf_trk[8];
+  uint8_t wrf_sec[8];
+  uint8_t wrf_side[8];
+  uint16_t wrf_ids[8];
+  uint32_t wrf_us[8];
   uint8_t wr_last_result;    // b0 wrote b1 id_found b2 cyl b3 size b4 late
                              // b5 no_flux
   uint8_t wr_flags;          // b0 writing b1 armed b2 writes enabled b3 ~WPT
