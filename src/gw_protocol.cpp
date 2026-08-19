@@ -933,7 +933,7 @@ void gw_task() {
 
   else if (cmd == MZP_CMD_RDDIAG) {
     // [cmd, ACK, capture_ok, flux_n(4), capture_us(4), search_us(4),
-    //  rd_elapsed_us(4), want, result, ids_seen, ids[16],
+    //  rd_elapsed_us(4), want, result, ids_seen, ids[FDC_IDS_N=20],
     //  status_polls(4), status_span_us(4),
     //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4),
     //  write_attempts(4), verify_start_ok, verify_n(4), seek_error,
@@ -953,7 +953,7 @@ void gw_task() {
     reply_buffer[i++] = d.rd_want;
     reply_buffer[i++] = d.rd_result;
     reply_buffer[i++] = d.rd_ids_seen;
-    for (int k = 0; k < 16; k++)
+    for (int k = 0; k < FDC_IDS_N; k++)
       reply_buffer[i++] = d.rd_ids[k];
     const uint32_t p32[] = {d.status_polls, d.status_span_us};
     for (uint32_t v : p32) {
@@ -1343,9 +1343,9 @@ void gw_task() {
     // cmd_buffer[2]: 1 = clear the latch after reporting (arm for a new run).
     // [cmd, ACK, valid, kind, count(4), at_ms(4), want_sec, trk_reg,
     //  head_target, phys_track, side, seen_cyl, seen_head, capture_ok,
-    //  flux_n(4), capture_us(4), ids_seen, ids[16], pos_resyncs(4),
+    //  flux_n(4), capture_us(4), ids_seen, ids[FDC_IDS_N=20], pos_resyncs(4),
     //  resync_from, resync_to, reset_events(4), reset_at_ms(4),
-    //  reset_line, reset_active] -- 61 bytes.
+    //  reset_line, reset_active] -- 65 bytes.
     FdcFirstFail f;
     fdc_firstfail_snapshot(&f);
     reply_buffer[i++] = GW_ACK_OK;
@@ -1370,7 +1370,7 @@ void gw_task() {
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
     }
     reply_buffer[i++] = f.ids_seen;
-    for (int k = 0; k < 16; k++)
+    for (int k = 0; k < FDC_IDS_N; k++)
       reply_buffer[i++] = f.ids[k];
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (f.pos_resyncs >> (8 * k)) & 0xFF;

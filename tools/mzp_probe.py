@@ -446,8 +446,8 @@ def fdc_line(r):
 def do_rddiag(s):
     s.write(bytes([MZP_CMD_RDDIAG, 2]))
     s.flush()
-    r = read_exact(s, 92)
-    if len(r) < 92 or r[1] != 0:
+    r = read_exact(s, 96)
+    if len(r) < 96 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
 
@@ -457,20 +457,20 @@ def do_rddiag(s):
     capture_ok = r[2]
     flux_n, capture_us, search_us, abort_us = u32(3), u32(7), u32(11), u32(15)
     want, result, ids_seen = r[19], r[20], r[21]
-    ids = list(r[22:38])
-    status_polls, status_span_us = u32(38), u32(42)
-    int_flags, int_mode = r[46], r[47]
-    intrq_asserts, lost_data_events = u32(48), u32(52)
-    write_attempts = u32(56)
-    verify_start_ok, verify_n, seek_error = r[60], u32(61), r[65]
-    verify_attempts = u32(66)
+    ids = list(r[22:42])  # FDC_IDS_N = 20
+    status_polls, status_span_us = u32(42), u32(46)
+    int_flags, int_mode = r[50], r[51]
+    intrq_asserts, lost_data_events = u32(52), u32(56)
+    write_attempts = u32(60)
+    verify_start_ok, verify_n, seek_error = r[64], u32(65), r[69]
+    verify_attempts = u32(70)
     # Parsed here, with everything else, because the READ ADDRESS branch below
     # rebinds `r` to a size code and destroys the reply buffer.
-    sec_ok, sec_crc_err, sec_rnf = u32(70), u32(74), u32(78)
-    last_id_cyl, last_id_head = r[82], r[83]
-    sec_cyl_mismatch = u32(84)
-    last_trk_reg, last_want_side = r[88], r[89]
-    last_head_target, last_phys_track = r[90], r[91]
+    sec_ok, sec_crc_err, sec_rnf = u32(74), u32(78), u32(82)
+    last_id_cyl, last_id_head = r[86], r[87]
+    sec_cyl_mismatch = u32(88)
+    last_trk_reg, last_want_side = r[92], r[93]
+    last_head_target, last_phys_track = r[94], r[95]
 
     found = bool(result & 1)
     is_readaddr = bool(result & 0x10)
@@ -492,11 +492,11 @@ def do_rddiag(s):
     print(f"  decode  : {search_us / 1000:.1f} ms")
     if not found and not is_readaddr:
         if ids_seen:
-            shown = ids[:min(ids_seen, 16)]
+            shown = ids[:min(ids_seen, 20)]
             print(f"  track HAS {ids_seen} sector IDs: "
                   f"{', '.join(str(v) for v in shown)}"
-                  f"{' ...' if ids_seen > 16 else ''}")
-            if want not in shown and ids_seen <= 16:
+                  f"{' ...' if ids_seen > 20 else ''}")
+            if want not in shown and ids_seen <= 20:
                 print(f"  -> sector {want} is NOT on this track/side")
         else:
             print("  track HAS 0 decodable sector IDs -> the captured flux is "
@@ -544,8 +544,8 @@ def do_rddiag(s):
               "matching the target cylinder. The boot ROM stops here and "
               "reports a loading error WITHOUT ever issuing a READ.")
     if write_attempts:
-        print(f"  WRITES  : {write_attempts} WRITE SECTOR command(s) REFUSED "
-              f"with WRITE PROTECT -- 3.3 is not implemented yet")
+        print(f"  WRITES  : {write_attempts} WRITE SECTOR command(s) this "
+              f"session -- see `wrdiag` for their outcomes")
     if lost_data_events:
         print(f"  LOST DATA: {lost_data_events} sector(s) DRQ'd but never "
               f"drained by the host")
@@ -961,8 +961,8 @@ def do_firstfail(s, clear=False):
     """
     s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
     s.flush()
-    r = read_exact(s, 61)
-    if len(r) < 61 or r[1] != 0:
+    r = read_exact(s, 65)
+    if len(r) < 65 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     valid, kind = r[2], r[3]
@@ -972,12 +972,12 @@ def do_firstfail(s, clear=False):
     flux_n = int.from_bytes(r[20:24], "little")
     cap_us = int.from_bytes(r[24:28], "little")
     ids_seen = r[28]
-    ids = list(r[29:45])
-    resyncs = int.from_bytes(r[45:49], "little")
-    rs_from, rs_to = r[49], r[50]
-    reset_events = int.from_bytes(r[51:55], "little")
-    reset_at_ms = int.from_bytes(r[55:59], "little")
-    reset_line, reset_active = r[59], r[60]
+    ids = list(r[29:49])  # FDC_IDS_N = 20
+    resyncs = int.from_bytes(r[49:53], "little")
+    rs_from, rs_to = r[53], r[54]
+    reset_events = int.from_bytes(r[55:59], "little")
+    reset_at_ms = int.from_bytes(r[59:63], "little")
+    reset_line, reset_active = r[63], r[64]
 
     # Read this first. The bus-RESET handling assumes the line idles LOW; if a
     # running machine shows it high, that assumption is wrong for this board and

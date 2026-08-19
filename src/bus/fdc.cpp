@@ -283,7 +283,7 @@ struct FdcState {
   volatile uint32_t rd_capture_us = 0;  // wall time spent in the capture window
   volatile uint32_t rd_search_us = 0;   // wall time spent decoding
   volatile uint8_t rd_ids_seen = 0;     // ID fields decoded in that flux
-  volatile uint8_t rd_ids[16] = {0};    // the sector numbers actually found
+  volatile uint8_t rd_ids[FDC_IDS_N] = {0}; // sector numbers actually found
   volatile uint8_t rd_want = 0;         // sector the host asked for
   volatile uint8_t rd_result = 0;       // b0 found b1 has_data b2 crc_ok b3 del
 
@@ -373,7 +373,7 @@ struct FdcState {
   volatile uint32_t ff_flux_n = 0;
   volatile uint32_t ff_capture_us = 0;
   volatile uint8_t ff_ids_seen = 0;
-  volatile uint8_t ff_ids[16] = {0}; // the sector numbers really on the track
+  volatile uint8_t ff_ids[FDC_IDS_N] = {0}; // sector numbers really on the track
 
   volatile uint32_t status_polls = 0;
   volatile uint32_t status_last_us = 0;
@@ -1327,7 +1327,7 @@ static void fdc_note_track_ids(const uint8_t *flux, size_t n_flux) {
   int ns = mfm_scan_track(flux, n_flux, fdc_bit_us(), ids, 40, g_secbuf,
                           sizeof(g_secbuf));
   S.rd_ids_seen = (ns < 0) ? 0 : (uint8_t)ns;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     S.rd_ids[k] = (k < ns) ? ids[k].sec : 0;
 }
 
@@ -1367,7 +1367,7 @@ static void fdc_note_failure(uint8_t kind, uint8_t want_sec, uint8_t seen_cyl,
   S.ff_flux_n = S.rd_flux_n;
   S.ff_capture_us = S.rd_capture_us;
   S.ff_ids_seen = S.rd_ids_seen;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     S.ff_ids[k] = S.rd_ids[k];
 }
 
@@ -2125,7 +2125,7 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->rd_capture_us = S.rd_capture_us;
   o->rd_search_us = S.rd_search_us;
   o->rd_ids_seen = S.rd_ids_seen;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     o->rd_ids[k] = S.rd_ids[k];
   o->rd_want = S.rd_want;
   o->rd_result = S.rd_result;
@@ -2200,7 +2200,7 @@ void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->flux_n = S.ff_flux_n;
   o->capture_us = S.ff_capture_us;
   o->ids_seen = S.ff_ids_seen;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     o->ids[k] = S.ff_ids[k];
   o->reset_events = S.reset_events;
   o->reset_at_ms = S.reset_at_ms;
@@ -3318,6 +3318,24 @@ void fdc_disk_task(void) {
           uint8_t idtmp[6];
           if (!mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
               fdc_try_other_density(flux, g_flux_n))
+            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
+                                 g_secbuf, sizeof(g_secbuf));
+        }
+        // Still not found: grant ONE more revolution before reporting RNF. A
+        // real WD1793 is more patient than a single window -- it keeps
+        // matching ID fields until the FOURTH index pulse. Our single
+        // 1.05-rev capture missed its sector ~0.5% of the time at HD
+        // (measured: 2 RNFs in ~630 format-verify reads, the wanted sector
+        // sitting in the window's wrap region both times), and FORMAT4
+        // aborts the whole format after two closely-spaced misses. A fresh
+        // capture starts at a different rotational phase, so a double miss
+        // is ~0.003%. Costs nothing on the success path; skipped when the
+        // host has already Force-Interrupted (the answer would be dropped)
+        // and on a wrong-cylinder result (another revolution cannot move
+        // the head -- the resync below is the fix for that).
+        if (!sd.found && !sd.cyl_mismatch && S.reading) {
+          fdc_capture_window(fdc_read_capture_bytes());
+          if (S.reading && g_flux_n > 0)
             sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                                  g_secbuf, sizeof(g_secbuf));
         }

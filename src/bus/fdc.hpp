@@ -63,8 +63,8 @@ bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags);
 // capture that decodes to nothing at the latched bit clock proves out at the
 // other one (CRC-valid ID field required). Forcing a mode also writes the
 // current drive's latch, so returning to auto starts from the proven density.
-// The host never signals density (the ROM defines port 0xDE but nothing writes
-// it), so this knob + the auto-detect are the only sources of truth.
+// In auto, a host 0xDE declaration (below) outranks the latch; the latch and
+// auto-detect serve hosts that never write the port (the boot ROM).
 void fdc_set_density_mode(uint8_t mode);
 uint8_t fdc_get_density_mode(void);
 bool fdc_drive_density_hd(int unit); // the per-drive latch
@@ -132,6 +132,12 @@ void fdc_disk_task(void);
 // the motor under a running machine every 10 s of USB silence.
 bool fdc_is_active(void);
 
+// Diagnostic sector-ID list length. Was 16, which an 18-sector HD track
+// overflows -- the two truncated entries are, by rotational bad luck, exactly
+// the ones a wrap-region RNF needs shown. Sized for HD plus margin. Changing
+// this changes the RDDIAG/FIRSTFAIL wire formats; the probe reads it in sync.
+static constexpr int FDC_IDS_N = 20;
+
 // Debug snapshot of the FDC state (for the USB probe). Call on core0.
 struct FdcDebug {
   uint8_t status;  // composed Type I STATUS (true, un-inverted)
@@ -169,7 +175,7 @@ struct FdcDebug {
   uint32_t rd_capture_us;   // time spent capturing
   uint32_t rd_search_us;    // time spent decoding
   uint8_t rd_ids_seen;      // ID fields decoded (only filled in on failure)
-  uint8_t rd_ids[16];       // sector numbers actually present on the track
+  uint8_t rd_ids[FDC_IDS_N]; // sector numbers actually present on the track
   uint8_t rd_want;          // sector the host asked for
   uint8_t rd_result;        // b0 found b1 has_data b2 crc_ok b3 deleted
   // The host's measured BUSY/DRQ patience after a READ command.
@@ -253,7 +259,7 @@ struct FdcFirstFail {
   uint32_t flux_n;
   uint32_t capture_us;
   uint8_t ids_seen;
-  uint8_t ids[16];     // the sector numbers really on the track
+  uint8_t ids[FDC_IDS_N]; // the sector numbers really on the track
   // Head-position resyncs: an ID field proved the head was elsewhere and we
   // adopted the disk's answer (fdc_resync_head).
   uint32_t pos_resyncs;
