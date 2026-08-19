@@ -223,6 +223,9 @@ struct FdcDebug {
   uint8_t wrf_side[8];
   uint16_t wrf_ids[8];
   uint32_t wrf_us[8];
+  uint8_t wrf_flags[8]; // b0 id_found b1 cyl b2 size b3 late b4 NO_FLUX
+                        // b5 hunted-at-HD b6 decl valid b7 decl HD
+  uint8_t wrf_motor[8]; // b0 host motor bit, b1 spindle applied
   // Ring of the last 8 host WRITE TRACKs, oldest -> newest (twr_n = total).
   // A format writes blind at the believed head position, so this is the only
   // record of where each track actually went down and with which density

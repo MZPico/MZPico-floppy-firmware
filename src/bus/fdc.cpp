@@ -266,6 +266,14 @@ struct FdcState {
   volatile uint8_t wrf_side[8] = {0};
   volatile uint16_t wrf_ids[8] = {0};  // IDs the failed hunt decoded
   volatile uint32_t wrf_us[8] = {0};   // ...and how long it hunted
+  // The environment of the failed hunt -- what separates "wrong bit clock"
+  // from "spindle not turning" from "flux flowed but would not decode":
+  // b0 splice result id_found, b1 cyl_mismatch, b2 size_mismatch, b3 late,
+  // b4 NO_FLUX (capture produced nothing), b5 hunted at HD clock,
+  // b6 0xDE declaration valid, b7 declaration said HD.
+  volatile uint8_t wrf_flags[8] = {0};
+  // b0 host motor bit, b1 spindle actually applied at the hunt.
+  volatile uint8_t wrf_motor[8] = {0};
   volatile uint8_t wrf_pos = 0;
   volatile uint32_t wrf_n = 0; // total failed host writes (ring wraps)
   // Ring of the last 8 host WRITE TRACKs. A format is positionally BLIND --
@@ -2216,6 +2224,8 @@ void fdc_debug_snapshot(FdcDebug *o) {
       o->wrf_side[k] = S.wrf_side[idx];
       o->wrf_ids[k] = S.wrf_ids[idx];
       o->wrf_us[k] = S.wrf_us[idx];
+      o->wrf_flags[k] = S.wrf_flags[idx];
+      o->wrf_motor[k] = S.wrf_motor[idx];
     }
   }
   // Track-write ring, same ordering.
@@ -3272,6 +3282,14 @@ void fdc_disk_task(void) {
         S.wrf_side[p] = S.side1 ? 1 : 0;
         S.wrf_ids[p] = sr.ids_seen;
         S.wrf_us[p] = sr.search_us;
+        S.wrf_flags[p] = (uint8_t)(
+            (sr.id_found ? 0x01 : 0) | (sr.cyl_mismatch ? 0x02 : 0) |
+            (sr.size_mismatch ? 0x04 : 0) | (sr.late ? 0x08 : 0) |
+            (sr.no_flux ? 0x10 : 0) | (fdc_is_hd() ? 0x20 : 0) |
+            (S.density_host_valid ? 0x40 : 0) |
+            (S.density_host_hd ? 0x80 : 0));
+        S.wrf_motor[p] = (uint8_t)((S.motor_on ? 1 : 0) |
+                                   (g_applied_motor ? 2 : 0));
         S.wrf_pos = (uint8_t)((p + 1) & 7);
         S.wrf_n++;
       }

@@ -847,8 +847,8 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 244)
-    if len(r) < 244 or r[1] != 0:
+    r = read_exact(s, 236)
+    if len(r) < 236 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
@@ -911,21 +911,33 @@ def do_wrdiag(s):
         print(f"failed writes: {wrf_n} total; last {shown} "
               f"(oldest -> newest):")
         for e in range(shown):  # snapshot emits oldest -> newest in slots 0..n-1
-            off = 80 + e * 9
-            trk, sec, side = r[off], r[off + 1], r[off + 2]
-            ids = r[off + 3] | (r[off + 4] << 8)
-            us = int.from_bytes(r[off + 5:off + 9], "little")
+            off = 80 + e * 8
+            trk, sec, side, ids = r[off], r[off + 1], r[off + 2], r[off + 3]
+            fl, mot = r[off + 4], r[off + 5]
+            ms = r[off + 6] | (r[off + 7] << 8)
+            decl = ("decl=" + ("HD" if fl & 0x80 else "DD")) if fl & 0x40 \
+                else "decl=none"
             print(f"    trk={trk:3d} side={side} sec={sec:2d}  "
-                  f"ids_seen={ids:2d}  hunted {us / 1000:.1f} ms")
+                  f"ids_seen={ids:2d}  hunted {ms} ms  "
+                  f"clk={'HD' if fl & 0x20 else 'DD'} {decl}  "
+                  f"motor={'on' if mot & 2 else 'OFF!'}"
+                  f"{'  NO FLUX' if fl & 0x10 else ''}"
+                  f"{'  late' if fl & 8 else ''}")
+        blind = all((r[80 + e * 8 + 3] == 0) and not (r[80 + e * 8 + 4] & 0x10)
+                    for e in range(shown))
+        if blind and shown:
+            print("    ^ flux flowed but NOTHING decoded at that clock for the "
+                  "whole hunt -- wrong bit clock, dying spindle, or the live "
+                  "decoder losing the stream (the no-DMA FIFO)")
     # Track-write ring: every host WRITE TRACK, with the position belief and
     # the density decision it was made under. A format writes BLIND at the
     # believed position, so 'phys=?' here is a mislabeled track on the media.
-    twr_n = int.from_bytes(r[152:156], "little")
+    twr_n = int.from_bytes(r[144:148], "little")
     if twr_n:
         shown = min(twr_n, 8)
         print(f"track writes: {twr_n} total; last {shown} (oldest -> newest):")
         for e in range(shown):
-            off = 156 + e * 11
+            off = 148 + e * 11
             ds = r[off] | (r[off + 1] << 8)
             trk, side, phys, nsec, fl = (r[off + 2], r[off + 3], r[off + 4],
                                          r[off + 5], r[off + 6])

@@ -1430,22 +1430,29 @@ void gw_task() {
     reply_buffer[i++] = (uint8_t)(d.trk_pos >> 8);
     reply_buffer[i++] = (uint8_t)(d.trk_last_bytes & 0xFF);
     reply_buffer[i++] = (uint8_t)(d.trk_last_bytes >> 8);
-    // Failed-write ring: wrf_n(4), then 8 x [trk, sec, side, ids(2), us(4)],
-    // oldest -> newest. 76 bytes -> 152 total.
+    // Failed-write ring: wrf_n(4), then 8 x [trk, sec, side, ids(1), flags,
+    // motor, hunt_ms(2)], oldest -> newest. 76 bytes -> 144.
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (d.wrf_n >> (8 * k)) & 0xFF;
+    // Entries repacked to 8 bytes each so the flags fit inside the 256-byte
+    // reply: [trk, sec, side, ids(1), flags, motor, hunt_ms(2)].
     for (int e = 0; e < 8; e++) {
       reply_buffer[i++] = d.wrf_trk[e];
       reply_buffer[i++] = d.wrf_sec[e];
       reply_buffer[i++] = d.wrf_side[e];
-      reply_buffer[i++] = (uint8_t)(d.wrf_ids[e] & 0xFF);
-      reply_buffer[i++] = (uint8_t)(d.wrf_ids[e] >> 8);
-      for (int k = 0; k < 4; k++)
-        reply_buffer[i++] = (d.wrf_us[e] >> (8 * k)) & 0xFF;
+      reply_buffer[i++] =
+          (uint8_t)((d.wrf_ids[e] > 255) ? 255 : d.wrf_ids[e]);
+      reply_buffer[i++] = d.wrf_flags[e];
+      reply_buffer[i++] = d.wrf_motor[e];
+      uint32_t ms = d.wrf_us[e] / 1000;
+      if (ms > 0xFFFF)
+        ms = 0xFFFF;
+      reply_buffer[i++] = (uint8_t)(ms & 0xFF);
+      reply_buffer[i++] = (uint8_t)(ms >> 8);
     }
     // Track-write ring: twr_n(4), then 8 x [ds(2), trk, side, phys, nsec,
     // flags, census(2), len(2)] with timestamps in DECISECONDS (u16 covers
-    // 109 min) so the whole reply stays inside the 256-byte buffer. 244 total.
+    // 109 min) so the whole reply stays inside the 256-byte buffer. 236 total.
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (d.twr_n >> (8 * k)) & 0xFF;
     for (int e = 0; e < 8; e++) {
