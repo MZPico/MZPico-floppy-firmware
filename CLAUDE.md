@@ -211,7 +211,8 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   cured by reseating the cartridge or cleaning the fingers with IPA are
   contacts, not code, and corrupted command bytes mimic impossible firmware
   bugs (the D7 incident). `busdump` remains the detailed per-line view; the
-  `bustest` Z80 program the definitive active measure. Note the summary only sees bytes
+  `bustest` Z80 program (`tools/mzf/BUSTEST.MZF`: `bustestreset`, load+run
+  on the MZ-800, `bustest`) the definitive active measure. Note the summary only sees bytes
   the ROM actually wrote, so a line reported "stuck" may simply never have
   needed to be 1 — check the union of the observed `last_raw_write` values
   before believing it. (ADDRESS bits 6/7 always read stuck high: every port we
@@ -360,10 +361,12 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     45700 bytes DD / 91400 HD) — byte windows are rotation-relative, adapting
     to the spindle's real speed, where a time window on a slightly-slow drive
     captured 0.96 rev and threw phase-dependent CRC errors (a lesson learned
-    the hard way; see `fdc_read_capture_bytes`). Density is the firmware's own determination (`mzp_probe.py
-    density dd|hd|auto`, default auto): a per-drive latch (default DD),
-    flipped when a capture that decodes to nothing at the latched bit clock
-    yields a CRC-valid ID at the other one — no recapture needed. **Port
+    the hard way; see `fdc_read_capture_bytes`). Density (`mzp_probe.py density dd|hd|auto|detect`, default auto):
+    a valid host `0xDE` declaration decides, else a per-drive latch (default
+    DD) — **no media probing by default**, so the boot-ROM/DD read path is
+    the pre-HD behaviour exactly; `detect` adds probing (a nothing-decodes
+    capture re-decoded at the other bit clock, CRC-valid ID flips the latch)
+    for `0xDE`-less hosts with HD media, which this machine does not have. **Port
     `0xDE` is the host's density declaration and, when valid, is trusted
     OUTRIGHT in auto mode** — a real WD never second-guesses its DENSEL
     input. Polarity observed from CP/M 4.1 (`0x00` throughout DD operation,
@@ -383,9 +386,11 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     Writes never auto-detect (the splice uses the effective density).
     A status-only verify read (host drains nothing — FORMAT4's idiom, legal on
     a real WD) completes after 15 ms instead of the 250 ms LOST-DATA budget,
-    which is what made an HD format ~11 min. The **Type I STATUS Index bit (b1) is now live
-    from `~INDEX`** (`idxbit 0` reverts): FORMAT4's HD path times the spindle
-    by polling it and froze forever against the old hardwired 0. DENSEL is
+    which is what made an HD format ~11 min. The **Type I STATUS Index bit (b1) is live from `~INDEX`
+    only while the host has declared HD** (`idxbit 0|1|2`): FORMAT4's HD
+    path times the spindle by polling it and froze forever against the old
+    hardwired 0, but an earlier always-live experiment regressed the boot
+    ROM's RESTORE check, so the DD/boot world keeps the hardwired 0. DENSEL is
     driven best-effort (3.5" drives sense HD from the media hole). Buffers are
     HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
     capture buffer already fit a full HD revolution). Verify bench-first:
