@@ -59,12 +59,12 @@ void fdc_bench_release(void);
 bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags);
 
 // Density (DD 250 kbit/s vs HD 500 kbit/s, both 300 rpm). mode 0 = force DD,
-// 1 = force HD, 2 = auto (default): per-drive latched density, flipped when a
-// capture that decodes to nothing at the latched bit clock proves out at the
-// other one (CRC-valid ID field required). Forcing a mode also writes the
-// current drive's latch, so returning to auto starts from the proven density.
-// In auto, a host 0xDE declaration (below) outranks the latch; the latch and
-// auto-detect serve hosts that never write the port (the boot ROM).
+// 1 = force HD, 2 = auto (default): a valid host 0xDE declaration decides,
+// else the per-drive latch (default DD) -- no media probing, so the boot/DD
+// path is the pre-HD behaviour exactly; 3 = detect: auto plus media probing
+// for declaration-less hosts (a nothing-decodes capture is probed at the
+// other bit clock; a CRC-valid ID flips the latch). Forcing dd/hd also writes
+// the current drive's latch.
 void fdc_set_density_mode(uint8_t mode);
 uint8_t fdc_get_density_mode(void);
 bool fdc_drive_density_hd(int unit); // the per-drive latch
@@ -79,8 +79,11 @@ void fdc_density_host(bool *valid, bool *hd);
 // Type I STATUS Index bit (b1), live from ~INDEX. Required by HD-aware
 // formatters (FORMAT4 times the spindle with it); removable at runtime in
 // case the boot ROM's RESTORE check ever objects again (see compose_status).
-void fdc_set_index_bit(bool on);
-bool fdc_get_index_bit(void);
+// 0 = never (pre-HD behaviour), 1 = only while the host has declared HD on
+// 0xDE (default -- the DD/boot-ROM world keeps pre-HD semantics exactly),
+// 2 = always.
+void fdc_set_index_bit(uint8_t mode);
+uint8_t fdc_get_index_bit(void);
 
 // core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back

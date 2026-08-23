@@ -653,12 +653,17 @@ volatile bool g_posfix_enabled = true;
 // WD179x reports the raw IP input here and an HD-aware formatter NEEDS it:
 // FORMAT4's HD path times the spindle by polling this bit, and with it
 // hardwired to 0 the machine froze polling STATUS forever (65535+ reads of
-// 0x04, measured in `iotrace`). Runtime-switchable (`mzp_probe.py idxbit 0`)
-// because an earlier live-index experiment regressed the boot ROM's RESTORE
-// completion check into an infinite retry loop -- if that recurs, this must be
-// removable without a reflash, and the A/B settles whether that experiment's
-// polarity was simply wrong.
-volatile bool g_index_bit_enabled = true;
+// 0x04, measured in `iotrace`).
+//
+// But an earlier live-index experiment regressed the boot ROM's RESTORE
+// completion check into an infinite retry loop, and enabling the bit
+// unconditionally on HD evidence alone put that risk back on every DD boot.
+// So, by default, the bit is visible ONLY while the host has declared HD on
+// 0xDE -- the one world that is known to need it. The boot ROM never writes
+// 0xDE and CP/M writes 0x00 for DD, so the DD world keeps exactly the pre-HD
+// status semantics. Modes: 0 = never, 1 = HD-declared only (default),
+// 2 = always (experiment). `mzp_probe.py idxbit N`.
+volatile uint8_t g_index_bit_mode = 1;
 
 namespace {
 
@@ -1014,11 +1019,15 @@ static constexpr float FDC_HD_BIT_US = 1.0f;
 // unknowable from the ROM alone. So the density used for decode/encode is OURS
 // to determine:
 //   mode 0 = force DD, 1 = force HD (bench/probe override, `density dd|hd`),
-//   mode 2 = AUTO (default): each drive has a latched density, and a capture
-//     that decodes to nothing at the latched bit clock is re-decoded at the
-//     other one -- same flux, no extra revolution, because the capture window
-//     is sized in TIME (a revolution is 200 ms at either density). An ID field
-//     with a valid CRC at the other clock flips the latch.
+//   mode 2 = AUTO (default): a valid host 0xDE declaration decides; with no
+//     declaration (the boot ROM), the per-drive latch decides. NO media
+//     probing -- the boot/DD path stays byte-for-byte the pre-HD behaviour.
+//   mode 3 = DETECT: auto, plus media probing for declaration-less hosts -- a
+//     capture that decodes to nothing at the latched bit clock is cheaply
+//     probed at the other one (first CRC-valid ID field) and a proven ID
+//     flips the latch. Useful for HD media under a host that never writes
+//     0xDE; off by default because it adds a code path to the boot ROM's
+//     failure handling for a case this machine does not have.
 // The latch is per drive for the same reason the size cache is: two drives can
 // hold different media. Default DD -- the machine's native format, and what
 // every boot must assume. Writes never auto-detect: a splice rides the disk
@@ -1052,7 +1061,7 @@ ALWAYS_INLINE size_t fdc_track_flux_max(void) {
 // Record an observed density for the drive core0 is driving (auto mode only --
 // a forced mode is a bench statement of fact and must not be second-guessed).
 static void fdc_note_density(bool hd) {
-  if (g_density_mode != 2)
+  if (g_density_mode < 2)
     return;
   int d = fdc_cur_idx();
   if (g_drive_hd[d] != hd) {
@@ -1083,7 +1092,7 @@ static void fdc_note_density(bool hd) {
 // of proof at a fraction of the cost, and on flux of the WRONG density it
 // terminates after a single cheap sync-hunt pass, since no ID can decode.
 static bool fdc_try_other_density(const uint8_t *flux, size_t n_flux) {
-  if (g_density_mode != 2 || n_flux == 0)
+  if (g_density_mode != 3 || n_flux == 0)
     return false;
   // Once the host has declared a density on 0xDE, do not second-guess it: a
   // flip of our latch could not take effect anyway (the declaration
@@ -1516,8 +1525,13 @@ inline uint8_t compose_status() {
     // stays runtime-removable (`idxbit 0`) until a boot has been seen clean
     // with it on. Gated on motor_on so an idle spindle shows no phantom
     // pulses; one gpio_get on a STATUS read costs nothing that matters.
-    if (g_index_bit_enabled && S.motor_on && !gpio_get(PIN_INDEX))
-      st |= 0x02; // INDEX
+    {
+      bool idx_on = (g_index_bit_mode == 2) ||
+                    (g_index_bit_mode == 1 && S.density_host_valid &&
+                     S.density_host_hd);
+      if (idx_on && S.motor_on && !gpio_get(PIN_INDEX))
+        st |= 0x02; // INDEX
+    }
     if (S.at_track0)
       st |= 0x04; // TRACK 00
     if (S.seek_error)
@@ -2719,7 +2733,7 @@ bool fdc_get_write_enable(void) { return g_write_enable; }
 bool fdc_is_active(void) { return S.active; }
 
 void fdc_set_density_mode(uint8_t mode) {
-  g_density_mode = (mode > 2) ? 2 : mode;
+  g_density_mode = (mode > 3) ? 3 : mode;
   // Forcing a density also teaches the latch: when the mode later returns to
   // auto, the drive starts from the density the bench just proved, not from a
   // stale guess.
@@ -2735,8 +2749,10 @@ void fdc_density_host(bool *valid, bool *hd) {
   if (hd)
     *hd = S.density_host_hd;
 }
-void fdc_set_index_bit(bool on) { g_index_bit_enabled = on; }
-bool fdc_get_index_bit(void) { return g_index_bit_enabled; }
+void fdc_set_index_bit(uint8_t mode) {
+  g_index_bit_mode = (mode > 2) ? 2 : mode;
+}
+uint8_t fdc_get_index_bit(void) { return g_index_bit_mode; }
 bool fdc_drive_density_hd(int unit) {
   return (unit >= 0 && unit < FDC_DRIVE_MAX) ? g_drive_hd[unit] : false;
 }

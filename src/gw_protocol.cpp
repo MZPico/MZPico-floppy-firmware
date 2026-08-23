@@ -1302,10 +1302,10 @@ void gw_task() {
   }
 
   else if (cmd == MZP_CMD_DENSITY) {
-    // cmd_buffer[2]: 0 = force DD, 1 = force HD, 2 = auto, 3 = query.
-    // Reply: [cmd, ACK, mode, unit0_hd, unit1_hd, flips(4 LE),
+    // cmd_buffer[2]: 0 = force DD, 1 = force HD, 2 = auto, 3 = detect,
+    // 4 = query. Reply: [cmd, ACK, mode, unit0_hd, unit1_hd, flips(4 LE),
     //         host_valid, host_hd].
-    if (cmd_buffer[2] < 3)
+    if (cmd_buffer[2] < 4)
       fdc_set_density_mode(cmd_buffer[2]);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = fdc_get_density_mode();
@@ -1337,11 +1337,12 @@ void gw_task() {
   }
 
   else if (cmd == MZP_CMD_IDXBIT) {
-    // cmd_buffer[2]: 0 = off, 1 = on (default), 2 = query.
-    if (cmd_buffer[2] < 2)
-      fdc_set_index_bit(cmd_buffer[2] != 0);
+    // cmd_buffer[2]: 0 = never, 1 = HD-declared only (default), 2 = always,
+    // 3 = query.
+    if (cmd_buffer[2] < 3)
+      fdc_set_index_bit(cmd_buffer[2]);
     reply_buffer[i++] = GW_ACK_OK;
-    reply_buffer[i++] = fdc_get_index_bit() ? 1 : 0;
+    reply_buffer[i++] = fdc_get_index_bit();
     cdc_write_all(reply_buffer, i);
   }
 

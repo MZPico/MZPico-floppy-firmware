@@ -32,8 +32,8 @@ Usage:
     python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
     python mzp_probe.py PORT drvlock [0|1]                # pin every access to drive 0, ignoring port 0xDC (no arg = query)
     python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
-    python mzp_probe.py PORT density [dd|hd|auto]         # density; auto = host 0xDE, else per-drive detect (no arg = query)
-    python mzp_probe.py PORT idxbit [0|1]                 # Type I STATUS Index bit from ~INDEX (no arg = query)
+    python mzp_probe.py PORT density [dd|hd|auto|detect]  # density; auto = host 0xDE else latch (default); detect adds media probing
+    python mzp_probe.py PORT idxbit [0|1|2]               # Index status bit: 0 never, 1 only while host declares HD (default), 2 always
     python mzp_probe.py PORT fwver                        # git hash of the RUNNING firmware
     python mzp_probe.py PORT health                       # session sanity check: build + passive bus/contact screen (run FIRST)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
@@ -214,7 +214,7 @@ def effective_density(s):
     side just did -- an explicit dens argument still overrides. (fmtverify
     once wrote a track at forced-HD and scanned it back at the DD default:
     "MISSING sectors: [1..9]" on a perfectly good track.)"""
-    s.write(bytes([MZP_CMD_DENSITY, 3, 3]))  # 3 = query
+    s.write(bytes([MZP_CMD_DENSITY, 3, 4]))  # 4 = query
     s.flush()
     r = read_exact(s, 11)
     if len(r) != 11 or r[1] != 0:
@@ -1564,16 +1564,18 @@ def main():
                     print("  (both heads on the same cylinder -- park them apart to test independence)")
         elif cmd == "density":
             # 0 = force DD, 1 = force HD, 2 = auto (default), 3 = query.
-            names = {"dd": 0, "hd": 1, "auto": 2}
-            val = names.get(sys.argv[3].lower(), None) if len(sys.argv) > 3 else 3
+            names = {"dd": 0, "hd": 1, "auto": 2, "detect": 3}
+            val = names.get(sys.argv[3].lower(), None) if len(sys.argv) > 3 else 4
             if val is None:
-                raise SystemExit("density takes dd, hd or auto")
+                raise SystemExit("density takes dd, hd, auto or detect")
             s.write(bytes([MZP_CMD_DENSITY, 3, val & 0xFF]))
             s.flush()
             r = read_exact(s, 11)
             if len(r) == 11:
                 mode = {0: "FORCED DD", 1: "FORCED HD",
-                        2: "auto (host 0xDE, else per-drive detect)"}.get(r[2], "?")
+                        2: "auto (host 0xDE, else per-drive latch; no probing)",
+                        3: "detect (auto + media probing for 0xDE-less hosts)"
+                        }.get(r[2], "?")
                 flips = r[5] | (r[6] << 8) | (r[7] << 16) | (r[8] << 24)
                 print("density mode: %s" % mode)
                 print("  host 0xDE declaration: %s"
@@ -1597,15 +1599,18 @@ def main():
             else:
                 print("firmware predates the fwver command (pre-101d57f+)")
         elif cmd == "idxbit":
-            # Type I STATUS Index bit: 0 = off, 1 = on (default), no arg = query.
-            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            # Type I STATUS Index bit: 0 = never, 1 = only while the host has
+            # declared HD on 0xDE (default), 2 = always; no arg = query.
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 3
             s.write(bytes([MZP_CMD_IDXBIT, 3, val & 0xFF]))
             s.flush()
             r = read_exact(s, 3)
+            names = {0: "hardwired 0 (pre-HD behaviour, everywhere)",
+                     1: "live from ~INDEX ONLY while the host declares HD "
+                        "(default: DD/boot ROM keep pre-HD semantics)",
+                     2: "live from ~INDEX always (experiment)"}
             print("Type I STATUS Index bit (b1): "
-                  + ("LIVE from ~INDEX (WD-faithful; HD formatters need it)"
-                     if len(r) == 3 and r[2] else
-                     "hardwired 0 (pre-HD behaviour)"))
+                  + (names.get(r[2], "?") if len(r) == 3 else "bad reply"))
         elif cmd == "drvlock":
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
             s.write(bytes([MZP_CMD_DRVLOCK, 3, val & 0xFF]))
