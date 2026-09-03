@@ -850,6 +850,16 @@ bool g_applied_select = false;
 bool g_applied_motor = false; // physical motor state (may lag S.motor_on)
 int g_applied_side = -1;
 int g_applied_density = -1; // DENSEL pin shadow: -1 unknown, 0 DD, 1 HD
+// Bench override for the DENSEL pin, decoupled from the encode/decode density:
+// -1 = follow the effective density (default), 0/1 = pin that level. Exists to
+// answer a question the media raised: FORMAT4's DD boot track on an HD disk
+// came back with 9 of 16 data fields CRC-bad while IDs decoded fine -- a
+// weakly RECORDED track, i.e. the drive's write mode, not our flux timing.
+// Drives that honour pin 2 (most 3.5" drives go by the media hole and ignore
+// it) would have written that track in DD mode onto HD media. The override
+// lets the bench write the same track with the pin at either level and scan
+// the difference.
+volatile int8_t g_densel_override = -1;
 bool g_timing_set = false;
 uint32_t g_motor_off_at = 0; // deferred motor-stop deadline (ms; 0 = none)
 // Has this drive's spindle been confirmed turning (index seen) since boot?
@@ -1064,6 +1074,21 @@ ALWAYS_INLINE float fdc_bit_us(void) {
 }
 ALWAYS_INLINE size_t fdc_track_flux_max(void) {
   return fdc_is_hd() ? FDC_TRACK_FLUX_MAX_HD : FDC_TRACK_FLUX_MAX_DD;
+}
+
+// Drive DENSEL to the level the override or the effective density asks for.
+// Best-effort and idempotent; called from the disk task on every pass and
+// from every bench entry point before it touches the media, so a bench
+// experiment and the host path see the same pin policy.
+static void fdc_apply_densel(void) {
+  if (!DRV)
+    return;
+  int want = (g_densel_override >= 0) ? (int)g_densel_override
+                                      : (fdc_is_hd() ? 1 : 0);
+  if (want != g_applied_density) {
+    DRV->set_density(want != 0);
+    g_applied_density = want;
+  }
 }
 
 // Record an observed density for the drive core0 is driving (auto mode only --
@@ -2482,6 +2507,7 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
 
   size_t cap = 0;
@@ -2524,6 +2550,7 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
 
   S.write_attempts++;
@@ -2625,6 +2652,7 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
   if (DRV->get_write_protect()) {
     if (out_result)
@@ -2676,6 +2704,7 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
 
   int32_t idx = 0;
@@ -2693,6 +2722,7 @@ const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
 FloppyDrive *fdc_bench_drive(void) {
   if (!fdc_apply_drive_select())
     return nullptr;
+  fdc_apply_densel();
   return DRV;
 }
 
@@ -2763,6 +2793,13 @@ void fdc_density_host(bool *valid, bool *hd) {
   if (hd)
     *hd = S.density_host_hd;
 }
+void fdc_set_densel(int8_t mode) {
+  g_densel_override = (mode < 0) ? -1 : (mode ? 1 : 0);
+  fdc_apply_densel(); // take effect now if a drive is live
+}
+int8_t fdc_get_densel(void) { return g_densel_override; }
+int fdc_get_densel_level(void) { return g_applied_density; }
+
 void fdc_set_index_bit(uint8_t mode) {
   g_index_bit_mode = (mode > 2) ? 2 : mode;
 }
@@ -2859,13 +2896,7 @@ void fdc_disk_task(void) {
   // (see hardware-notes) -- so nothing here RELIES on the pin. The captured
   // flux is deliberately NOT dropped on a change: flux deltas are
   // clock-agnostic, the density only tells the decoder how to read them.
-  {
-    int want_dens = fdc_is_hd() ? 1 : 0;
-    if (want_dens != g_applied_density) {
-      DRV->set_density(want_dens != 0);
-      g_applied_density = want_dens;
-    }
-  }
+  fdc_apply_densel();
 
   // Execute a pending physical seek.
   if (S.op_done != S.op_seq) {

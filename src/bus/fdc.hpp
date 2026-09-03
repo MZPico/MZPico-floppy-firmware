@@ -85,6 +85,14 @@ void fdc_density_host(bool *valid, bool *hd);
 void fdc_set_index_bit(uint8_t mode);
 uint8_t fdc_get_index_bit(void);
 
+// DENSEL pin override, decoupled from the encode/decode density: -1 = follow
+// the effective density (default), 0/1 = pin that level. Bench experiment
+// tool -- see g_densel_override. fdc_get_densel_level() is the level actually
+// on the pin (-1 = never driven yet).
+void fdc_set_densel(int8_t mode);
+int8_t fdc_get_densel(void);
+int fdc_get_densel_level(void);
+
 // core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back
 // onto the bus (inversion already applied for 0xD8..0xDB).

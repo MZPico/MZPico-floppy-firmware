@@ -81,6 +81,7 @@
 #define MZP_CMD_DENSITY 0x9E   // density: force DD/HD or auto-detect (default)
 #define MZP_CMD_IDXBIT 0x9F    // Type I STATUS Index bit on/off (default on)
 #define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
+#define MZP_CMD_DENSEL 0xA1    // DENSEL pin override: 0/1 force, 2 auto, 3 query
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1333,6 +1334,20 @@ void gw_task() {
     reply_buffer[i++] = n;
     for (uint8_t k = 0; k < n; k++)
       reply_buffer[i++] = (uint8_t)ver[k];
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_DENSEL) {
+    // cmd_buffer[2]: 0/1 = pin that level, 2 = follow density, 3 = query.
+    // Reply: [cmd, ACK, override(-1/0/1 as u8), pin level now (0xFF unknown)].
+    if (cmd_buffer[2] < 2)
+      fdc_set_densel((int8_t)cmd_buffer[2]);
+    else if (cmd_buffer[2] == 2)
+      fdc_set_densel(-1);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = (uint8_t)fdc_get_densel();
+    int lvl = fdc_get_densel_level();
+    reply_buffer[i++] = (lvl < 0) ? 0xFF : (uint8_t)lvl;
     cdc_write_all(reply_buffer, i);
   }
 

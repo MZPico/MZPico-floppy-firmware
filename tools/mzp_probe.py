@@ -34,6 +34,7 @@ Usage:
     python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
     python mzp_probe.py PORT density [dd|hd|auto|detect]  # density; auto = host 0xDE else latch (default); detect adds media probing
     python mzp_probe.py PORT idxbit [0|1|2]               # Index status bit: 0 never, 1 only while host declares HD (default), 2 always
+    python mzp_probe.py PORT densel [0|1|auto]            # DENSEL pin override for write-current experiments (no arg = query)
     python mzp_probe.py PORT fwver                        # git hash of the RUNNING firmware
     python mzp_probe.py PORT health                       # session sanity check: build + passive bus/contact screen (run FIRST)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
@@ -89,6 +90,7 @@ MZP_CMD_DRIVE = 0x83
 MZP_CMD_DENSITY = 0x9E
 MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_FWVER = 0xA0
+MZP_CMD_DENSEL = 0xA1
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -1613,6 +1615,21 @@ def main():
                 print("firmware build: %s" % v.decode("ascii", "replace"))
             else:
                 print("firmware predates the fwver command (pre-101d57f+)")
+        elif cmd == "densel":
+            # DENSEL pin override: 0/1 = force that level, auto = follow the
+            # effective density (default); no arg = query.
+            arg = sys.argv[3].lower() if len(sys.argv) > 3 else None
+            val = {None: 3, "auto": 2, "0": 0, "1": 1}.get(arg)
+            if val is None:
+                raise SystemExit("densel takes 0, 1 or auto")
+            s.write(bytes([MZP_CMD_DENSEL, 3, val]))
+            s.flush()
+            r = read_exact(s, 4)
+            if len(r) == 4 and r[1] == 0:
+                ov = "follows density" if r[2] == 0xFF else f"FORCED {r[2]}"
+                lvl = "never driven" if r[3] == 0xFF else str(r[3])
+                print(f"DENSEL override: {ov}   pin now: {lvl}  "
+                      f"(1 = the level we call HD)")
         elif cmd == "idxbit":
             # Type I STATUS Index bit: 0 = never, 1 = only while the host has
             # declared HD on 0xDE (default), 2 = always; no arg = query.
