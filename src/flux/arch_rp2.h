@@ -63,7 +63,12 @@ void rp2040_flux_capture_stop(void);
 // kHz DD transition rate.
 int rp2040_flux_capture_next(uint32_t timeout_us);
 
-// Drain and sum whatever deltas are already queued in the FIFO, in 24 MHz
+// True if, since the capture started, the consumer fell more than 3/4 of the
+// DMA ring behind the disk -- i.e. flux was lost. With the 16 KB ring that is
+// tens of milliseconds of neglect, not the FIFO's 12-24 us.
+bool rp2040_flux_capture_overrun(void);
+
+// Drain and sum whatever deltas are already queued in the ring, in 24 MHz
 // ticks. That backlog is disk time that has ALREADY passed under the head, so
 // a splice that measures its gap with a wall clock has to subtract it.
 uint32_t rp2040_flux_capture_backlog(void);

@@ -13,6 +13,7 @@
 
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
+#include "hardware/dma.h"
 #include "hardware/pio.h"
 #include "hardware/sync.h"
 #include "pico/time.h"
@@ -123,8 +124,69 @@ static void start_common() {
   pio_sm_restart(g_reader.pio, g_reader.sm);
 }
 
+// ---- DMA-fed capture ring ------------------------------------------------
+//
+// The PIO reader pushes one 16-bit counter sample per flux transition, two
+// per 32-bit word. Before this, the CPU drained the RX FIFO itself -- 8 words
+// deep, ~24 us of flux at DD and ~12 us at HD -- and every consumer that
+// decoded between drains lived on that cushion. The read path learned early
+// to capture-then-decode for exactly that reason; the WRITE SECTOR splice
+// cannot (it has to decode the ID as it passes to hit Gap 2), and at
+// 500 kbit/s its live decoder fell behind the FIFO on ~8% of hunts and,
+// once behind, never saw an intact ID again: zero IDs for 2.3 revolutions
+// on flux that a capture-then-decode of the same track read perfectly
+// (measured with the failed-write post-mortem).
+//
+// A DMA channel now drains the FIFO into this ring with hardware address
+// wrap, paced by the PIO's RX DREQ, so the cushion is the ring (16 KB =
+// 8192 samples, ~16-25 ms at HD) instead of the FIFO. Consumers keep their
+// unpack logic; only the source of words changed. Overrun is now only
+// possible after tens of milliseconds of not consuming, and is flagged.
+#define FLUX_RING_BYTES_LOG2 14 // 16 KB, the alignment the DMA ring mode needs
+#define FLUX_RING_WORDS (1u << (FLUX_RING_BYTES_LOG2 - 2))
+static uint32_t g_ring[FLUX_RING_WORDS]
+    __attribute__((aligned(1u << FLUX_RING_BYTES_LOG2)));
+static int g_ring_dma = -1;     // claimed channel, -1 = none
+static uint32_t g_ring_rd = 0;  // next word index to consume
+static bool g_ring_overrun = false;
+
+static inline uint32_t ring_wr_index(void) {
+  // The channel's write address is where the NEXT word will land.
+  uint32_t addr = dma_hw->ch[g_ring_dma].write_addr;
+  return ((addr - (uint32_t)(uintptr_t)g_ring) >> 2) & (FLUX_RING_WORDS - 1);
+}
+
+static inline uint32_t ring_unread(void) {
+  return (ring_wr_index() - g_ring_rd) & (FLUX_RING_WORDS - 1);
+}
+
+static void ring_start(void) {
+  if (g_ring_dma < 0)
+    g_ring_dma = dma_claim_unused_channel(true);
+  dma_channel_config c = dma_channel_get_default_config(g_ring_dma);
+  channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+  channel_config_set_read_increment(&c, false);
+  channel_config_set_write_increment(&c, true);
+  channel_config_set_ring(&c, true, FLUX_RING_BYTES_LOG2); // wrap the WRITE side
+  channel_config_set_dreq(&c, pio_get_dreq(g_reader.pio, g_reader.sm, false));
+  g_ring_rd = 0;
+  g_ring_overrun = false;
+  // 2^32-1 transfers is ~8 hours at HD rates: effectively endless for any
+  // capture this firmware runs. Stopped explicitly by ring_stop().
+  dma_channel_configure(g_ring_dma, &c, g_ring, &g_reader.pio->rxf[g_reader.sm],
+                        0xFFFFFFFFu, true);
+}
+
+static void ring_stop(void) {
+  if (g_ring_dma >= 0) {
+    dma_channel_abort(g_ring_dma);
+    dma_channel_unclaim(g_ring_dma);
+    g_ring_dma = -1;
+  }
+}
+
 static bool data_available() {
-  return g_reader.half || !pio_sm_is_rx_fifo_empty(g_reader.pio, g_reader.sm);
+  return g_reader.half || (g_ring_dma >= 0 && ring_unread() != 0);
 }
 
 static uint16_t read_fifo() {
@@ -133,13 +195,21 @@ static uint16_t read_fifo() {
     g_reader.half = 0;
     return result;
   }
-  uint32_t value = pio_sm_get_blocking(g_reader.pio, g_reader.sm);
+  // Callers only get here after data_available(); spin for the word anyway so
+  // the contract ("blocking read") holds if one ever does not.
+  while (g_ring_dma >= 0 && ring_unread() == 0) {
+  }
+  if (ring_unread() > (FLUX_RING_WORDS * 3) / 4)
+    g_ring_overrun = true; // consumer is > 3/4 of a ring behind: data lost
+  uint32_t value = g_ring[g_ring_rd];
+  g_ring_rd = (g_ring_rd + 1) & (FLUX_RING_WORDS - 1);
   g_reader.half = value >> 16;
   return value & 0xffff;
 }
 
 static void disable_capture(void) {
   pio_sm_set_enabled(g_reader.pio, g_reader.sm, false);
+  ring_stop();
 }
 
 static void free_capture(void) {
@@ -191,6 +261,8 @@ static uint8_t *capture_foreground(int index_pin, uint8_t *start, uint8_t *end,
 
   uint32_t irq = save_and_disable_interrupts();
   pio_sm_clear_fifos(g_reader.pio, g_reader.sm);
+  g_reader.half = 0;
+  ring_start();
   pio_sm_set_enabled(g_reader.pio, g_reader.sm, true);
   // Bounded prime -- same reasoning as in rp2040_flux_capture_start(): the
   // fluxread program only pushes on transitions, so an unconditional blocking
@@ -259,6 +331,7 @@ bool rp2040_flux_capture_start(int index_pin, int rdpin) {
   uint32_t irq = save_and_disable_interrupts();
   pio_sm_clear_fifos(g_reader.pio, g_reader.sm);
   g_reader.half = 0;
+  ring_start();
   pio_sm_set_enabled(g_reader.pio, g_reader.sm, true);
   restore_interrupts(irq);
   // Prime g_stream_last with the first sample -- BOUNDED. read_fifo() blocks
@@ -328,6 +401,8 @@ int rp2040_flux_capture_next(uint32_t timeout_us) {
   g_stream_last = data;
   return delta;
 }
+
+bool rp2040_flux_capture_overrun(void) { return g_ring_overrun; }
 
 uint32_t rp2040_flux_capture_backlog(void) {
   uint32_t sum = 0;

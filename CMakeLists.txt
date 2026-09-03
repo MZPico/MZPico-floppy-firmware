@@ -59,6 +59,7 @@ target_link_libraries(mzpico_floppy
     pico_stdlib
     pico_multicore
     hardware_pio
+    hardware_dma
     hardware_clocks
     hardware_vreg
     tinyusb_device
