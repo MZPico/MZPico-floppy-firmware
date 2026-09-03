@@ -490,6 +490,14 @@ struct FdcState {
   volatile uint8_t bt_rd_last_got = 0;
   volatile uint32_t bt_rd_bit_high[8] = {0};
 
+  // Every distinct RAW command byte seen since power-up, as a 256-bit map.
+  // The bus-health screen needs a line's activity across the whole session's
+  // command vocabulary: 16 recent commands from a copy loop share bits by
+  // coincidence and cried 'stuck line' at a bus that had just passed 365k
+  // loopback cycles clean. Dozens of distinct raw command bytes accumulate
+  // over a boot + CP/M session; a bit that is constant across ALL of them is
+  // the genuine D7-class signature.
+  volatile uint32_t cmd_seen[8] = {0};
   // Ring log of recent command opcodes (true values), for debugging.
   volatile uint8_t cmd_hist[16] = {0};
   volatile uint8_t cmd_raw_hist[16] = {0};
@@ -1587,6 +1595,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     S.command = cmd;
     S.cmd_hist[S.cmd_pos & 15] = cmd;
     S.cmd_raw_hist[S.cmd_pos & 15] = raw;
+    S.cmd_seen[raw >> 5] |= (1u << (raw & 31));
     S.cmd_pos++;
     S.cmd_count++;
     S.cmd_gap_us = time_us_32() - S.last_ready_us; // diagnostic: see last_ready_us
@@ -2113,6 +2122,11 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
   default:
     return 0xFF; // control ports are write-only
   }
+}
+
+void fdc_cmd_seen(uint32_t out[8]) {
+  for (int k = 0; k < 8; ++k)
+    out[k] = S.cmd_seen[k];
 }
 
 uint8_t fdc_debug_cmdlog(uint8_t *out_decoded, uint8_t *out_raw,

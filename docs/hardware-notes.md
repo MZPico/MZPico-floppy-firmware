@@ -52,6 +52,15 @@ abs-max, and it back-feeds a rail that cannot sink — the 3V3 rail rises and
 takes the whole board with it. Multiply by the four or five input lines. The
 same path bites whenever the drive is powered and the board is not.
 
+**Confirmed in the field (2026-08):** with the drives on their own PSU, powering
+the MZ-800 off leaves the drives powered while the Pico is not. The Pico then
+sits at a parasitic ~2–3 V from the drive's pull-ups via the GPIO diodes, its
+power-on reset never sees a clean rise when the MZ comes back, and it wakes up
+hung — no boot, **no USB enumeration**. Unplugging the floppy data cable and
+powering up again clears it. Until the buffers exist: **switch the floppy PSU
+on with or after the MZ-800 and off with or before it — never leave the drives
+powered while the MZ is off.**
+
 **Fix — one buffer in each direction:**
 
 - **Drive → Pico:** a `74LVC244A`/`74LVC541A` at 3V3 for `~RDATA`, `~INDEX`,

@@ -728,6 +728,7 @@ def do_fdclog(s):
         return
     ops = payload[:n]
     raws = payload[n:n*2]
+    read_exact(s, 32)  # the seen-bitmap; consumed here, analysed by `health`
     print(f"total commands: {count}; last {n} (oldest->newest):")
     for k, c in enumerate(ops):
         raw = raws[k]
@@ -1029,32 +1030,44 @@ def do_health(s):
                         warns.append(f"DATA bit C{k} never written high "
                                      f"({sum(wr)} writes)")
 
-    # 3. Command-byte corruption: across the last 16 command writes the RAW
-    # (CPL'd) bytes are varied, so a bit that is CONSTANT across all of them
-    # is suspicious -- a stuck line turns Type II/III commands into aliased
-    # Type I ones (0x94 arrived as 0x14 in the documented D7 incident).
+    # 3. Command-byte corruption, judged over EVERY distinct raw command byte
+    # seen since power-up (a 256-bit map), not the last 16: a copy loop's
+    # last 16 commands are two or three opcodes that share bits by
+    # coincidence, and that version of this check cried 'stuck line' at a bus
+    # that had just passed 365k loopback cycles clean. A stuck line turns
+    # Type II/III commands into aliased Type I ones (0x94 arrived as 0x14 in
+    # the documented D7 incident), so across a session's whole vocabulary --
+    # boot ROM + CP/M issue dozens of distinct raw bytes -- a bit that NEVER
+    # takes one of its values is the signature.
     s.write(bytes([MZP_CMD_FDCLOG, 2]))
     s.flush()
     hdr = read_exact(s, 5)
     if len(hdr) == 5 and hdr[1] == 0:
         count = hdr[2] | (hdr[3] << 8)
         n = hdr[4]
-        payload = read_exact(s, n * 2)
-        raws = payload[n:n * 2]
-        print(f"commands : {count} total; analysing last {n}")
-        if n >= 8:
+        read_exact(s, n * 2)
+        bm = read_exact(s, 32)
+        seen = [v for v in range(256)
+                if len(bm) == 32 and (bm[v >> 3] >> (v & 7)) & 1]
+        print(f"commands : {count} total; {len(seen)} distinct raw bytes seen")
+        if len(seen) >= 8:
             u_and, u_or = 0xFF, 0x00
-            for b in raws:
+            for b in seen:
                 u_and &= b
                 u_or |= b
             for k in range(8):
                 m = 1 << k
                 if u_and & m:
-                    warns.append(f"command-byte bit C{k} was 1 in ALL of the "
-                                 f"last {n} commands -- stuck-high suspect")
+                    warns.append(f"command-byte bit C{k} was 1 in ALL "
+                                 f"{len(seen)} distinct commands -- "
+                                 f"stuck-high suspect")
                 if not (u_or & m):
-                    warns.append(f"command-byte bit C{k} was 0 in ALL of the "
-                                 f"last {n} commands -- stuck-low suspect")
+                    warns.append(f"command-byte bit C{k} was 0 in ALL "
+                                 f"{len(seen)} distinct commands -- "
+                                 f"stuck-low suspect")
+        else:
+            print("           (fewer than 8 distinct commands so far -- "
+                  "command-line check skipped)")
 
     # 4. Verdict.
     print()
@@ -1533,6 +1546,8 @@ def main():
                 unit, ds0, ds1 = r[2], r[3], r[4]
                 where = "~DS0" if unit == 0 else ("~DS1" if unit == 1 else "no select line on this board")
                 print("selected unit: %d (%s)" % (unit, where))
+                print("  (the lines below show the LAST APPLIED select -- the "
+                      "new unit is selected by the next actuating command)")
                 # ~DSn is active low: 0 = asserted.
                 print("  ~DS0 (GPIO24) = %d  %s" % (ds0, "ASSERTED" if ds0 == 0 else "released"))
                 print("  ~DS1 (GPIO25) = %d  %s" % (ds1, "ASSERTED" if ds1 == 0 else "released"))

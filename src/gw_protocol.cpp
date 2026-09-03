@@ -1500,8 +1500,9 @@ void gw_task() {
   }
 
   else if (cmd == MZP_CMD_FDCLOG) {
-    // [cmd, ACK, count_lo, count_hi, n, decoded[n], raw[n]]
-    // both oldest->newest, same slot order.
+    // [cmd, ACK, count_lo, count_hi, n, decoded[n], raw[n], seen[32]]
+    // both rings oldest->newest, same slot order; seen = 256-bit map of every
+    // distinct raw command byte since power-up (bit `raw` set).
     uint8_t dec[16];
     uint8_t raw[16];
     uint16_t count = 0;
@@ -1514,6 +1515,11 @@ void gw_task() {
       reply_buffer[i++] = dec[k];
     for (uint8_t k = 0; k < n; k++)
       reply_buffer[i++] = raw[k];
+    uint32_t seen[8];
+    fdc_cmd_seen(seen);
+    for (int w = 0; w < 8; w++)
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (seen[w] >> (8 * k)) & 0xFF;
     cdc_write_all(reply_buffer, i);
   }
 

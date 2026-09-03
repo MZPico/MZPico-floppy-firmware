@@ -458,3 +458,6 @@ bool fdc_get_write_enable(void);
 // the data bus at D8. Returns count written; *count = total commands seen.
 uint8_t fdc_debug_cmdlog(uint8_t *out_decoded, uint8_t *out_raw,
                          uint16_t *count);
+// 256-bit map of every distinct RAW command byte seen since power-up (bit
+// raw = 1). The bus-health screen's evidence base for stuck-line detection.
+void fdc_cmd_seen(uint32_t out[8]);
