@@ -853,8 +853,8 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 236)
-    if len(r) < 236 or r[1] != 0:
+    r = read_exact(s, 252)
+    if len(r) < 252 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
@@ -917,33 +917,45 @@ def do_wrdiag(s):
         print(f"failed writes: {wrf_n} total; last {shown} "
               f"(oldest -> newest):")
         for e in range(shown):  # snapshot emits oldest -> newest in slots 0..n-1
-            off = 80 + e * 8
+            off = 80 + e * 10
             trk, sec, side, ids = r[off], r[off + 1], r[off + 2], r[off + 3]
-            fl, mot = r[off + 4], r[off + 5]
-            ms = r[off + 6] | (r[off + 7] << 8)
+            fl, ctx, t10 = r[off + 4], r[off + 5], r[off + 6]
+            phys, pm_cyl, pm_info = r[off + 7], r[off + 8], r[off + 9]
             decl = ("decl=" + ("HD" if fl & 0x80 else "DD")) if fl & 0x40 \
                 else "decl=none"
+            core0 = (ctx >> 4) & 3
             print(f"    trk={trk:3d} side={side} sec={sec:2d}  "
-                  f"ids_seen={ids:2d}  hunted {ms} ms  "
+                  f"ids_seen={ids:2d}  hunted {t10 * 10} ms  "
                   f"clk={'HD' if fl & 0x20 else 'DD'} {decl}  "
-                  f"motor={'on' if mot & 2 else 'OFF!'}"
+                  f"motor={'on' if ctx & 2 else 'OFF!'}"
                   f"{'  NO FLUX' if fl & 0x10 else ''}"
                   f"{'  late' if fl & 8 else ''}")
-        blind = all((r[80 + e * 8 + 3] == 0) and not (r[80 + e * 8 + 4] & 0x10)
+            print(f"        host drv={(ctx >> 2) & 3}  core0 drv="
+                  f"{'none' if core0 == 3 else core0}  "
+                  f"~DS0={'asserted' if not (ctx & 0x40) else 'released'} "
+                  f"~DS1={'asserted' if not (ctx & 0x80) else 'released'}  "
+                  f"belief={'?' if phys == 0xFE else phys}")
+            if pm_info & 0x80:
+                print(f"        under the head: cyl {pm_cyl} head "
+                      f"{pm_info & 1}, decoded at "
+                      f"{'HD' if pm_info & 2 else 'DD'} clock")
+            elif ids == 0 and not (fl & 0x10):
+                print("        under the head: NOTHING decodable at either "
+                      "clock (flux present)")
+        blind = all((r[80 + e * 10 + 3] == 0) and not (r[80 + e * 10 + 4] & 0x10)
                     for e in range(shown))
         if blind and shown:
-            print("    ^ flux flowed but NOTHING decoded at that clock for the "
-                  "whole hunt -- wrong bit clock, dying spindle, or the live "
-                  "decoder losing the stream (the no-DMA FIFO)")
+            print("    ^ every hunt was blind -- read the 'under the head' "
+                  "lines: that is what the splice was actually looking at")
     # Track-write ring: every host WRITE TRACK, with the position belief and
     # the density decision it was made under. A format writes BLIND at the
     # believed position, so 'phys=?' here is a mislabeled track on the media.
-    twr_n = int.from_bytes(r[144:148], "little")
+    twr_n = int.from_bytes(r[160:164], "little")
     if twr_n:
         shown = min(twr_n, 8)
         print(f"track writes: {twr_n} total; last {shown} (oldest -> newest):")
         for e in range(shown):
-            off = 148 + e * 11
+            off = 164 + e * 11
             ds = r[off] | (r[off + 1] << 8)
             trk, side, phys, nsec, fl = (r[off + 2], r[off + 3], r[off + 4],
                                          r[off + 5], r[off + 6])

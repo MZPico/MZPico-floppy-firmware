@@ -272,8 +272,17 @@ struct FdcState {
   // b4 NO_FLUX (capture produced nothing), b5 hunted at HD clock,
   // b6 0xDE declaration valid, b7 declaration said HD.
   volatile uint8_t wrf_flags[8] = {0};
-  // b0 host motor bit, b1 spindle actually applied at the hunt.
-  volatile uint8_t wrf_motor[8] = {0};
+  // Context at the hunt: b0 host motor bit, b1 spindle applied, b2-3 the
+  // host's 0xDC drive field, b4-5 the drive core0 actually had selected
+  // (3 = none), b6/b7 the LIVE levels of ~DS0/~DS1 (0 = asserted).
+  volatile uint8_t wrf_ctx[8] = {0};
+  volatile uint8_t wrf_phys[8] = {0};  // drive position belief (0xFE unknown)
+  // Post-mortem of a BLIND hunt (flux flowed, nothing decoded): the flux that
+  // was under the head, recaptured and decoded at both clocks. Whatever it
+  // turns out to be -- the DD boot track, the other drive's disk, the wrong
+  // side -- is the answer to 'what was the splice actually looking at'.
+  volatile uint8_t wrf_pm_cyl[8] = {0};  // first ID's cylinder; 0xFF = nothing
+  volatile uint8_t wrf_pm_info[8] = {0}; // b0 head, b1 decoded at HD, b7 valid
   volatile uint8_t wrf_pos = 0;
   volatile uint32_t wrf_n = 0; // total failed host writes (ring wraps)
   // Ring of the last 8 host WRITE TRACKs. A format is positionally BLIND --
@@ -2278,7 +2287,10 @@ void fdc_debug_snapshot(FdcDebug *o) {
       o->wrf_ids[k] = S.wrf_ids[idx];
       o->wrf_us[k] = S.wrf_us[idx];
       o->wrf_flags[k] = S.wrf_flags[idx];
-      o->wrf_motor[k] = S.wrf_motor[idx];
+      o->wrf_ctx[k] = S.wrf_ctx[idx];
+      o->wrf_phys[k] = S.wrf_phys[idx];
+      o->wrf_pm_cyl[k] = S.wrf_pm_cyl[idx];
+      o->wrf_pm_info[k] = S.wrf_pm_info[idx];
     }
   }
   // Track-write ring, same ordering.
@@ -3366,8 +3378,36 @@ void fdc_disk_task(void) {
             (sr.no_flux ? 0x10 : 0) | (fdc_is_hd() ? 0x20 : 0) |
             (S.density_host_valid ? 0x40 : 0) |
             (S.density_host_hd ? 0x80 : 0));
-        S.wrf_motor[p] = (uint8_t)((S.motor_on ? 1 : 0) |
-                                   (g_applied_motor ? 2 : 0));
+        S.wrf_ctx[p] = (uint8_t)(
+            (S.motor_on ? 0x01 : 0) | (g_applied_motor ? 0x02 : 0) |
+            ((S.drive_sel & 3) << 2) |
+            (((g_cur_drive < 0) ? 3 : (g_cur_drive & 3)) << 4) |
+            (gpio_get(PIN_DS0) ? 0x40 : 0) | (gpio_get(PIN_DS1) ? 0x80 : 0));
+        {
+          int pt = DRV ? DRV->track() : -1;
+          S.wrf_phys[p] = (pt < 0) ? 0xFE : (uint8_t)pt;
+        }
+        // Post-mortem for a blind hunt: what WAS under the head? One capture,
+        // decoded at both clocks, first ID wins. ~240 ms on a command that
+        // has already failed and that the host is still waiting on.
+        S.wrf_pm_cyl[p] = 0xFF;
+        S.wrf_pm_info[p] = 0;
+        if (sr.ids_seen == 0 && !sr.no_flux) {
+          size_t cap = 0;
+          uint8_t *flux = mzp_flux_buffer(&cap);
+          fdc_capture_window(fdc_read_capture_bytes());
+          uint8_t id[6];
+          if (g_flux_n > 0) {
+            if (mfm_read_address(flux, g_flux_n, FDC_HD_BIT_US, id)) {
+              S.wrf_pm_cyl[p] = id[0];
+              S.wrf_pm_info[p] = (uint8_t)(0x80 | 0x02 | (id[1] & 1));
+            } else if (mfm_read_address(flux, g_flux_n, FDC_DD_BIT_US, id)) {
+              S.wrf_pm_cyl[p] = id[0];
+              S.wrf_pm_info[p] = (uint8_t)(0x80 | (id[1] & 1));
+            }
+          }
+          g_flux_n = 0;
+        }
         S.wrf_pos = (uint8_t)((p + 1) & 7);
         S.wrf_n++;
       }
