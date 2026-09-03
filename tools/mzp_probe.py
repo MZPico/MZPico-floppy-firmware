@@ -1239,6 +1239,11 @@ def scan_geometry(s, track, side, dens=0):
 
 
 def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
+    # Read back at the density the writes go down at. This was a hard-coded 0
+    # (DD): an HD soak on a perfectly written disk reported 160/160 'bad CRC on
+    # read-back' -- every sector decoded at the wrong clock -- and cost a
+    # false alarm against the DMA capture rework.
+    dens = effective_density(s)
     """Write/verify soak across many tracks and sides.
 
     16 writes on one outer track is a demo. This is the test that answers the
@@ -1289,7 +1294,7 @@ def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
                 got = b""
                 crc_ok = False
                 if wrote:
-                    s.write(bytes([MZP_CMD_FDCREAD, 6, t, sector, sd, 0]))
+                    s.write(bytes([MZP_CMD_FDCREAD, 6, t, sector, sd, dens]))
                     s.flush()
                     h = read_exact(s, 5)
                     if len(h) == 5 and h[1] == 0:
