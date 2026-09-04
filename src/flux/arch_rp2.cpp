@@ -146,18 +146,24 @@ static void start_common() {
 #define FLUX_RING_WORDS (1u << (FLUX_RING_BYTES_LOG2 - 2))
 static uint32_t g_ring[FLUX_RING_WORDS]
     __attribute__((aligned(1u << FLUX_RING_BYTES_LOG2)));
-static int g_ring_dma = -1;     // claimed channel, -1 = none
-static uint32_t g_ring_rd = 0;  // next word index to consume
+static int g_ring_dma = -1;       // claimed channel, -1 = none
+static uint32_t g_ring_consumed = 0; // ABSOLUTE words consumed (monotonic)
 static bool g_ring_overrun = false;
 
-static inline uint32_t ring_wr_index(void) {
-  // The channel's write address is where the NEXT word will land.
-  uint32_t addr = dma_hw->ch[g_ring_dma].write_addr;
-  return ((addr - (uint32_t)(uintptr_t)g_ring) >> 2) & (FLUX_RING_WORDS - 1);
+// Words the DMA has written since the capture started, as an absolute count.
+// Configured with 0xFFFFFFFF transfers, so remaining counts down from there.
+static inline uint32_t ring_written(void) {
+  return 0xFFFFFFFFu - dma_hw->ch[g_ring_dma].transfer_count;
 }
 
+// Words available to the reader, absolute-difference so it CANNOT alias: if
+// this reaches FLUX_RING_WORDS the DMA has lapped us and the oldest unread
+// words have been overwritten. The old index-masked version wrapped a full
+// lap back to a small number and reported "caught up" while handing out
+// overwritten, out-of-sequence samples -- garbage deltas with no flag, which
+// is exactly the HD write-splice signature (RXSTALL clear, ring flag clear).
 static inline uint32_t ring_unread(void) {
-  return (ring_wr_index() - g_ring_rd) & (FLUX_RING_WORDS - 1);
+  return ring_written() - g_ring_consumed;
 }
 
 static void ring_start(void) {
@@ -169,7 +175,7 @@ static void ring_start(void) {
   channel_config_set_write_increment(&c, true);
   channel_config_set_ring(&c, true, FLUX_RING_BYTES_LOG2); // wrap the WRITE side
   channel_config_set_dreq(&c, pio_get_dreq(g_reader.pio, g_reader.sm, false));
-  g_ring_rd = 0;
+  g_ring_consumed = 0;
   g_ring_overrun = false;
   // Clear the PIO's sticky RX-FIFO-overflow flag so it reflects only THIS
   // capture. If it is set at the end, the DMA (or, before it, the CPU) could
@@ -209,10 +215,16 @@ static uint16_t read_fifo() {
   // the contract ("blocking read") holds if one ever does not.
   while (g_ring_dma >= 0 && ring_unread() == 0) {
   }
-  if (ring_unread() > (FLUX_RING_WORDS * 3) / 4)
-    g_ring_overrun = true; // consumer is > 3/4 of a ring behind: data lost
-  uint32_t value = g_ring[g_ring_rd];
-  g_ring_rd = (g_ring_rd + 1) & (FLUX_RING_WORDS - 1);
+  // A lap: the DMA has written a whole ring past us, so the word we are about
+  // to read has been overwritten with much newer flux and every delta from
+  // here is out of sequence. Flag it, and resync to just behind the DMA so the
+  // stream at least becomes coherent again rather than staying scrambled.
+  if (ring_unread() >= FLUX_RING_WORDS) {
+    g_ring_overrun = true;
+    g_ring_consumed = ring_written() - (FLUX_RING_WORDS / 2);
+  }
+  uint32_t value = g_ring[g_ring_consumed & (FLUX_RING_WORDS - 1)];
+  g_ring_consumed++;
   g_reader.half = value >> 16;
   return value & 0xffff;
 }
