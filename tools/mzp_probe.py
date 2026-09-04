@@ -26,7 +26,7 @@ Usage:
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
     python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive] [aggr]  # !! splices; aggr=1 runs the bench bus aggressor (BENCH ONLY)
     python mzp_probe.py PORT busagg [0|1]                 # bench bus aggressor: core1 bursts C0..C7 (BENCH ONLY, cartridge out)
-    python mzp_probe.py PORT huntflux                     # raw deltas the last BLIND write hunt saw (see the garbage)
+    python mzp_probe.py PORT huntflux [ok]                # raw deltas of the last blind hunt (or `ok` = first good hunt, for A/B)
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -1721,7 +1721,8 @@ def main():
         elif cmd == "huntflux":
             # Dump the raw deltas (24 MHz ticks, /2, byte-clamped) the last
             # BLIND write hunt saw -- the actual garbage stream, to look at.
-            s.write(bytes([MZP_CMD_HUNTFLUX, 2]))
+            which = 1 if (len(sys.argv) > 3 and sys.argv[3] == "ok") else 0
+            s.write(bytes([MZP_CMD_HUNTFLUX, 3, which]))
             s.flush()
             hdr = read_exact(s, 5)  # cmd, ack, valid, n_lo, n_hi
             if len(hdr) < 5 or hdr[1] != 0:
@@ -1730,12 +1731,14 @@ def main():
             valid = hdr[2]
             n = hdr[3] | (hdr[4] << 8)
             data = read_exact(s, n) if n else b""
+            label = "successful" if which else "blind"
             if not valid:
-                print("no blind hunt recorded since power-up (nothing to show)")
+                print(f"no {label} hunt recorded since power-up "
+                      f"(nothing to show)")
             else:
                 import statistics
                 d = list(data)
-                print(f"last blind hunt: {n} raw deltas (24MHz ticks, /2, "
+                print(f"last {label} hunt: {n} raw deltas (24MHz ticks, /2, "
                       f"clamped 255). HD 1T~=12, 2T~=24, 3T~=36 ticks.")
                 # histogram summary
                 zeros = d.count(0)

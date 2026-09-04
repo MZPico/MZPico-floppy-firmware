@@ -79,4 +79,7 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
 // Raw deltas (24 MHz ticks, byte-clamped) of the last BLIND write hunt -- the
 // stream the live decoder saw when it found zero sync marks. `out` must hold
 // 512 bytes; *n is how many, *valid is 0 until a blind hunt has occurred.
-void mfm_splice_debug_flux(uint8_t *out, uint16_t *n, uint8_t *valid);
+// which: 0 = last BLIND hunt, 1 = first SUCCESSFUL hunt (kept for an A/B of the
+// same code path on the same machine). `out` holds 512 bytes.
+void mfm_splice_debug_flux(uint8_t which, uint8_t *out, uint16_t *n,
+                           uint8_t *valid);

@@ -1345,7 +1345,8 @@ void gw_task() {
     static uint8_t fx[512];
     uint16_t n = 0;
     uint8_t valid = 0;
-    mfm_splice_debug_flux(fx, &n, &valid);
+    uint8_t which = cmd_buffer[2]; // 0 = blind hunt, 1 = successful hunt
+    mfm_splice_debug_flux(which, fx, &n, &valid);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = valid;
     reply_buffer[i++] = (uint8_t)(n & 0xFF);

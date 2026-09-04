@@ -43,6 +43,9 @@ static uint16_t g_hunt_dbg_n = 0;
 static uint8_t g_hunt_fail[HUNT_DBG_N];
 static uint16_t g_hunt_fail_n = 0;
 static bool g_hunt_fail_valid = false;
+static uint8_t g_hunt_ok[HUNT_DBG_N];
+static uint16_t g_hunt_ok_n = 0;
+static bool g_hunt_ok_valid = false;
 
 // Live MFM symbol source: the buffered decoder's mfm_io_read_symbol() reads
 // pulses[pos++] out of an array, this one takes the next transition off the
@@ -134,12 +137,14 @@ uint16_t live_receive(LiveIo *l, uint8_t *buf, size_t n) {
 
 } // namespace
 
-void mfm_splice_debug_flux(uint8_t *out, uint16_t *n, uint8_t *valid) {
-  uint16_t cnt = g_hunt_fail_n;
+void mfm_splice_debug_flux(uint8_t which, uint8_t *out, uint16_t *n,
+                           uint8_t *valid) {
+  const uint8_t *src = which ? g_hunt_ok : g_hunt_fail;
+  uint16_t cnt = which ? g_hunt_ok_n : g_hunt_fail_n;
   for (uint16_t k = 0; k < cnt; ++k)
-    out[k] = g_hunt_fail[k];
+    out[k] = src[k];
   *n = cnt;
-  *valid = g_hunt_fail_valid ? 1 : 0;
+  *valid = (which ? g_hunt_ok_valid : g_hunt_fail_valid) ? 1 : 0;
 }
 
 SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
@@ -272,6 +277,11 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
     for (uint16_t k = 0; k < g_hunt_dbg_n; ++k)
       g_hunt_fail[k] = g_hunt_dbg[k];
     g_hunt_fail_valid = true;
+  } else if (r.id_found && !g_hunt_ok_valid) { // first good hunt: keep for A/B
+    g_hunt_ok_n = g_hunt_dbg_n;
+    for (uint16_t k = 0; k < g_hunt_dbg_n; ++k)
+      g_hunt_ok[k] = g_hunt_dbg[k];
+    g_hunt_ok_valid = true;
   }
   restore_interrupts(irq);
   rp2040_flux_write_release();
