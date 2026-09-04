@@ -87,44 +87,8 @@ static inline bool port_is_ours(uint8_t addr) {
 // (~560 ns @3.55 MHz) to switch buffers and sample/drive. Everything that is not
 // strictly needed to hit that window -- bit-activity accumulators, per-port
 // counters -- runs AFTER the bus access, never before it.
-// ---- Bench bus aggressor (diagnostic) ------------------------------------
-//
-// The HD write-splice corruption only appears while core1 switches C0..C7 to
-// answer the host's STATUS-poll storm during a splice hunt. On the bench there
-// is no MZ-800, so core1 is idle and the fault cannot be reproduced. This
-// recreates the electrical aggressor: bursts of fake data-bus cycles -- drive
-// C0..C7, enable the '245 onto the connector side, disable -- at the rate and
-// on the exact pins a real STATUS read uses. Run it concurrently with bench
-// splices (mzp_probe.py wrburst ... with the aggressor on) and watch wrdiag.
-//
-// SAFETY: it drives C0..C7 as outputs, so it must NEVER run with the cartridge
-// in a powered MZ-800 (it would fight the machine's data bus). It refuses once
-// the FDC has been activated by a real host (fdc_is_active()), which only
-// happens when an MZ has talked to us -- so it is bench/USB-only by
-// construction. Cartridge OUT of the machine.
-volatile bool g_bus_aggressor = false;
-
-RAM_FUNC static void bus_aggress(void) {
-  if (fdc_is_active())
-    return; // a real MZ is (or was) driving the bus -- refuse, do not fight it
-  sio_hw->gpio_oe_set = DATA_BUS_MASK; // C0..C7 -> outputs
-  data_dir_drive();                    // RD1 = 0 ('245 drives connector side)
-  for (int i = 0; i < 4000; ++i) {
-    sio_hw->gpio_clr = DATA_BUS_MASK;
-    sio_hw->gpio_set = ((uint32_t)(i & 0xFF)) << DATA_BUS_BASE;
-    data_buffer_on();  // EN1 = 0
-    __asm volatile("nop; nop; nop; nop");
-    data_buffer_off(); // EN1 = 1
-  }
-  data_buffer_off();
-  data_dir_read();
-  sio_hw->gpio_oe_clr = DATA_BUS_MASK; // C0..C7 -> inputs again
-}
-
 RAM_FUNC static void listen_loop(void) {
   while (true) {
-    if (g_bus_aggressor) // bench-only diagnostic; false in real operation
-      bus_aggress();
     // Drain BOTH FIFOs each pass. Under a tight OUT/IN loop, handling only one
     // entry per FIFO per iteration can still accumulate backlog and eventually
     // overflow one FIFO.
@@ -244,9 +208,6 @@ static void core1_entry(void) {
   fdc_bus_reset_irq_init();
   listen_loop();
 }
-
-void bus_set_aggressor(bool on) { g_bus_aggressor = on; }
-bool bus_get_aggressor(void) { return g_bus_aggressor; }
 
 // Bench pin-READ test: sample the live C0..C7 inputs (bit0 = GPIO0 = C0).
 uint8_t bus_read_pins(bool isolate) {
