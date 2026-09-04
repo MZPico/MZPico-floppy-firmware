@@ -409,7 +409,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     It is a signal-integrity limit of the bare board -- see the RDATA item in
     [docs/hardware-notes.md](docs/hardware-notes.md) for the fixes (grounding
     first, then a Schmitt `~RDATA` buffer or 33 Ω on the bus) and the
-    index-relative-splice firmware mitigation.
+    index-relative-splice firmware mitigation. `huntflux` later
+    showed the failing hunt reads the real HD signal with DOUBLED transition
+    density (extra edges), i.e. coupled noise or a second drive's flux
+    superimposing on the shared RDATA -- a hardware limit, not firmware.
+    **Do not host-write HD disks you care about until it is fixed** -- a
+    mistimed splice can damage a track (one corrupted a CP/M image during this
+    bring-up; rewriting the image cured a scary but false 'firmware' regression
+    -- media, not code).
 - **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
   testing (the `wrsoak` run so far is minutes, not hours, and has met only one
   spindle), catching the rare boot `FD:Loading error` with `firstfail`.

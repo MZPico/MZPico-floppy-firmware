@@ -178,6 +178,19 @@ cheapest first:
   `~RDATA` — hysteresis is exactly the defence against coupled noise on a slow
   open-collector line, and it settles this for good.
 
+**Raw-flux evidence (2026-08, `huntflux`):** a successful HD hunt reads a clean
+2:3:4 interval distribution (this disk's true 2T/3T/4T); a failed hunt reads the
+SAME signal with roughly DOUBLED transition density -- intervals halved and
+scrambled, so the missing-clock sync never forms (syncs=0). Doubled edges on
+the shared RDATA line come from one of two places, both hardware: coupled noise
+injecting edges, or a SECOND drive's flux superimposing (both drives spin on the
+shared MOTOR line, and RDATA is one wire gated by select -- a source drive that
+does not cleanly release RDATA on deselect overlays its own flux). The clean
+half-cluster favours superposition over random noise. Distinguishing test: a
+single-drive HD write (no other drive on the cable) -- if it is clean, it is
+superposition and the fix is drive/cable/select-side; if it still fails, it is
+coupled noise. Either way the buffered Schmitt `~RDATA` input (item 1) fixes it.
+
 A firmware mitigation exists if the board cannot be changed: capture a full
 revolution first (as a read does, tolerant + retryable), decode it to find the
 target sector's rotational offset from index, then time a blind write into its
