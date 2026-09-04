@@ -26,6 +26,7 @@ Usage:
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
     python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive] [aggr]  # !! splices; aggr=1 runs the bench bus aggressor (BENCH ONLY)
     python mzp_probe.py PORT busagg [0|1]                 # bench bus aggressor: core1 bursts C0..C7 (BENCH ONLY, cartridge out)
+    python mzp_probe.py PORT huntflux                     # raw deltas the last BLIND write hunt saw (see the garbage)
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -94,6 +95,7 @@ MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_FWVER = 0xA0
 MZP_CMD_DENSEL = 0xA1
 MZP_CMD_BUSAGG = 0xA2
+MZP_CMD_HUNTFLUX = 0xA3
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -1716,6 +1718,48 @@ def main():
                 print("firmware build: %s" % v.decode("ascii", "replace"))
             else:
                 print("firmware predates the fwver command (pre-101d57f+)")
+        elif cmd == "huntflux":
+            # Dump the raw deltas (24 MHz ticks, /2, byte-clamped) the last
+            # BLIND write hunt saw -- the actual garbage stream, to look at.
+            s.write(bytes([MZP_CMD_HUNTFLUX, 2]))
+            s.flush()
+            hdr = read_exact(s, 5)  # cmd, ack, valid, n_lo, n_hi
+            if len(hdr) < 5 or hdr[1] != 0:
+                print(f"bad reply: {hdr.hex()}")
+                sys.exit(0)
+            valid = hdr[2]
+            n = hdr[3] | (hdr[4] << 8)
+            data = read_exact(s, n) if n else b""
+            if not valid:
+                print("no blind hunt recorded since power-up (nothing to show)")
+            else:
+                import statistics
+                d = list(data)
+                print(f"last blind hunt: {n} raw deltas (24MHz ticks, /2, "
+                      f"clamped 255). HD 1T~=12, 2T~=24, 3T~=36 ticks.")
+                # histogram summary
+                zeros = d.count(0)
+                sat = d.count(255)
+                nz = [x for x in d if x]
+                if nz:
+                    print(f"  zeros={zeros}  saturated(255)={sat}  "
+                          f"min={min(nz)} max={max(d)} mean={sum(d)/len(d):.1f} "
+                          f"median={statistics.median(d):.0f}")
+                # crude class counts around HD nominals
+                def near(v, c, w=4): return abs(v - c) <= w
+                c1 = sum(1 for x in d if near(x, 12))
+                c2 = sum(1 for x in d if near(x, 24))
+                c3 = sum(1 for x in d if near(x, 36))
+                other = n - c1 - c2 - c3 - zeros - sat
+                print(f"  near-1T(12)={c1} near-2T(24)={c2} near-3T(36)={c3} "
+                      f"other={other}")
+                # also show as DD nominals in case it's the wrong clock
+                d1 = sum(1 for x in d if near(x, 24))
+                d2 = sum(1 for x in d if near(x, 48, 6))
+                print(f"  (if DD-rate: near-1T(24)={d1} near-2T(48)={d2})")
+                print("  first 64 deltas:")
+                for r in range(0, min(n, 64), 16):
+                    print("   " + " ".join(f"{x:3d}" for x in d[r:r+16]))
         elif cmd == "busagg":
             # Bench bus aggressor: 0 off, 1 on, no arg = query. BENCH ONLY --
             # cartridge OUT of the MZ-800 (it drives C0..C7). Run it, then a

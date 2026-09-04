@@ -32,6 +32,18 @@ constexpr int SPLICE_TRAILING_GAP = 3;
 // means no disk, no motor, or the head is off the media.
 constexpr uint32_t SPLICE_SYMBOL_TIMEOUT_US = 10000;
 
+// Debug: raw deltas (24 MHz ticks, clamped to a byte) the live hunt saw. The
+// bench cannot reproduce the HD blind hunts (no MZ bus to switch), so this
+// carries the ACTUAL garbage stream off a failed hunt to be looked at -- good
+// signal, noise, a wrong clock, zeros and a stuck line all look different in
+// the raw deltas. Recorded during every hunt; latched on a blind failure.
+constexpr int HUNT_DBG_N = 512;
+static uint8_t g_hunt_dbg[HUNT_DBG_N];
+static uint16_t g_hunt_dbg_n = 0;
+static uint8_t g_hunt_fail[HUNT_DBG_N];
+static uint16_t g_hunt_fail_n = 0;
+static bool g_hunt_fail_valid = false;
+
 // Live MFM symbol source: the buffered decoder's mfm_io_read_symbol() reads
 // pulses[pos++] out of an array, this one takes the next transition off the
 // capture FIFO as the disk produces it. Everything downstream (the sync-mark
@@ -44,6 +56,8 @@ struct LiveIo {
 
 inline int live_symbol(LiveIo *l) {
   int d = rp2040_flux_capture_next(SPLICE_SYMBOL_TIMEOUT_US);
+  if (g_hunt_dbg_n < HUNT_DBG_N)
+    g_hunt_dbg[g_hunt_dbg_n++] = (d < 0) ? 0 : (d > 255 ? 255 : (uint8_t)d);
   if (d < 0) {
     l->dead = true;
     return mfm_io_pulse_10; // harmless filler; callers check `dead`
@@ -120,6 +134,14 @@ uint16_t live_receive(LiveIo *l, uint8_t *buf, size_t n) {
 
 } // namespace
 
+void mfm_splice_debug_flux(uint8_t *out, uint16_t *n, uint8_t *valid) {
+  uint16_t cnt = g_hunt_fail_n;
+  for (uint16_t k = 0; k < cnt; ++k)
+    out[k] = g_hunt_fail[k];
+  *n = cnt;
+  *valid = g_hunt_fail_valid ? 1 : 0;
+}
+
 SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
                               const uint8_t *data, uint16_t n_data,
                               bool deleted, float nominal_bit_time_us,
@@ -159,6 +181,7 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
     return r;
 
   LiveIo l;
+  g_hunt_dbg_n = 0;
   uint32_t irq = save_and_disable_interrupts();
   uint32_t t_start = time_us_32();
 
@@ -244,6 +267,12 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
   r.overrun = rp2040_flux_capture_overrun();
   r.pio_overflow = rp2040_flux_capture_pio_overflow();
   rp2040_flux_capture_stop();
+  if (r.ids_seen == 0 && !r.no_flux) { // blind: latch the stream we just saw
+    g_hunt_fail_n = g_hunt_dbg_n;
+    for (uint16_t k = 0; k < g_hunt_dbg_n; ++k)
+      g_hunt_fail[k] = g_hunt_dbg[k];
+    g_hunt_fail_valid = true;
+  }
   restore_interrupts(irq);
   rp2040_flux_write_release();
   r.search_us = time_us_32() - t_start;

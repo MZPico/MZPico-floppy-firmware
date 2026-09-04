@@ -10,6 +10,7 @@
 #include "mfm_decode.hpp"
 #include "mfm_encode.hpp"
 #include "bus/mz_bus.hpp"
+#include "mfm_splice.hpp"
 #include "bus/fdc.hpp"
 #include "flux/arch_rp2.h"
 
@@ -83,6 +84,7 @@
 #define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
 #define MZP_CMD_DENSEL 0xA1    // DENSEL pin override: 0/1 force, 2 auto, 3 query
 #define MZP_CMD_BUSAGG 0xA2    // bench bus aggressor on/off (HD-crosstalk repro)
+#define MZP_CMD_HUNTFLUX 0xA3  // raw deltas of the last blind write hunt
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1336,6 +1338,21 @@ void gw_task() {
     for (uint8_t k = 0; k < n; k++)
       reply_buffer[i++] = (uint8_t)ver[k];
     cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_HUNTFLUX) {
+    // [cmd, ACK, valid, n_lo, n_hi, deltas[n]] -- the stream a blind hunt saw.
+    static uint8_t fx[512];
+    uint16_t n = 0;
+    uint8_t valid = 0;
+    mfm_splice_debug_flux(fx, &n, &valid);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = valid;
+    reply_buffer[i++] = (uint8_t)(n & 0xFF);
+    reply_buffer[i++] = (uint8_t)(n >> 8);
+    cdc_write_all(reply_buffer, i);
+    if (n)
+      cdc_write_all(fx, n);
   }
 
   else if (cmd == MZP_CMD_BUSAGG) {
