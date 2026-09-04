@@ -82,6 +82,7 @@
 #define MZP_CMD_IDXBIT 0x9F    // Type I STATUS Index bit on/off (default on)
 #define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
 #define MZP_CMD_DENSEL 0xA1    // DENSEL pin override: 0/1 force, 2 auto, 3 query
+#define MZP_CMD_BUSAGG 0xA2    // bench bus aggressor on/off (HD-crosstalk repro)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1334,6 +1335,16 @@ void gw_task() {
     reply_buffer[i++] = n;
     for (uint8_t k = 0; k < n; k++)
       reply_buffer[i++] = (uint8_t)ver[k];
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_BUSAGG) {
+    // cmd_buffer[2]: 0 off, 1 on, 2 query. BENCH ONLY (drives C0..C7); the
+    // firmware refuses to aggress once a real MZ has activated the FDC.
+    if (cmd_buffer[2] < 2)
+      bus_set_aggressor(cmd_buffer[2] != 0);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = bus_get_aggressor() ? 1 : 0;
     cdc_write_all(reply_buffer, i);
   }
 

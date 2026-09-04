@@ -73,3 +73,11 @@ void bus_pin_selftest(uint8_t *pu, uint8_t *pd);
 //           the MZ-800), measures the connector D-pins
 // NB: only meaningful with the board out of the MZ-800 (no bus cycles firing).
 void bus_drive_test(uint8_t value, uint8_t mode);
+
+// Bench bus aggressor (diagnostic): when on, core1 bursts fake data-bus cycles
+// on C0..C7 to reproduce, on the bench, the electrical switching that corrupts
+// the HD write splice while a real host storm-polls STATUS. BENCH ONLY -- it
+// drives C0..C7 as outputs and refuses once a real MZ has activated the FDC.
+// Run concurrently with `wrburst`; see mzp_probe.py busagg.
+void bus_set_aggressor(bool on);
+bool bus_get_aggressor(void);

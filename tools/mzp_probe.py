@@ -24,7 +24,8 @@ Usage:
     python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
-    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive]  # !! splices; read rdtrack (from rddrive) before each = CP/M A->B
+    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive] [aggr]  # !! splices; aggr=1 runs the bench bus aggressor (BENCH ONLY)
+    python mzp_probe.py PORT busagg [0|1]                 # bench bus aggressor: core1 bursts C0..C7 (BENCH ONLY, cartridge out)
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -92,6 +93,7 @@ MZP_CMD_DENSITY = 0x9E
 MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_FWVER = 0xA0
 MZP_CMD_DENSEL = 0xA1
+MZP_CMD_BUSAGG = 0xA2
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -1555,6 +1557,12 @@ def main():
             # transition -- and any cross-drive RDATA bleed from the spinning
             # source drive -- is finally on the bench.
             rddrive = int(sys.argv[8]) if len(sys.argv) > 8 else -1
+            # 9th arg nonzero = run the bench bus aggressor during the burst,
+            # so core1 electrically mimics the host's STATUS-poll storm. BENCH
+            # ONLY (cartridge out of the MZ-800).
+            aggr = (len(sys.argv) > 9 and sys.argv[9] not in ("0", ""))
+            if aggr:
+                s.write(bytes([MZP_CMD_BUSAGG, 3, 1])); s.flush(); read_exact(s, 3)
             wrdrive = None
             if rddrive >= 0:
                 # remember the write drive so we can flip back to it
@@ -1585,9 +1593,11 @@ def main():
                 note = f" (reading track {rdtrack}" + \
                     (f" from drive {rddrive}" if rddrive >= 0 else "") + \
                     " before each)"
+            if aggr:
+                s.write(bytes([MZP_CMD_BUSAGG, 3, 0])); s.flush(); read_exact(s, 3)
             print(f"burst done: {nsec - fails}/{nsec} spliced on track {track} "
-                  f"side {side}{note}; now `wrdiag` for the ring and "
-                  f"`scan {track} {side}` for the media")
+                  f"side {side}{note}{' +AGGRESSOR' if aggr else ''}; "
+                  f"now `wrdiag` for the ring and `scan {track} {side}`")
         elif cmd in ("fdcwrite", "wrverify"):
             # THESE WRITE TO THE DISK. args: track sector [side] [sizecode]
             #                                [mode] [seed]
@@ -1706,6 +1716,18 @@ def main():
                 print("firmware build: %s" % v.decode("ascii", "replace"))
             else:
                 print("firmware predates the fwver command (pre-101d57f+)")
+        elif cmd == "busagg":
+            # Bench bus aggressor: 0 off, 1 on, no arg = query. BENCH ONLY --
+            # cartridge OUT of the MZ-800 (it drives C0..C7). Run it, then a
+            # wrburst, and watch wrdiag for blind hunts appearing.
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            s.write(bytes([MZP_CMD_BUSAGG, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            print("bench bus aggressor: "
+                  + ("ON -- core1 is bursting C0..C7 (BENCH ONLY)"
+                     if len(r) == 3 and r[2] else "off")
+                  + "  (refused automatically once a real MZ has been seen)")
         elif cmd == "densel":
             # DENSEL pin override: 0/1 = force that level, auto = follow the
             # effective density (default); no arg = query.
