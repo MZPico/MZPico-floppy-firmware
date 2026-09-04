@@ -24,7 +24,7 @@ Usage:
     python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
-    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed]  # !! back-to-back splices, no read-back (CP/M cadence)
+    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack]  # !! back-to-back splices; rdtrack = read that track before each (CP/M read->write)
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -1529,17 +1529,33 @@ def main():
             # read-back between them -- CP/M's cadence (the next WRITE lands
             # milliseconds after the previous WGATE release), which the soak
             # never reproduces because it reads back after every write.
+            # Optional 5th arg = a DIFFERENT track to READ before each
+            # splice. Write-only bursts and the soak both pass; CP/M reads its
+            # source track then seeks to the destination and writes -- so the
+            # read's capture (DMA ring start/stop) runs immediately before the
+            # splice's own capture. This reproduces that read->seek->write
+            # transition on the bench.
             track = int(sys.argv[3])
             side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
             nsec = int(sys.argv[5]) if len(sys.argv) > 5 else 18
             seed = int(sys.argv[6], 0) if len(sys.argv) > 6 else 0x5A
+            rdtrack = int(sys.argv[7]) if len(sys.argv) > 7 else -1
             fails = 0
             for sec in range(1, nsec + 1):
+                if rdtrack >= 0:
+                    dens = effective_density(s)
+                    s.write(bytes([MZP_CMD_FDCREAD, 6, rdtrack, 1, side, dens]))
+                    s.flush()
+                    hdr = read_exact(s, 5)
+                    if len(hdr) == 5 and hdr[3] | (hdr[4] << 8):
+                        read_exact(s, hdr[3] | (hdr[4] << 8))
                 ok = do_fdcwrite(s, track, sec, side, 2, 2, (seed + sec) & 0xFF)
                 if not ok:
                     fails += 1
+            note = f" (reading track {rdtrack} before each)" if rdtrack >= 0 \
+                else ""
             print(f"burst done: {nsec - fails}/{nsec} spliced on track {track} "
-                  f"side {side}; now `wrdiag` for the ring and "
+                  f"side {side}{note}; now `wrdiag` for the ring and "
                   f"`scan {track} {side}` for the media")
         elif cmd in ("fdcwrite", "wrverify"):
             # THESE WRITE TO THE DISK. args: track sector [side] [sizecode]
