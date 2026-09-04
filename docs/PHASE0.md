@@ -81,8 +81,15 @@ gw write --device COM5 game.dsk                    # write an MZ-800 EDSK (.dsk)
 6. **RDATA needs an external pull-up.** The board has **no pull-up** on `~RDATA`
    and the library leaves the read pin as bare `INPUT` (no internal pull-up).
    Result: `gw rpm`/`gw read` hang (flux capture over a floating line) while
-   `seek` works. **Fix that made rpm work: 1 kΩ from GPIO20 (Pico pin 23) to
-   +3.3 V (Pico pin 36 / VCC).** Use 3.3 V, never 5 V (GPIO not 5 V tolerant).
+   `seek` works. **The bodge fitted is 4k7 from GPIO20 (Pico pin 23) to +3.3 V
+   (Pico pin 36 / VCC)** (per the Adafruit suggestion). Use 3.3 V, never 5 V
+   (GPIO not 5 V tolerant).
+   - **4k7 is too weak for HD.** RDATA is open-collector from the drive, so the
+     pull-up alone sets the rise time: 4k7 into ~1.5 m of ribbon (~150 pF) is
+     ~0.7 µs. Fine at DD (2 µs bit cell); at HD (1 µs cell) it eats the timing
+     budget and any coupled noise from the C0..C7 bus shifts the edge — this is
+     the root of the HD write-splice corruption (see hardware-notes RDATA
+     crosstalk item). **Fit 1 kΩ, or 680 Ω, for a stiffer/faster edge.**
 7. **Writing DD images needs DD media.** `gw write` verifies each track by
    reading it back; writing a **DD** image (e.g. an MZ-800 720K EDSK) onto **HD**
    media fails verify (HD media magnetizes too weakly at DD current). Options:

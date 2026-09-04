@@ -52,6 +52,15 @@ abs-max, and it back-feeds a rail that cannot sink — the 3V3 rail rises and
 takes the whole board with it. Multiply by the four or five input lines. The
 same path bites whenever the drive is powered and the board is not.
 
+**Confirmed in the field (2026-08):** with the drives on their own PSU, powering
+the MZ-800 off leaves the drives powered while the Pico is not. The Pico then
+sits at a parasitic ~2–3 V from the drive's pull-ups via the GPIO diodes, its
+power-on reset never sees a clean rise when the MZ comes back, and it wakes up
+hung — no boot, **no USB enumeration**. Unplugging the floppy data cable and
+powering up again clears it. Until the buffers exist: **switch the floppy PSU
+on with or after the MZ-800 and off with or before it — never leave the drives
+powered while the MZ is off.**
+
 **Fix — one buffer in each direction:**
 
 - **Drive → Pico:** a `74LVC244A`/`74LVC541A` at 3V3 for `~RDATA`, `~INDEX`,
@@ -82,7 +91,7 @@ Default to the '07 plus option 1; add headroom only on `~WDATA`/`~STEP` if
 
 **Then move the pull-ups where they belong.** Once the inputs sit behind
 5 V-tolerant buffers, fit proper **1 kΩ to +5 V** at the connector, exactly like
-a real controller, instead of the current 1 kΩ-to-3.3 V bodge on `~RDATA`.
+a real controller, instead of the current 4k7-to-3.3 V bodge on `~RDATA`.
 Better noise margin over a long ribbon, and it is the level the drives were
 designed against. **Do not do this while the pins are bare** — that is precisely
 the hazard above.
@@ -108,6 +117,86 @@ VBUS and MZ +5 V into the regulator input.
 
 While there: add ~10 µF bulk on 3V3. Two 100 n for two '245s plus the module is
 thin.
+
+### 2b. RDATA vs. C0..C7 crosstalk at HD — **the HD write-splice blocker** (field-confirmed 2026-08)
+
+The HD data path works: HD tracks format, read and (on the bench, core1 idle)
+splice-write flawlessly, 160/160. But the HD **write splice under CP/M** fails
+~7% of the time, and exhaustive firmware instrumentation traced it to the
+board, not the code. The failing splice's live decoder sees a garbage symbol
+stream (zero sync marks in 2.3 revolutions) on flux that a fresh capture
+decodes perfectly ~240 ms later; the PIO's RXSTALL flag proves **no samples
+were dropped** — the RDATA *edges themselves* were wrong at capture time.
+
+Why the write splice and not reads, through the same GPIO20: during the splice
+hunt the host polls STATUS thousands of times (~24k), so core1 switches
+`C0..C7` through U2 continuously right next to `~RDATA`. Reads capture once and
+retry on a bad CRC, so they tolerate the occasional corrupted edge (rddiag: 786
+clean, 1 stray bad CRC); the live splice decodes across the whole noisy polling
+window and cannot. **HD only** — the 1 µs bit cell has no margin for the
+coupled noise; DD's 2 µs does (DD is byte-for-byte clean: 530/530 host writes,
+full soaks).
+
+**Firmware fully ruled out (2026-08), by exhaustive instrumentation.** Across
+many builds the failing splice was shown to have: no PIO RX-FIFO overflow
+(RXSTALL clear, no samples dropped at the source); no DMA ring lap (with a
+corrected absolute-counter overrun detector — the earlier index-masked one
+could alias a full lap, which is why it was rebuilt); deltas computed by the
+identical code the working read path uses; and clean reproduction of every
+bench variable *except* one — cadence, read-then-write, and even the
+read-drive-0-then-write-drive-1 (A→B) topology all splice 160/160 on the
+bench. The single difference left is **core1 driving the Z80 bus during the
+hunt**, and the PIO faithfully captured garbage edges: the RDATA signal was
+electrically corrupted.
+
+**Not the pull-up rise time.** Swapping the RDATA bodge 4k7 → 1 kΩ changed
+nothing (41 → 44 failures). That argues against simple slow-edge/capacitive
+coupling and points at **ground bounce / shared-return coupling**: when core1
+switches the eight C0..C7 lines plus the buffer through the daisy-chained
+grounds, the reference under RDATA moves, and a pull-up to VCC cannot fix a
+moving ground. The board's daisy-chained ribbon grounds (item 1's "give every
+odd pin its own via") are the suspect. HD-only because the 1 µs bit cell has
+no margin for the reference excursion; DD's 2 µs does (DD copies are
+byte-for-byte clean).
+
+This is the item-1/item-3 signal-integrity gap made concrete. Fixes to try,
+cheapest first:
+- **Grounding first, since the pull-up did nothing:** star-ground the ribbon's
+  odd (GND) pins each to the plane instead of daisy-chaining, and add a ground
+  guard trace beside `~RDATA`. This is the change most consistent with the
+  pull-up-insensitive, ground-bounce reading.
+- **A Schmitt buffer on `~RDATA`** (`74LVC17A`/`74LVC14A`, item 1) — hysteresis
+  rejects the reference excursion outright and is the definitive fix.
+- **33 Ω series at U2 on `C0..C7`** to slow the aggressor edges (item 3).
+- A stiffer RDATA pull-up (1 kΩ/680 Ω) is worth keeping anyway but is **not**
+  sufficient on its own — measured.
+- **33 Ω series at U2 on `C0..C7`** (and the `D0..D7` side) to slow the edges
+  that couple — the single highest-value change, already listed in item 3.
+- **Ground the ribbon properly** and keep `~RDATA`'s trace away from the bus;
+  a ground guard trace beside GPIO20.
+- **The buffered input stage (item 1)** with a Schmitt `74LVC17A`/`74LVC14A` on
+  `~RDATA` — hysteresis is exactly the defence against coupled noise on a slow
+  open-collector line, and it settles this for good.
+
+**Raw-flux evidence (2026-08, `huntflux`):** a successful HD hunt reads a clean
+2:3:4 interval distribution (this disk's true 2T/3T/4T); a failed hunt reads the
+SAME signal with roughly DOUBLED transition density -- intervals halved and
+scrambled, so the missing-clock sync never forms (syncs=0). Doubled edges on
+the shared RDATA line come from one of two places, both hardware: coupled noise
+injecting edges, or a SECOND drive's flux superimposing (both drives spin on the
+shared MOTOR line, and RDATA is one wire gated by select -- a source drive that
+does not cleanly release RDATA on deselect overlays its own flux). The clean
+half-cluster favours superposition over random noise. Distinguishing test: a
+single-drive HD write (no other drive on the cable) -- if it is clean, it is
+superposition and the fix is drive/cable/select-side; if it still fails, it is
+coupled noise. Either way the buffered Schmitt `~RDATA` input (item 1) fixes it.
+
+A firmware mitigation exists if the board cannot be changed: capture a full
+revolution first (as a read does, tolerant + retryable), decode it to find the
+target sector's rotational offset from index, then time a blind write into its
+Gap 2 on the following revolution — an **index-relative splice** that decouples
+the noisy decode from the write timing. It is a real amount of new code and is
+not written; the hardware fix is preferred.
 
 ### 3. MZ-800 bus side — mostly right, three additions
 
@@ -214,6 +303,20 @@ above, the two connectors disagree about which direction that net is. Item 4's
 per-port split fixes it. Currently harmless: the MZ-800 ROM never writes the
 density port, so DENSEL is unused and density→DENSEL is closed as
 "not to be done".
+
+### 6b. Edge-connector fingers — plating and wipe — **recurring field failure**
+
+The cartridge fingers are a live reliability problem on v0.0.1: intermittent
+`FD:Loading error`s (and command bytes corrupted into shapes that impersonate
+firmware bugs — the D7 incident, twice) that clear after reseating the card or
+cleaning the fingers with IPA. For the next revision: **hard-gold (ENEPIG or
+30µ" hard gold) plated fingers with a proper 20–30° chamfer**, maximum finger
+length the slot allows (wipe), and no soldermask pullback ambiguity over the
+contact area. HASL fingers oxidize and shed into the slot — they are the
+cheapest part of this board and the most frequent failure. Until then:
+`mzp_probe.py PORT health` screens for the symptom, and IPA plus reseat is the
+field fix. Consider cleaning the MZ-800 slot springs too — the other half of
+every contact.
 
 ### 7. Silkscreen / documentation
 Label the headers by form factor (`J2` = 5.25" Shugart, `J3` = 3.5" PC) and

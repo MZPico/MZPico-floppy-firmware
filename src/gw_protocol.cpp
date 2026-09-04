@@ -3,12 +3,14 @@
 // millis()/yield() -> Pico-SDK time / tud_task(); floppy-> -> FloppyDrive.
 #include "hardware/gpio.h"
 #include "gw_protocol.hpp"
+#include "gitver.h"
 
 #include "board_config.h"
 #include "floppy.hpp"
 #include "mfm_decode.hpp"
 #include "mfm_encode.hpp"
 #include "bus/mz_bus.hpp"
+#include "mfm_splice.hpp"
 #include "bus/fdc.hpp"
 #include "flux/arch_rp2.h"
 
@@ -77,6 +79,11 @@
 #define MZP_CMD_DRVSEL 0x9B    // bench: which unit (~DS0/~DS1) the FDC drives
 #define MZP_CMD_DRVLOCK 0x9C   // pin every access to drive 0 (escape hatch)
 #define MZP_CMD_DRVSTAT 0x9D   // per-drive state for ALL units at once
+#define MZP_CMD_DENSITY 0x9E   // density: force DD/HD or auto-detect (default)
+#define MZP_CMD_IDXBIT 0x9F    // Type I STATUS Index bit on/off (default on)
+#define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
+#define MZP_CMD_DENSEL 0xA1    // DENSEL pin override: 0/1 force, 2 auto, 3 query
+#define MZP_CMD_HUNTFLUX 0xA3  // raw deltas of the last blind write hunt
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -931,7 +938,7 @@ void gw_task() {
 
   else if (cmd == MZP_CMD_RDDIAG) {
     // [cmd, ACK, capture_ok, flux_n(4), capture_us(4), search_us(4),
-    //  rd_elapsed_us(4), want, result, ids_seen, ids[16],
+    //  rd_elapsed_us(4), want, result, ids_seen, ids[FDC_IDS_N=20],
     //  status_polls(4), status_span_us(4),
     //  int_flags, int_mode, intrq_asserts(4), lost_data_events(4),
     //  write_attempts(4), verify_start_ok, verify_n(4), seek_error,
@@ -951,7 +958,7 @@ void gw_task() {
     reply_buffer[i++] = d.rd_want;
     reply_buffer[i++] = d.rd_result;
     reply_buffer[i++] = d.rd_ids_seen;
-    for (int k = 0; k < 16; k++)
+    for (int k = 0; k < FDC_IDS_N; k++)
       reply_buffer[i++] = d.rd_ids[k];
     const uint32_t p32[] = {d.status_polls, d.status_span_us};
     for (uint32_t v : p32) {
@@ -1297,6 +1304,81 @@ void gw_task() {
     cdc_write_all(reply_buffer, i);
   }
 
+  else if (cmd == MZP_CMD_DENSITY) {
+    // cmd_buffer[2]: 0 = force DD, 1 = force HD, 2 = auto, 3 = detect,
+    // 4 = query. Reply: [cmd, ACK, mode, unit0_hd, unit1_hd, flips(4 LE),
+    //         host_valid, host_hd].
+    if (cmd_buffer[2] < 4)
+      fdc_set_density_mode(cmd_buffer[2]);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_density_mode();
+    reply_buffer[i++] = fdc_drive_density_hd(0) ? 1 : 0;
+    reply_buffer[i++] = fdc_drive_density_hd(1) ? 1 : 0;
+    uint32_t flips = fdc_density_flips();
+    reply_buffer[i++] = flips & 0xFF;
+    reply_buffer[i++] = (flips >> 8) & 0xFF;
+    reply_buffer[i++] = (flips >> 16) & 0xFF;
+    reply_buffer[i++] = (flips >> 24) & 0xFF;
+    bool hv = false, hh = false;
+    fdc_density_host(&hv, &hh);
+    reply_buffer[i++] = hv ? 1 : 0;
+    reply_buffer[i++] = hh ? 1 : 0;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_FWVER) {
+    // [cmd, ACK, len, hash bytes]. Exists because a whole hardware test
+    // session was once diagnosed against the wrong firmware: several stamped
+    // uf2s in circulation, no way to ask the board which one it was.
+    static const char ver[] = FW_GIT_HASH;
+    uint8_t n = (uint8_t)(sizeof(ver) - 1);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = n;
+    for (uint8_t k = 0; k < n; k++)
+      reply_buffer[i++] = (uint8_t)ver[k];
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_HUNTFLUX) {
+    // [cmd, ACK, valid, n_lo, n_hi, deltas[n]] -- the stream a blind hunt saw.
+    static uint8_t fx[512];
+    uint16_t n = 0;
+    uint8_t valid = 0;
+    uint8_t which = cmd_buffer[2]; // 0 = blind hunt, 1 = successful hunt
+    mfm_splice_debug_flux(which, fx, &n, &valid);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = valid;
+    reply_buffer[i++] = (uint8_t)(n & 0xFF);
+    reply_buffer[i++] = (uint8_t)(n >> 8);
+    cdc_write_all(reply_buffer, i);
+    if (n)
+      cdc_write_all(fx, n);
+  }
+
+  else if (cmd == MZP_CMD_DENSEL) {
+    // cmd_buffer[2]: 0/1 = pin that level, 2 = follow density, 3 = query.
+    // Reply: [cmd, ACK, override(-1/0/1 as u8), pin level now (0xFF unknown)].
+    if (cmd_buffer[2] < 2)
+      fdc_set_densel((int8_t)cmd_buffer[2]);
+    else if (cmd_buffer[2] == 2)
+      fdc_set_densel(-1);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = (uint8_t)fdc_get_densel();
+    int lvl = fdc_get_densel_level();
+    reply_buffer[i++] = (lvl < 0) ? 0xFF : (uint8_t)lvl;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_IDXBIT) {
+    // cmd_buffer[2]: 0 = never, 1 = HD-declared only (default), 2 = always,
+    // 3 = query.
+    if (cmd_buffer[2] < 3)
+      fdc_set_index_bit(cmd_buffer[2]);
+    reply_buffer[i++] = GW_ACK_OK;
+    reply_buffer[i++] = fdc_get_index_bit();
+    cdc_write_all(reply_buffer, i);
+  }
+
   else if (cmd == MZP_CMD_DRVLOCK) {
     // cmd_buffer[2]: 0 = multi-drive (default), 1 = pin to drive 0, 2 = query.
     if (cmd_buffer[2] < 2)
@@ -1310,9 +1392,9 @@ void gw_task() {
     // cmd_buffer[2]: 1 = clear the latch after reporting (arm for a new run).
     // [cmd, ACK, valid, kind, count(4), at_ms(4), want_sec, trk_reg,
     //  head_target, phys_track, side, seen_cyl, seen_head, capture_ok,
-    //  flux_n(4), capture_us(4), ids_seen, ids[16], pos_resyncs(4),
+    //  flux_n(4), capture_us(4), ids_seen, ids[FDC_IDS_N=20], pos_resyncs(4),
     //  resync_from, resync_to, reset_events(4), reset_at_ms(4),
-    //  reset_line, reset_active] -- 61 bytes.
+    //  reset_line, reset_active] -- 67 bytes (drive+motor follow seen_head).
     FdcFirstFail f;
     fdc_firstfail_snapshot(&f);
     reply_buffer[i++] = GW_ACK_OK;
@@ -1330,6 +1412,8 @@ void gw_task() {
     reply_buffer[i++] = f.side;
     reply_buffer[i++] = f.seen_cyl;
     reply_buffer[i++] = f.seen_head;
+    reply_buffer[i++] = f.drive;
+    reply_buffer[i++] = f.motor;
     reply_buffer[i++] = f.capture_ok;
     const uint32_t f32[] = {f.flux_n, f.capture_us};
     for (uint32_t v : f32) {
@@ -1337,7 +1421,7 @@ void gw_task() {
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
     }
     reply_buffer[i++] = f.ids_seen;
-    for (int k = 0; k < 16; k++)
+    for (int k = 0; k < FDC_IDS_N; k++)
       reply_buffer[i++] = f.ids[k];
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (f.pos_resyncs >> (8 * k)) & 0xFF;
@@ -1395,6 +1479,52 @@ void gw_task() {
     reply_buffer[i++] = (uint8_t)(d.trk_pos >> 8);
     reply_buffer[i++] = (uint8_t)(d.trk_last_bytes & 0xFF);
     reply_buffer[i++] = (uint8_t)(d.trk_last_bytes >> 8);
+    // Failed-write ring: wrf_n(4), then 8 x [trk, sec, side, ids(1), flags,
+    // motor, hunt_ms(2)], oldest -> newest. 76 bytes -> 144.
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.wrf_n >> (8 * k)) & 0xFF;
+    // 10 bytes per entry: [trk, sec, side, ids(1), flags, ctx, syncs,
+    // phys, pm_cyl, pm_info | (ringovr<<2) | (min(badid,7)<<3) | (pioovf<<6)].
+    // 76 + 4 + 80 = 160 so far. (The hunt length is always the timeout on a
+    // failure, so that byte now carries the sync count instead.)
+    for (int e = 0; e < 8; e++) {
+      reply_buffer[i++] = d.wrf_trk[e];
+      reply_buffer[i++] = d.wrf_sec[e];
+      reply_buffer[i++] = d.wrf_side[e];
+      reply_buffer[i++] =
+          (uint8_t)((d.wrf_ids[e] > 255) ? 255 : d.wrf_ids[e]);
+      reply_buffer[i++] = d.wrf_flags[e];
+      reply_buffer[i++] = d.wrf_ctx[e];
+      reply_buffer[i++] = d.wrf_syncs[e];
+      reply_buffer[i++] = d.wrf_phys[e];
+      reply_buffer[i++] = d.wrf_pm_cyl[e];
+      uint8_t bad = (d.wrf_badid[e] > 7) ? 7 : d.wrf_badid[e];
+      reply_buffer[i++] = (uint8_t)(d.wrf_pm_info[e] |
+                                    ((d.wrf_ovr[e] & 1) ? 0x04 : 0) |
+                                    (bad << 3) |
+                                    ((d.wrf_ovr[e] & 2) ? 0x40 : 0));
+    }
+    // Track-write ring: twr_n(4), then 8 x [ds(2), trk, side, phys, nsec,
+    // flags, census(2), len(2)] with timestamps in DECISECONDS (u16 covers
+    // 109 min) so the whole reply stays inside the 256-byte buffer. 252 total.
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.twr_n >> (8 * k)) & 0xFF;
+    for (int e = 0; e < 8; e++) {
+      uint32_t ds = d.twr_ms[e] / 100;
+      if (ds > 0xFFFF)
+        ds = 0xFFFF;
+      reply_buffer[i++] = (uint8_t)(ds & 0xFF);
+      reply_buffer[i++] = (uint8_t)(ds >> 8);
+      reply_buffer[i++] = d.twr_trk[e];
+      reply_buffer[i++] = d.twr_side[e];
+      reply_buffer[i++] = d.twr_phys[e];
+      reply_buffer[i++] = d.twr_nsec[e];
+      reply_buffer[i++] = d.twr_flags[e];
+      reply_buffer[i++] = (uint8_t)(d.twr_census[e] & 0xFF);
+      reply_buffer[i++] = (uint8_t)(d.twr_census[e] >> 8);
+      reply_buffer[i++] = (uint8_t)(d.twr_len[e] & 0xFF);
+      reply_buffer[i++] = (uint8_t)(d.twr_len[e] >> 8);
+    }
     cdc_write_all(reply_buffer, i);
   }
 
@@ -1408,8 +1538,9 @@ void gw_task() {
   }
 
   else if (cmd == MZP_CMD_FDCLOG) {
-    // [cmd, ACK, count_lo, count_hi, n, decoded[n], raw[n]]
-    // both oldest->newest, same slot order.
+    // [cmd, ACK, count_lo, count_hi, n, decoded[n], raw[n], seen[32]]
+    // both rings oldest->newest, same slot order; seen = 256-bit map of every
+    // distinct raw command byte since power-up (bit `raw` set).
     uint8_t dec[16];
     uint8_t raw[16];
     uint16_t count = 0;
@@ -1422,6 +1553,11 @@ void gw_task() {
       reply_buffer[i++] = dec[k];
     for (uint8_t k = 0; k < n; k++)
       reply_buffer[i++] = raw[k];
+    uint32_t seen[8];
+    fdc_cmd_seen(seen);
+    for (int w = 0; w < 8; w++)
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (seen[w] >> (8 * k)) & 0xFF;
     cdc_write_all(reply_buffer, i);
   }
 

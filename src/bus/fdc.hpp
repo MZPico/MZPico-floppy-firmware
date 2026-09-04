@@ -55,8 +55,43 @@ void fdc_bench_release(void);
 // board has no select line for. `track` is the drive's own position belief
 // (-1 = unknown), `target` the head target core1 folds Type I steps into.
 // flags: b0 ready (index seen on the last spin-up), b1 ever spun up,
-//        b2 currently selected.
+//        b2 currently selected, b3 latched density is HD.
 bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags);
+
+// Density (DD 250 kbit/s vs HD 500 kbit/s, both 300 rpm). mode 0 = force DD,
+// 1 = force HD, 2 = auto (default): a valid host 0xDE declaration decides,
+// else the per-drive latch (default DD) -- no media probing, so the boot/DD
+// path is the pre-HD behaviour exactly; 3 = detect: auto plus media probing
+// for declaration-less hosts (a nothing-decodes capture is probed at the
+// other bit clock; a CRC-valid ID flips the latch). Forcing dd/hd also writes
+// the current drive's latch.
+void fdc_set_density_mode(uint8_t mode);
+uint8_t fdc_get_density_mode(void);
+bool fdc_drive_density_hd(int unit); // the per-drive latch
+uint32_t fdc_density_flips(void);    // auto-detect flips since power-up
+// The host's own 0xDE declaration (b0: 1 = HD -- polarity observed from CP/M
+// 4.1, which writes 0 all through DD operation and 1 for an HD format). In
+// auto mode a valid declaration outranks the per-drive latch; it is cleared
+// by bus RESET so the boot ROM (which never writes the port) starts from the
+// latch again.
+void fdc_density_host(bool *valid, bool *hd);
+
+// Type I STATUS Index bit (b1), live from ~INDEX. Required by HD-aware
+// formatters (FORMAT4 times the spindle with it); removable at runtime in
+// case the boot ROM's RESTORE check ever objects again (see compose_status).
+// 0 = never (pre-HD behaviour), 1 = only while the host has declared HD on
+// 0xDE (default -- the DD/boot-ROM world keeps pre-HD semantics exactly),
+// 2 = always.
+void fdc_set_index_bit(uint8_t mode);
+uint8_t fdc_get_index_bit(void);
+
+// DENSEL pin override, decoupled from the encode/decode density: -1 = follow
+// the effective density (default), 0/1 = pin that level. Bench experiment
+// tool -- see g_densel_override. fdc_get_densel_level() is the level actually
+// on the pin (-1 = never driven yet).
+void fdc_set_densel(int8_t mode);
+int8_t fdc_get_densel(void);
+int fdc_get_densel_level(void);
 
 // core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back
@@ -108,6 +143,12 @@ void fdc_disk_task(void);
 // the motor under a running machine every 10 s of USB silence.
 bool fdc_is_active(void);
 
+// Diagnostic sector-ID list length. Was 16, which an 18-sector HD track
+// overflows -- the two truncated entries are, by rotational bad luck, exactly
+// the ones a wrap-region RNF needs shown. Sized for HD plus margin. Changing
+// this changes the RDDIAG/FIRSTFAIL wire formats; the probe reads it in sync.
+static constexpr int FDC_IDS_N = 20;
+
 // Debug snapshot of the FDC state (for the USB probe). Call on core0.
 struct FdcDebug {
   uint8_t status;  // composed Type I STATUS (true, un-inverted)
@@ -145,7 +186,7 @@ struct FdcDebug {
   uint32_t rd_capture_us;   // time spent capturing
   uint32_t rd_search_us;    // time spent decoding
   uint8_t rd_ids_seen;      // ID fields decoded (only filled in on failure)
-  uint8_t rd_ids[16];       // sector numbers actually present on the track
+  uint8_t rd_ids[FDC_IDS_N]; // sector numbers actually present on the track
   uint8_t rd_want;          // sector the host asked for
   uint8_t rd_result;        // b0 found b1 has_data b2 crc_ok b3 deleted
   // The host's measured BUSY/DRQ patience after a READ command.
@@ -183,6 +224,40 @@ struct FdcDebug {
   uint32_t wr_late;          // ID decoded too late to hit its Gap 2 window
   uint32_t wr_splice_us;     // last splice: search time
   uint16_t wr_ids_seen;      // last splice: ID fields decoded
+  // Ring of the last 8 FAILED host writes, oldest -> newest (wrf_n = total
+  // failures ever; min(wrf_n, 8) entries are valid). Which writes fail --
+  // clustered on a sector number, a track, a side, or scattered -- is what
+  // separates a geometry mismatch from a marginal decode.
+  uint32_t wrf_n;
+  uint8_t wrf_trk[8];
+  uint8_t wrf_sec[8];
+  uint8_t wrf_side[8];
+  uint16_t wrf_ids[8];
+  uint32_t wrf_us[8];
+  uint8_t wrf_flags[8]; // b0 id_found b1 cyl b2 size b3 late b4 NO_FLUX
+                        // b5 hunted-at-HD b6 decl valid b7 decl HD
+  uint8_t wrf_ctx[8];   // b0 host motor b1 spindle b2-3 host drive b4-5 core0
+                        // drive (3 none) b6 ~DS0 level b7 ~DS1 level
+  uint8_t wrf_phys[8];  // position belief at the hunt (0xFE unknown)
+  uint8_t wrf_pm_cyl[8]; // blind-hunt post-mortem: first ID's cyl (0xFF none)
+  uint8_t wrf_pm_info[8]; // b0 head, b1 decoded at HD clock, b7 valid
+  uint8_t wrf_syncs[8];  // sync marks the hunt found (capped 255)
+  uint8_t wrf_badid[8];  // ID candidates with bad CRC / non-ID mark (capped)
+  uint8_t wrf_ovr[8];    // DMA ring overran during the hunt
+  // Ring of the last 8 host WRITE TRACKs, oldest -> newest (twr_n = total).
+  // A format writes blind at the believed head position, so this is the only
+  // record of where each track actually went down and with which density
+  // decision. flags: b0 encoded HD, b1 declaration valid, b2 declaration HD,
+  // b3 census HD, b4 reached the media.
+  uint32_t twr_n;
+  uint32_t twr_ms[8];
+  uint8_t twr_trk[8];
+  uint8_t twr_side[8];
+  uint8_t twr_phys[8]; // position belief at the write (0xFE = unknown!)
+  uint8_t twr_nsec[8];
+  uint8_t twr_flags[8];
+  uint16_t twr_census[8];
+  uint16_t twr_len[8];
   uint8_t wr_last_result;    // b0 wrote b1 id_found b2 cyl b3 size b4 late
                              // b5 no_flux
   uint8_t wr_flags;          // b0 writing b1 armed b2 writes enabled b3 ~WPT
@@ -225,11 +300,15 @@ struct FdcFirstFail {
   uint8_t side;
   uint8_t seen_cyl;    // what the disk said instead (0xFF = it said nothing)
   uint8_t seen_head;
+  uint8_t drive;       // unit core0 was driving (0xFF = none) -- a failure on
+                       // the boot drive and one on the target drive tell very
+                       // different stories, and this used to be unrecorded
+  uint8_t motor;       // b0 host's motor bit, b1 spindle actually applied
   uint8_t capture_ok;
   uint32_t flux_n;
   uint32_t capture_us;
   uint8_t ids_seen;
-  uint8_t ids[16];     // the sector numbers really on the track
+  uint8_t ids[FDC_IDS_N]; // the sector numbers really on the track
   // Head-position resyncs: an ID field proved the head was elsewhere and we
   // adopted the disk's answer (fdc_resync_head).
   uint32_t pos_resyncs;
@@ -394,3 +473,6 @@ bool fdc_get_write_enable(void);
 // the data bus at D8. Returns count written; *count = total commands seen.
 uint8_t fdc_debug_cmdlog(uint8_t *out_decoded, uint8_t *out_raw,
                          uint16_t *count);
+// 256-bit map of every distinct RAW command byte seen since power-up (bit
+// raw = 1). The bus-health screen's evidence base for stuck-line detection.
+void fdc_cmd_seen(uint32_t out[8]);

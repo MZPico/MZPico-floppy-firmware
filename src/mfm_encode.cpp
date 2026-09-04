@@ -72,7 +72,8 @@ size_t mfm_encode_data_field(uint8_t *flux, size_t max_flux,
 
 size_t mfm_encode_format_image(uint8_t *flux, size_t max_flux,
                                const uint8_t *image, size_t n_image,
-                               float nominal_bit_time_us) {
+                               float nominal_bit_time_us,
+                               bool *out_overflow) {
   mfm_io_t io;
   memset(&io, 0, sizeof(io));
   io.T1_nom = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 1e-6f);
@@ -122,7 +123,13 @@ size_t mfm_encode_format_image(uint8_t *flux, size_t max_flux,
       continue;
     }
   }
-  return mfm_io_eof(&io) ? 0 : io.pos;
+  // A full buffer is reported, not treated as failure: for a track write the
+  // index pulse terminates the write, so the first max_flux transitions are
+  // exactly what a real WD would have put on the disk before being cut off.
+  // (Contrast mfm_encode_data_field, where truncation corrupts the sector.)
+  if (out_overflow)
+    *out_overflow = mfm_io_eof(&io);
+  return io.pos;
 }
 
 size_t mfm_encode_gap_fill(uint8_t *flux, size_t n_flux, size_t max_flux,

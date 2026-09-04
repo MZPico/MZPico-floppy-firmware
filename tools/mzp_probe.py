@@ -24,6 +24,8 @@ Usage:
     python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
+    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive]  # !! splices; read rdtrack (from rddrive) before each = CP/M A->B
+    python mzp_probe.py PORT huntflux [ok]                # raw deltas of the last blind hunt (or `ok` = first good hunt, for A/B)
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -32,6 +34,11 @@ Usage:
     python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
     python mzp_probe.py PORT drvlock [0|1]                # pin every access to drive 0, ignoring port 0xDC (no arg = query)
     python mzp_probe.py PORT drvstat                      # head position + target + readiness for BOTH units at once
+    python mzp_probe.py PORT density [dd|hd|auto|detect]  # density; auto = host 0xDE else latch (default); detect adds media probing
+    python mzp_probe.py PORT idxbit [0|1|2]               # Index status bit: 0 never, 1 only while host declares HD (default), 2 always
+    python mzp_probe.py PORT densel [0|1|auto]            # DENSEL pin override for write-current experiments (no arg = query)
+    python mzp_probe.py PORT fwver                        # git hash of the RUNNING firmware
+    python mzp_probe.py PORT health                       # session sanity check: build + passive bus/contact screen (run FIRST)
     python mzp_probe.py PORT readtrack <track> [side] [limit]   # READ TRACK: raw decoded bytes + address marks
     python mzp_probe.py PORT fdcformat <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! FORMATS THE TRACK
     python mzp_probe.py PORT fmtverify <track> [side] [nsec] [sizecode] [interleave] [fill]  # !! format, then scan it back
@@ -46,7 +53,8 @@ Usage:
                  actually latched -- the only way to test the READ direction.
     python mzp_probe.py PORT <track> <side> [dens]        # shorthand for scan
 
-    dens: 0 = DD / 250 kbit/s (default), 1 = HD / 500 kbit/s
+    dens: 0 = DD / 250 kbit/s, 1 = HD / 500 kbit/s; when omitted, read
+          commands follow the firmware's effective density (see `density`)
     size_code: 0=128, 1=256, 2=512, 3=1024 bytes/sector
     write pattern mode: 0 = ramp from seed, 1 = constant seed,
                         2 = pseudo-random from seed (default; hardest MFM)
@@ -81,6 +89,11 @@ MZP_CMD_SCAN = 0x80
 MZP_CMD_ENCTEST = 0x81
 MZP_CMD_BUSDUMP = 0x82
 MZP_CMD_DRIVE = 0x83
+MZP_CMD_DENSITY = 0x9E
+MZP_CMD_IDXBIT = 0x9F
+MZP_CMD_FWVER = 0xA0
+MZP_CMD_DENSEL = 0xA1
+MZP_CMD_HUNTFLUX = 0xA3
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -197,6 +210,30 @@ def print_sectors(s, ns):
         if id_ok and data_ok:
             good += 1
     return good
+
+
+def effective_density(s):
+    """The density the firmware will encode/decode with RIGHT NOW: a forced
+    mode wins; auto follows the selected unit's latched density. Bench read
+    commands default to this so a read-back always matches what the write
+    side just did -- an explicit dens argument still overrides. (fmtverify
+    once wrote a track at forced-HD and scanned it back at the DD default:
+    "MISSING sectors: [1..9]" on a perfectly good track.)"""
+    s.write(bytes([MZP_CMD_DENSITY, 3, 4]))  # 4 = query
+    s.flush()
+    r = read_exact(s, 11)
+    if len(r) != 11 or r[1] != 0:
+        return 0
+    mode = r[2]
+    if mode < 2:
+        return mode
+    if r[9]:  # the host has declared a density on 0xDE: it outranks the latch
+        return 1 if r[10] else 0
+    s.write(bytes([MZP_CMD_DRVSEL, 3, 4]))  # 4 = query only
+    s.flush()
+    d = read_exact(s, 5)
+    unit = d[2] if len(d) == 5 else 0
+    return 1 if (unit < 2 and r[3 + unit]) else 0
 
 
 def do_scan(s, track, side, dens):
@@ -417,8 +454,8 @@ def fdc_line(r):
 def do_rddiag(s):
     s.write(bytes([MZP_CMD_RDDIAG, 2]))
     s.flush()
-    r = read_exact(s, 92)
-    if len(r) < 92 or r[1] != 0:
+    r = read_exact(s, 96)
+    if len(r) < 96 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
 
@@ -428,20 +465,20 @@ def do_rddiag(s):
     capture_ok = r[2]
     flux_n, capture_us, search_us, abort_us = u32(3), u32(7), u32(11), u32(15)
     want, result, ids_seen = r[19], r[20], r[21]
-    ids = list(r[22:38])
-    status_polls, status_span_us = u32(38), u32(42)
-    int_flags, int_mode = r[46], r[47]
-    intrq_asserts, lost_data_events = u32(48), u32(52)
-    write_attempts = u32(56)
-    verify_start_ok, verify_n, seek_error = r[60], u32(61), r[65]
-    verify_attempts = u32(66)
+    ids = list(r[22:42])  # FDC_IDS_N = 20
+    status_polls, status_span_us = u32(42), u32(46)
+    int_flags, int_mode = r[50], r[51]
+    intrq_asserts, lost_data_events = u32(52), u32(56)
+    write_attempts = u32(60)
+    verify_start_ok, verify_n, seek_error = r[64], u32(65), r[69]
+    verify_attempts = u32(70)
     # Parsed here, with everything else, because the READ ADDRESS branch below
     # rebinds `r` to a size code and destroys the reply buffer.
-    sec_ok, sec_crc_err, sec_rnf = u32(70), u32(74), u32(78)
-    last_id_cyl, last_id_head = r[82], r[83]
-    sec_cyl_mismatch = u32(84)
-    last_trk_reg, last_want_side = r[88], r[89]
-    last_head_target, last_phys_track = r[90], r[91]
+    sec_ok, sec_crc_err, sec_rnf = u32(74), u32(78), u32(82)
+    last_id_cyl, last_id_head = r[86], r[87]
+    sec_cyl_mismatch = u32(88)
+    last_trk_reg, last_want_side = r[92], r[93]
+    last_head_target, last_phys_track = r[94], r[95]
 
     found = bool(result & 1)
     is_readaddr = bool(result & 0x10)
@@ -463,11 +500,11 @@ def do_rddiag(s):
     print(f"  decode  : {search_us / 1000:.1f} ms")
     if not found and not is_readaddr:
         if ids_seen:
-            shown = ids[:min(ids_seen, 16)]
+            shown = ids[:min(ids_seen, 20)]
             print(f"  track HAS {ids_seen} sector IDs: "
                   f"{', '.join(str(v) for v in shown)}"
-                  f"{' ...' if ids_seen > 16 else ''}")
-            if want not in shown and ids_seen <= 16:
+                  f"{' ...' if ids_seen > 20 else ''}")
+            if want not in shown and ids_seen <= 20:
                 print(f"  -> sector {want} is NOT on this track/side")
         else:
             print("  track HAS 0 decodable sector IDs -> the captured flux is "
@@ -515,8 +552,8 @@ def do_rddiag(s):
               "matching the target cylinder. The boot ROM stops here and "
               "reports a loading error WITHOUT ever issuing a READ.")
     if write_attempts:
-        print(f"  WRITES  : {write_attempts} WRITE SECTOR command(s) REFUSED "
-              f"with WRITE PROTECT -- 3.3 is not implemented yet")
+        print(f"  WRITES  : {write_attempts} WRITE SECTOR command(s) this "
+              f"session -- see `wrdiag` for their outcomes")
     if lost_data_events:
         print(f"  LOST DATA: {lost_data_events} sector(s) DRQ'd but never "
               f"drained by the host")
@@ -696,6 +733,7 @@ def do_fdclog(s):
         return
     ops = payload[:n]
     raws = payload[n:n*2]
+    read_exact(s, 32)  # the seen-bitmap; consumed here, analysed by `health`
     print(f"total commands: {count}; last {n} (oldest->newest):")
     for k, c in enumerate(ops):
         raw = raws[k]
@@ -788,7 +826,8 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
         print("VERIFY SKIPPED (nothing was written)")
         return
     want = gen_pattern(mode, seed, n)
-    s.write(bytes([MZP_CMD_FDCREAD, 6, track, sector, side, 0]))
+    s.write(bytes([MZP_CMD_FDCREAD, 6, track, sector, side,
+                   effective_density(s)]))
     s.flush()
     hdr = read_exact(s, 5)
     if len(hdr) < 5 or hdr[1] != 0:
@@ -817,8 +856,8 @@ def do_wrverify(s, track, sector, side, sizecode, mode, seed):
 def do_wrdiag(s):
     s.write(bytes([MZP_CMD_WRDIAG, 2]))
     s.flush()
-    r = read_exact(s, 76)
-    if len(r) < 76 or r[1] != 0:
+    r = read_exact(s, 252)
+    if len(r) < 252 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     wr_flags, last = r[2], r[3]
@@ -873,11 +912,210 @@ def do_wrdiag(s):
     if late:
         print("  ! 'too late' means the ID decoded after its Gap 2 had passed; "
               "the splice was skipped rather than risk the next ID field")
+    # Failed-write ring: WHICH writes failed. Clustering on a sector number /
+    # track / side = geometry mismatch; scattered = marginal decode.
+    wrf_n = int.from_bytes(r[76:80], "little")
+    if wrf_n:
+        shown = min(wrf_n, 8)
+        print(f"failed writes: {wrf_n} total; last {shown} "
+              f"(oldest -> newest):")
+        for e in range(shown):  # snapshot emits oldest -> newest in slots 0..n-1
+            off = 80 + e * 10
+            trk, sec, side, ids = r[off], r[off + 1], r[off + 2], r[off + 3]
+            fl, ctx, syncs = r[off + 4], r[off + 5], r[off + 6]
+            phys, pm_cyl, pm_info = r[off + 7], r[off + 8], r[off + 9]
+            badid, ovr = (pm_info >> 3) & 0x7, bool(pm_info & 4)
+            pio_ovf = bool(pm_info & 0x40)
+            decl = ("decl=" + ("HD" if fl & 0x80 else "DD")) if fl & 0x40 \
+                else "decl=none"
+            core0 = (ctx >> 4) & 3
+            print(f"    trk={trk:3d} side={side} sec={sec:2d}  "
+                  f"ids_seen={ids:2d}  syncs={syncs:3d}  bad-ID={badid}"
+                  f"{'+' if badid == 15 else ''}  "
+                  f"clk={'HD' if fl & 0x20 else 'DD'} {decl}  "
+                  f"motor={'on' if ctx & 2 else 'OFF!'}"
+                  f"{'  RING OVERRUN' if ovr else ''}"
+                  f"{'  PIO FIFO OVERFLOW' if pio_ovf else ''}"
+                  f"{'  NO FLUX' if fl & 0x10 else ''}"
+                  f"{'  late' if fl & 8 else ''}")
+            if ids == 0 and syncs == 0 and not (fl & 0x10):
+                if pio_ovf:
+                    print("        ^ NO syncs AND the PIO FIFO overflowed: the "
+                          "capture pipeline was STARVED -- samples lost at the "
+                          "source, not a corrupted signal")
+                else:
+                    print("        ^ NO syncs, PIO FIFO did NOT overflow: the "
+                          "PIO captured every sample and the deltas were still "
+                          "garbage -> the RDATA signal itself was corrupted")
+            elif ids == 0 and syncs:
+                print("        ^ syncs found but every ID failed: marginal "
+                      "read (or the stream corrupts right after each sync)")
+            print(f"        host drv={(ctx >> 2) & 3}  core0 drv="
+                  f"{'none' if core0 == 3 else core0}  "
+                  f"~DS0={'asserted' if not (ctx & 0x40) else 'released'} "
+                  f"~DS1={'asserted' if not (ctx & 0x80) else 'released'}  "
+                  f"belief={'?' if phys == 0xFE else phys}")
+            if pm_info & 0x80:
+                print(f"        under the head: cyl {pm_cyl} head "
+                      f"{pm_info & 1}, decoded at "
+                      f"{'HD' if pm_info & 2 else 'DD'} clock")
+            elif ids == 0 and not (fl & 0x10):
+                print("        under the head: NOTHING decodable at either "
+                      "clock (flux present)")
+        blind = all((r[80 + e * 10 + 3] == 0) and not (r[80 + e * 10 + 4] & 0x10)
+                    for e in range(shown))
+        if blind and shown:
+            print("    ^ every hunt was blind -- read the 'under the head' "
+                  "lines: that is what the splice was actually looking at")
+    # Track-write ring: every host WRITE TRACK, with the position belief and
+    # the density decision it was made under. A format writes BLIND at the
+    # believed position, so 'phys=?' here is a mislabeled track on the media.
+    twr_n = int.from_bytes(r[160:164], "little")
+    if twr_n:
+        shown = min(twr_n, 8)
+        print(f"track writes: {twr_n} total; last {shown} (oldest -> newest):")
+        for e in range(shown):
+            off = 164 + e * 11
+            ds = r[off] | (r[off + 1] << 8)
+            trk, side, phys, nsec, fl = (r[off + 2], r[off + 3], r[off + 4],
+                                         r[off + 5], r[off + 6])
+            census = r[off + 7] | (r[off + 8] << 8)
+            length = r[off + 9] | (r[off + 10] << 8)
+            dens = "HD" if fl & 1 else "DD"
+            decl = ("decl=" + ("HD" if fl & 4 else "DD")) if fl & 2 \
+                else "decl=none"
+            print(f"    t={ds / 10:7.1f}s  trk={trk:3d} side={side} "
+                  f"phys={'?' if phys == 0xFE else phys}  "
+                  f"{nsec:2d} sectors ~{census}B  img={length}B  "
+                  f"enc={dens} {decl} censusHD={bool(fl & 8)} "
+                  f"{'OK' if fl & 0x10 else 'FAILED'}")
+            if phys == 0xFE:
+                print("      ^ position belief UNKNOWN at a blind track write "
+                      "-- this track landed on an unverified cylinder")
 
 
 FF_KINDS = {0: "(none)", 1: "RNF -- sector not on this track",
             2: "data CRC error", 3: "WRONG CYLINDER",
             4: "Verify/seek error"}
+
+
+def do_health(s):
+    """One-shot session sanity check. Run FIRST each session and after any
+    strange failure. Exists because this project has repeatedly burned days
+    chasing firmware ghosts that were really the cartridge edge connector: the
+    D7 data line has failed twice from a marginal joint, and flaky fingers
+    (cured by reseating / IPA) corrupt commands into shapes that look exactly
+    like impossible firmware bugs. This is the passive half of the bus rule
+    ('run busdump first'); the definitive active measure is still the bustest
+    Z80 program."""
+    warns = []
+
+    # 1. Which firmware is this, really? (A test cycle was once spent against
+    # the wrong build.)
+    s.write(bytes([MZP_CMD_FWVER, 2]))
+    s.flush()
+    hdr = read_exact(s, 3)
+    if len(hdr) == 3 and hdr[1] == 0:
+        v = read_exact(s, hdr[2]).decode("ascii", "replace")
+        print(f"firmware : {v}")
+        if v.endswith("+dirty"):
+            warns.append("firmware built from a dirty tree -- not a committed state")
+    else:
+        print("firmware : (predates fwver -- OLD build!)")
+        warns.append("firmware predates fwver: flash a current build before "
+                     "trusting any result")
+
+    # 2. Bus line health from the passive counters.
+    s.write(bytes([MZP_CMD_BUSDUMP, 2]))
+    s.flush()
+    r = read_exact(s, 78)
+    if len(r) < 78 or r[1] != 0:
+        print("busdump  : bad reply")
+        warns.append("busdump unreadable")
+        r = None
+    if r:
+        wr = [int.from_bytes(r[10 + 4 * k:14 + 4 * k], "little") for k in range(8)]
+        rd = [int.from_bytes(r[42 + 4 * k:46 + 4 * k], "little") for k in range(8)]
+        addr_low, addr_high, dat_low, dat_high = r[74], r[75], r[76], r[77]
+        total = sum(wr) + sum(rd)
+        print(f"bus      : {total} register accesses since power-up")
+        if total == 0:
+            print("           (machine has not talked yet -- bus checks skipped)")
+        else:
+            # ADDRESS bits 6/7 read constant-high BY DESIGN (every port we own,
+            # 0xD8-0xDF, has both set) -- only bits 0-5 are meaningful here.
+            for k in range(6):
+                m = 1 << k
+                if not (addr_low & m):
+                    warns.append(f"ADDRESS bit C{k} never sampled low")
+                if not (addr_high & m):
+                    warns.append(f"ADDRESS bit C{k} never sampled high")
+            # WRITE-DATA union: a line that never moved MAY simply never have
+            # needed to -- but with thousands of varied writes that gets
+            # unlikely, so grade by traffic.
+            if sum(wr) > 500:
+                for k in range(8):
+                    m = 1 << k
+                    if not (dat_low & m):
+                        warns.append(f"DATA bit C{k} never written low "
+                                     f"({sum(wr)} writes) -- the D7-class "
+                                     f"stuck-high signature")
+                    if not (dat_high & m):
+                        warns.append(f"DATA bit C{k} never written high "
+                                     f"({sum(wr)} writes)")
+
+    # 3. Command-byte corruption, judged over EVERY distinct raw command byte
+    # seen since power-up (a 256-bit map), not the last 16: a copy loop's
+    # last 16 commands are two or three opcodes that share bits by
+    # coincidence, and that version of this check cried 'stuck line' at a bus
+    # that had just passed 365k loopback cycles clean. A stuck line turns
+    # Type II/III commands into aliased Type I ones (0x94 arrived as 0x14 in
+    # the documented D7 incident), so across a session's whole vocabulary --
+    # boot ROM + CP/M issue dozens of distinct raw bytes -- a bit that NEVER
+    # takes one of its values is the signature.
+    s.write(bytes([MZP_CMD_FDCLOG, 2]))
+    s.flush()
+    hdr = read_exact(s, 5)
+    if len(hdr) == 5 and hdr[1] == 0:
+        count = hdr[2] | (hdr[3] << 8)
+        n = hdr[4]
+        read_exact(s, n * 2)
+        bm = read_exact(s, 32)
+        seen = [v for v in range(256)
+                if len(bm) == 32 and (bm[v >> 3] >> (v & 7)) & 1]
+        print(f"commands : {count} total; {len(seen)} distinct raw bytes seen")
+        if len(seen) >= 8:
+            u_and, u_or = 0xFF, 0x00
+            for b in seen:
+                u_and &= b
+                u_or |= b
+            for k in range(8):
+                m = 1 << k
+                if u_and & m:
+                    warns.append(f"command-byte bit C{k} was 1 in ALL "
+                                 f"{len(seen)} distinct commands -- "
+                                 f"stuck-high suspect")
+                if not (u_or & m):
+                    warns.append(f"command-byte bit C{k} was 0 in ALL "
+                                 f"{len(seen)} distinct commands -- "
+                                 f"stuck-low suspect")
+        else:
+            print("           (fewer than 8 distinct commands so far -- "
+                  "command-line check skipped)")
+
+    # 4. Verdict.
+    print()
+    if warns:
+        print(f"HEALTH: {len(warns)} warning(s)")
+        for w in warns:
+            print(f"  ! {w}")
+        print("  -> before blaming firmware: power down, RESEAT the cartridge,")
+        print("     clean the edge fingers with IPA, and re-run `health`.")
+        print("     Definitive bus measure: the `bustest` Z80 test program.")
+    else:
+        print("HEALTH: no bus anomalies in the passive counters.")
+        print("  (Contacts can still fail intermittently; if symptoms persist")
+        print("   with clean health, the fault is likely real firmware/media.)")
 
 
 def do_resetdiag(s, clear=False):
@@ -931,23 +1169,24 @@ def do_firstfail(s, clear=False):
     """
     s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
     s.flush()
-    r = read_exact(s, 61)
-    if len(r) < 61 or r[1] != 0:
+    r = read_exact(s, 67)
+    if len(r) < 67 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
     valid, kind = r[2], r[3]
     count = int.from_bytes(r[4:8], "little")
     at_ms = int.from_bytes(r[8:12], "little")
-    (want, trk, tgt, phys, side, seen_c, seen_h, cap_ok) = r[12:20]
-    flux_n = int.from_bytes(r[20:24], "little")
-    cap_us = int.from_bytes(r[24:28], "little")
-    ids_seen = r[28]
-    ids = list(r[29:45])
-    resyncs = int.from_bytes(r[45:49], "little")
-    rs_from, rs_to = r[49], r[50]
-    reset_events = int.from_bytes(r[51:55], "little")
-    reset_at_ms = int.from_bytes(r[55:59], "little")
-    reset_line, reset_active = r[59], r[60]
+    (want, trk, tgt, phys, side, seen_c, seen_h) = r[12:19]
+    ff_drive, ff_motor, cap_ok = r[19], r[20], r[21]
+    flux_n = int.from_bytes(r[22:26], "little")
+    cap_us = int.from_bytes(r[26:30], "little")
+    ids_seen = r[30]
+    ids = list(r[31:51])  # FDC_IDS_N = 20
+    resyncs = int.from_bytes(r[51:55], "little")
+    rs_from, rs_to = r[55], r[56]
+    reset_events = int.from_bytes(r[57:61], "little")
+    reset_at_ms = int.from_bytes(r[61:65], "little")
+    reset_line, reset_active = r[65], r[66]
 
     # Read this first. The bus-RESET handling assumes the line idles LOW; if a
     # running machine shows it high, that assumption is wrong for this board and
@@ -972,6 +1211,9 @@ def do_firstfail(s, clear=False):
           f"{'?' if phys == 0xFE else phys}"
           + (f"  disk said cyl={seen_c} head={seen_h}"
              if seen_c != 0xFF else ""))
+    print(f"  drive     : {'?' if ff_drive == 0xFF else ff_drive}"
+          f"   motor: host={'on' if ff_motor & 1 else 'OFF'}"
+          f" spindle={'applied' if ff_motor & 2 else 'NOT APPLIED'}")
     print(f"  capture   : {'started' if cap_ok else 'DID NOT START'}, "
           f"{flux_n} flux bytes in {cap_us / 1000:.1f} ms")
     print(f"  ids on trk: {ids[:ids_seen] if ids_seen else '(none decoded)'}")
@@ -990,7 +1232,7 @@ def do_firstfail(s, clear=False):
               "sector number")
 
 
-def scan_geometry(s, track, side):
+def scan_geometry(s, track, side, dens=0):
     """Return [(sector_id, size_code), ...] actually recorded on a track.
 
     The soak cannot assume a geometry. An MZ-800 CP/M disk is 9x512 on its data
@@ -999,7 +1241,7 @@ def scan_geometry(s, track, side):
     size compare -- which looks like a write failure but is the safety check
     working. Read the ID fields and use what is really there.
     """
-    s.write(bytes([MZP_CMD_SCAN, 5, track, side, 0]))
+    s.write(bytes([MZP_CMD_SCAN, 5, track, side, dens]))
     s.flush()
     hdr = read_exact(s, 7)
     if len(hdr) < 7 or hdr[1] != 0:
@@ -1017,6 +1259,11 @@ def scan_geometry(s, track, side):
 
 
 def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
+    # Read back at the density the writes go down at. This was a hard-coded 0
+    # (DD): an HD soak on a perfectly written disk reported 160/160 'bad CRC on
+    # read-back' -- every sector decoded at the wrong clock -- and cost a
+    # false alarm against the DMA capture rework.
+    dens = effective_density(s)
     """Write/verify soak across many tracks and sides.
 
     16 writes on one outer track is a demo. This is the test that answers the
@@ -1035,7 +1282,7 @@ def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
     geom = {}
     for t in tracks:
         for sd in sides:
-            ids = scan_geometry(s, t, sd)
+            ids = scan_geometry(s, t, sd, effective_density(s))
             if not ids:
                 print(f"  track {t} side {sd}: no readable IDs -- skipping")
                 continue
@@ -1067,7 +1314,7 @@ def do_wrsoak(s, tracks, sides, passes, sector, sizecode, start_seed):
                 got = b""
                 crc_ok = False
                 if wrote:
-                    s.write(bytes([MZP_CMD_FDCREAD, 6, t, sector, sd, 0]))
+                    s.write(bytes([MZP_CMD_FDCREAD, 6, t, sector, sd, dens]))
                     s.flush()
                     h = read_exact(s, 5)
                     if len(h) == 5 and h[1] == 0:
@@ -1132,9 +1379,10 @@ def do_fmtverify(s, track, side, nsec, sizecode, interleave, fill):
     right, the data CRC proves the fill field and its CRC were laid down too."""
     if not do_fdcformat(s, track, side, nsec, sizecode, interleave, fill):
         return
-    ids = scan_geometry(s, track, side)
+    dens = effective_density(s)
+    ids = scan_geometry(s, track, side, dens)
     print(f"read back: {len(ids)} sectors with valid ID CRCs")
-    do_scan(s, track, side, 0)
+    do_scan(s, track, side, dens)
     got = sorted({r for r, _n in ids})
     want = list(range(1, nsec + 1))
     missing = [x for x in want if x not in got]
@@ -1205,7 +1453,8 @@ def main():
         cmd = sys.argv[2]
         if cmd == "scan":
             t, sd = int(sys.argv[3]), int(sys.argv[4])
-            dens = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+            dens = (int(sys.argv[5]) if len(sys.argv) > 5
+                    else effective_density(s))
             do_scan(s, t, sd, dens)
         elif cmd == "enctest":
             nsec, sc = int(sys.argv[3]), int(sys.argv[4])
@@ -1282,8 +1531,65 @@ def main():
             track = int(sys.argv[3])
             sector = int(sys.argv[4])
             side = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-            dens = int(sys.argv[6]) if len(sys.argv) > 6 else 0
+            dens = (int(sys.argv[6]) if len(sys.argv) > 6
+                    else effective_density(s))
             do_fdcread(s, track, sector, side, dens)
+        elif cmd == "wrburst":
+            # !! WRITES THE DISK. Consecutive splices on one track with NO
+            # read-back between them -- CP/M's cadence (the next WRITE lands
+            # milliseconds after the previous WGATE release), which the soak
+            # never reproduces because it reads back after every write.
+            # Optional 5th arg = a DIFFERENT track to READ before each
+            # splice. Write-only bursts and the soak both pass; CP/M reads its
+            # source track then seeks to the destination and writes -- so the
+            # read's capture (DMA ring start/stop) runs immediately before the
+            # splice's own capture. This reproduces that read->seek->write
+            # transition on the bench.
+            track = int(sys.argv[3])
+            side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            nsec = int(sys.argv[5]) if len(sys.argv) > 5 else 18
+            seed = int(sys.argv[6], 0) if len(sys.argv) > 6 else 0x5A
+            rdtrack = int(sys.argv[7]) if len(sys.argv) > 7 else -1
+            # 8th arg = drive to READ from before each splice (default: the
+            # write drive). CP/M copies A->B: it reads the source from drive 0,
+            # then SELECTS drive 1 and writes. Every earlier bench test stayed
+            # on one drive; this alternates, so the drive-0-read -> drive-1-write
+            # transition -- and any cross-drive RDATA bleed from the spinning
+            # source drive -- is finally on the bench.
+            rddrive = int(sys.argv[8]) if len(sys.argv) > 8 else -1
+            wrdrive = None
+            if rddrive >= 0:
+                # remember the write drive so we can flip back to it
+                s.write(bytes([MZP_CMD_DRVSEL, 3, 4]))  # query
+                s.flush()
+                q = read_exact(s, 5)
+                wrdrive = q[2] if len(q) == 5 else 1
+            fails = 0
+            for sec in range(1, nsec + 1):
+                if rdtrack >= 0:
+                    if rddrive >= 0:
+                        s.write(bytes([MZP_CMD_DRVSEL, 3, rddrive]))
+                        s.flush(); read_exact(s, 5)
+                    dens = effective_density(s)
+                    s.write(bytes([MZP_CMD_FDCREAD, 6, rdtrack, 1, side, dens]))
+                    s.flush()
+                    hdr = read_exact(s, 5)
+                    if len(hdr) == 5 and hdr[3] | (hdr[4] << 8):
+                        read_exact(s, hdr[3] | (hdr[4] << 8))
+                    if rddrive >= 0 and wrdrive is not None:
+                        s.write(bytes([MZP_CMD_DRVSEL, 3, wrdrive]))
+                        s.flush(); read_exact(s, 5)
+                ok = do_fdcwrite(s, track, sec, side, 2, 2, (seed + sec) & 0xFF)
+                if not ok:
+                    fails += 1
+            note = ""
+            if rdtrack >= 0:
+                note = f" (reading track {rdtrack}" + \
+                    (f" from drive {rddrive}" if rddrive >= 0 else "") + \
+                    " before each)"
+            print(f"burst done: {nsec - fails}/{nsec} spliced on track {track} "
+                  f"side {side}{note}; "
+                  f"now `wrdiag` for the ring and `scan {track} {side}`")
         elif cmd in ("fdcwrite", "wrverify"):
             # THESE WRITE TO THE DISK. args: track sector [side] [sizecode]
             #                                [mode] [seed]
@@ -1335,6 +1641,8 @@ def main():
                 unit, ds0, ds1 = r[2], r[3], r[4]
                 where = "~DS0" if unit == 0 else ("~DS1" if unit == 1 else "no select line on this board")
                 print("selected unit: %d (%s)" % (unit, where))
+                print("  (the lines below show the LAST APPLIED select -- the "
+                      "new unit is selected by the next actuating command)")
                 # ~DSn is active low: 0 = asserted.
                 print("  ~DS0 (GPIO24) = %d  %s" % (ds0, "ASSERTED" if ds0 == 0 else "released"))
                 print("  ~DS1 (GPIO25) = %d  %s" % (ds1, "ASSERTED" if ds1 == 0 else "released"))
@@ -1352,17 +1660,127 @@ def main():
                 print("selected unit %d   ~DS0=%d %s   ~DS1=%d %s"
                       % (r[2], r[3], "ASSERTED" if r[3] == 0 else "released",
                          r[4], "ASSERTED" if r[4] == 0 else "released"))
-                print("  unit  head  target  ready  spun  selected")
+                print("  unit  head  target  ready  spun  dens  selected")
                 for u in range(2):
                     trk, tgt, fl = r[5 + u * 3], r[6 + u * 3], r[7 + u * 3]
-                    print("   %d    %5s  %6d  %5s  %4s  %s"
+                    print("   %d    %5s  %6d  %5s  %4s  %4s  %s"
                           % (u, "?" if trk == 0xFF else trk, tgt,
                              "yes" if fl & 1 else "NO",
                              "yes" if fl & 2 else "no",
+                             "HD" if fl & 8 else "DD",
                              "yes" if fl & 4 else ""))
                 h0, h1 = r[5], r[8]
                 if h0 != 0xFF and h1 != 0xFF and h0 == h1:
                     print("  (both heads on the same cylinder -- park them apart to test independence)")
+        elif cmd == "density":
+            # 0 = force DD, 1 = force HD, 2 = auto (default), 3 = query.
+            names = {"dd": 0, "hd": 1, "auto": 2, "detect": 3}
+            val = names.get(sys.argv[3].lower(), None) if len(sys.argv) > 3 else 4
+            if val is None:
+                raise SystemExit("density takes dd, hd, auto or detect")
+            s.write(bytes([MZP_CMD_DENSITY, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 11)
+            if len(r) == 11:
+                mode = {0: "FORCED DD", 1: "FORCED HD",
+                        2: "auto (host 0xDE, else per-drive latch; no probing)",
+                        3: "detect (auto + media probing for 0xDE-less hosts)"
+                        }.get(r[2], "?")
+                flips = r[5] | (r[6] << 8) | (r[7] << 16) | (r[8] << 24)
+                print("density mode: %s" % mode)
+                print("  host 0xDE declaration: %s"
+                      % (("HD" if r[10] else "DD") if r[9]
+                         else "none since power-up/reset"))
+                print("  unit 0 latched: %s   unit 1 latched: %s"
+                      % ("HD" if r[3] else "DD", "HD" if r[4] else "DD"))
+                print("  auto-detect flips since power-up: %d" % flips)
+                if flips > 4:
+                    print("  ! many flips -- if this climbs on one disk, the "
+                          "media is marginal at both clocks, not mixed-density")
+        elif cmd == "health":
+            do_health(s)
+        elif cmd == "fwver":
+            s.write(bytes([MZP_CMD_FWVER, 2]))
+            s.flush()
+            hdr = read_exact(s, 3)
+            if len(hdr) == 3 and hdr[1] == 0:
+                v = read_exact(s, hdr[2])
+                print("firmware build: %s" % v.decode("ascii", "replace"))
+            else:
+                print("firmware predates the fwver command (pre-101d57f+)")
+        elif cmd == "huntflux":
+            # Dump the raw deltas (24 MHz ticks, /2, byte-clamped) the last
+            # BLIND write hunt saw -- the actual garbage stream, to look at.
+            which = 1 if (len(sys.argv) > 3 and sys.argv[3] == "ok") else 0
+            s.write(bytes([MZP_CMD_HUNTFLUX, 3, which]))
+            s.flush()
+            hdr = read_exact(s, 5)  # cmd, ack, valid, n_lo, n_hi
+            if len(hdr) < 5 or hdr[1] != 0:
+                print(f"bad reply: {hdr.hex()}")
+                sys.exit(0)
+            valid = hdr[2]
+            n = hdr[3] | (hdr[4] << 8)
+            data = read_exact(s, n) if n else b""
+            label = "successful" if which else "blind"
+            if not valid:
+                print(f"no {label} hunt recorded since power-up "
+                      f"(nothing to show)")
+            else:
+                import statistics
+                d = list(data)
+                print(f"last {label} hunt: {n} raw deltas (24MHz ticks, /2, "
+                      f"clamped 255). HD 1T~=12, 2T~=24, 3T~=36 ticks.")
+                # histogram summary
+                zeros = d.count(0)
+                sat = d.count(255)
+                nz = [x for x in d if x]
+                if nz:
+                    print(f"  zeros={zeros}  saturated(255)={sat}  "
+                          f"min={min(nz)} max={max(d)} mean={sum(d)/len(d):.1f} "
+                          f"median={statistics.median(d):.0f}")
+                # crude class counts around HD nominals
+                def near(v, c, w=4): return abs(v - c) <= w
+                c1 = sum(1 for x in d if near(x, 12))
+                c2 = sum(1 for x in d if near(x, 24))
+                c3 = sum(1 for x in d if near(x, 36))
+                other = n - c1 - c2 - c3 - zeros - sat
+                print(f"  near-1T(12)={c1} near-2T(24)={c2} near-3T(36)={c3} "
+                      f"other={other}")
+                # also show as DD nominals in case it's the wrong clock
+                d1 = sum(1 for x in d if near(x, 24))
+                d2 = sum(1 for x in d if near(x, 48, 6))
+                print(f"  (if DD-rate: near-1T(24)={d1} near-2T(48)={d2})")
+                print("  first 64 deltas:")
+                for r in range(0, min(n, 64), 16):
+                    print("   " + " ".join(f"{x:3d}" for x in d[r:r+16]))
+        elif cmd == "densel":
+            # DENSEL pin override: 0/1 = force that level, auto = follow the
+            # effective density (default); no arg = query.
+            arg = sys.argv[3].lower() if len(sys.argv) > 3 else None
+            val = {None: 3, "auto": 2, "0": 0, "1": 1}.get(arg)
+            if val is None:
+                raise SystemExit("densel takes 0, 1 or auto")
+            s.write(bytes([MZP_CMD_DENSEL, 3, val]))
+            s.flush()
+            r = read_exact(s, 4)
+            if len(r) == 4 and r[1] == 0:
+                ov = "follows density" if r[2] == 0xFF else f"FORCED {r[2]}"
+                lvl = "never driven" if r[3] == 0xFF else str(r[3])
+                print(f"DENSEL override: {ov}   pin now: {lvl}  "
+                      f"(1 = the level we call HD)")
+        elif cmd == "idxbit":
+            # Type I STATUS Index bit: 0 = never, 1 = only while the host has
+            # declared HD on 0xDE (default), 2 = always; no arg = query.
+            val = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+            s.write(bytes([MZP_CMD_IDXBIT, 3, val & 0xFF]))
+            s.flush()
+            r = read_exact(s, 3)
+            names = {0: "hardwired 0 (pre-HD behaviour, everywhere)",
+                     1: "live from ~INDEX ONLY while the host declares HD "
+                        "(default: DD/boot ROM keep pre-HD semantics)",
+                     2: "live from ~INDEX always (experiment)"}
+            print("Type I STATUS Index bit (b1): "
+                  + (names.get(r[2], "?") if len(r) == 3 else "bad reply"))
         elif cmd == "drvlock":
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 2
             s.write(bytes([MZP_CMD_DRVLOCK, 3, val & 0xFF]))
@@ -1426,7 +1844,8 @@ def main():
         elif cmd == "streamscan":
             track = int(sys.argv[3])
             side = int(sys.argv[4])
-            dens = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+            dens = (int(sys.argv[5]) if len(sys.argv) > 5
+                    else effective_density(s))
             capture_ms = int(sys.argv[6]) if len(sys.argv) > 6 else 220
             do_streamscan(s, track, side, dens, capture_ms)
         elif cmd == "pindrive":
@@ -1444,7 +1863,8 @@ def main():
                   f"(measure Pico pins 1..; mode 0 to release)")
         else:  # shorthand: PORT track side [dens]
             t, sd = int(sys.argv[2]), int(sys.argv[3])
-            dens = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            dens = (int(sys.argv[4]) if len(sys.argv) > 4
+                    else effective_density(s))
             do_scan(s, t, sd, dens)
 
 

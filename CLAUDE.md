@@ -149,10 +149,17 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Build system:** ✅ Pico-SDK + CMake, pico-sdk 2.2.0 submodule (done, Phase 1).
 
 ### Still open
-- ~~**Apply density to the DENSEL pin.**~~ — ✅ closed as **"not to be done"**:
-  the Disk BASIC ROM defines port `0xDE` but never writes it, so its polarity is
-  unknowable and nothing needs it (MZ-800 media is DD). The bit is latched only
-  (`density_single`), deliberately not driven onto DENSEL.
+- ~~**Apply density to the DENSEL pin.**~~ — ✅ superseded by **HD support**,
+  and the `0xDE` mystery is solved by observation: CP/M 4.1 writes the port
+  (`0x00` all through DD work, `0x81` entering an HD format), so **b0 = 1 =
+  HD** and a host declaration now outranks the auto-detect latch. The Disk
+  BASIC ROM still never writes it, which is why the per-drive latch remains
+  the boot-time fallback. DENSEL is driven best-effort from the same model.
+- **HD support: write path hardware-verified** (HD `fmtverify` track scans
+  back CRC-clean at 500 kbit/s; `enctest 18 2 1` round-trips). A full CP/M HD
+  format ran up to FORMAT4's spindle-timing phase, which exposed the missing
+  Type I Index bit (now live — see the Status entry); the end-to-end HD
+  format is the remaining verification.
 - ~~**`~EXWAIT` budget**~~ — ✅ resolved: core1 comfortably services a register
   access inside the ~560 ns Z80 I/O window without wait states (see
   [docs/phase3-plan.md](docs/phase3-plan.md), risk #4).
@@ -197,9 +204,15 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   fails, build the midpoint and flash it. Reasoning from indirect evidence lost
   most of a session here, through four wrong hypotheses, while two flashes
   settled it. `build/known-good/` holds the uf2s from that bisect.
-- **Run `busdump` first when a working build breaks.** Its per-line bit
-  activity catches the recurring data-bus contact fault in one command, with
-  the machine just sitting at a failed boot. Note the summary only sees bytes
+- **Run `mzp_probe.py PORT health` first, every session.** It verifies which
+  firmware build is actually running (`fwver` — a whole test cycle was once
+  spent against the wrong uf2) and screens the passive counters for the
+  recurring **edge-connector contact faults**: random `FD:Loading error`s
+  cured by reseating the cartridge or cleaning the fingers with IPA are
+  contacts, not code, and corrupted command bytes mimic impossible firmware
+  bugs (the D7 incident). `busdump` remains the detailed per-line view; the
+  `bustest` Z80 program (`tools/mzf/BUSTEST.MZF`: `bustestreset`, load+run
+  on the MZ-800, `bustest`) the definitive active measure. Note the summary only sees bytes
   the ROM actually wrote, so a line reported "stuck" may simply never have
   needed to be 1 — check the union of the observed `last_raw_write` values
   before believing it. (ADDRESS bits 6/7 always read stuck high: every port we
@@ -218,7 +231,7 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Phase 0 (hardware bring-up): DONE** — the board reads *and* writes real
   floppies over USB via the Adafruit greaseweazle Arduino sketch. See
   [docs/PHASE0.md](docs/PHASE0.md) and [docs/hardware-notes.md](docs/hardware-notes.md).
-  One bodge in place: 1 kΩ pull-up on `~RDATA` (GPIO20) to 3.3 V.
+  One bodge in place: **4k7** pull-up on `~RDATA` (GPIO20) to 3.3 V (too weak for HD — a 1 kΩ / 680 Ω swap is the first HD write-splice fix to try; see docs/hardware-notes.md RDATA crosstalk item).
 - **Phase 1 (Pico-SDK greaseweazle firmware): DONE** — a bare Pico-SDK +
   TinyUSB firmware that speaks the greaseweazle protocol, ported from
   Adafruit_Floppy. Builds to `mzpico_floppy.uf2`. See [README.md](README.md).
@@ -342,6 +355,68 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
       originally used the greaseweazle drive object, hardwired to `~DS0`, so
       `drive 1; scan` silently read drive 0 — and `fmtverify` would have
       formatted one disk and verified another.
+  - **HD (500 kbit/s) support: implemented, not yet hardware-verified.** Target
+    is 3.5" HD at 300 rpm — the revolution time is unchanged, only the bit
+    clock halves. The capture window stays **byte-sized** (~1.05 rev:
+    45700 bytes DD / 91400 HD) — byte windows are rotation-relative, adapting
+    to the spindle's real speed, where a time window on a slightly-slow drive
+    captured 0.96 rev and threw phase-dependent CRC errors (a lesson learned
+    the hard way; see `fdc_read_capture_bytes`). Density (`mzp_probe.py density dd|hd|auto|detect`, default auto):
+    a valid host `0xDE` declaration decides, else a per-drive latch (default
+    DD) — **no media probing by default**, so the boot-ROM/DD read path is
+    the pre-HD behaviour exactly; `detect` adds probing (a nothing-decodes
+    capture re-decoded at the other bit clock, CRC-valid ID flips the latch)
+    for `0xDE`-less hosts with HD media, which this machine does not have. **Port
+    `0xDE` is the host's density declaration and, when valid, is trusted
+    OUTRIGHT in auto mode** — a real WD never second-guesses its DENSEL
+    input. Polarity observed from CP/M 4.1 (`0x00` throughout DD operation,
+    `0x81` entering an HD format): b0 = 1 = HD; cleared on bus RESET so the
+    boot ROM falls back to the latch. The instrumented track-write ring
+    proved this BIOS declares before **every** operation, always correctly —
+    including deliberately declaring **DD for the 16×256 boot track (cyl 0 /
+    head 1) of an HD disk**, so the DD-only boot ROM can still boot it: HD
+    data tracks, DD boot track, one disk, by design. Two generations of
+    census-outranks-declaration logic each broke a track before that was
+    understood (the collection tail is host memory junk that can carry
+    phantom IDAMs and inflate the census past the HD threshold — we clock in
+    more bytes than a real WD, whose DRQ stops at the index). A host WRITE
+    TRACK therefore uses the image's **sector census** (declared sectors ×
+    size codes, ~5.3k for 9×512 DD vs ~10.4k for 18×512 HD; never the image
+    length) only when **no** declaration exists — Disk BASIC-era software.
+    Writes never auto-detect (the splice uses the effective density).
+    A status-only verify read (host drains nothing — FORMAT4's idiom, legal on
+    a real WD) completes after 15 ms instead of the 250 ms LOST-DATA budget,
+    which is what made an HD format ~11 min. The **Type I STATUS Index bit (b1) is live from `~INDEX`
+    only while the host has declared HD** (`idxbit 0|1|2`): FORMAT4's HD
+    path times the spindle by polling it and froze forever against the old
+    hardwired 0, but an earlier always-live experiment regressed the boot
+    ROM's RESTORE check, so the DD/boot world keeps the hardwired 0. DENSEL is
+    driven best-effort (3.5" drives sense HD from the media hole). Buffers are
+    HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
+    capture buffer already fit a full HD revolution). Verify bench-first:
+    `enctest 18 2 1` (no disk), then `density hd; fmtverify` on a scratch HD
+    disk. See [docs/wd-fidelity.md](docs/wd-fidelity.md). **HD read/format/bench-write are
+    hardware-verified; the HD write SPLICE under CP/M is blocked by RDATA vs
+    C0..C7 crosstalk at the 1 µs bit cell** (~7% of splices see corrupted
+    flux edges while the host storm-polls STATUS; DD's 2 µs cell is immune,
+    DD is 530/530 clean). Every firmware cause was instrumented out across many
+    builds (no PIO RX overflow, no DMA ring lap under a corrected absolute
+    detector, deltas identical to the working read path, and every bench
+    variable -- cadence, read-then-write, cross-drive A→B -- clean); the one
+    remaining difference is core1 driving the bus during the hunt, and the
+    PIO captured garbage edges. A 4k7→1 kΩ RDATA pull-up swap changed nothing,
+    pointing at ground-bounce/shared-return coupling rather than rise time.
+    It is a signal-integrity limit of the bare board -- see the RDATA item in
+    [docs/hardware-notes.md](docs/hardware-notes.md) for the fixes (grounding
+    first, then a Schmitt `~RDATA` buffer or 33 Ω on the bus) and the
+    index-relative-splice firmware mitigation. `huntflux` later
+    showed the failing hunt reads the real HD signal with DOUBLED transition
+    density (extra edges), i.e. coupled noise or a second drive's flux
+    superimposing on the shared RDATA -- a hardware limit, not firmware.
+    **Do not host-write HD disks you care about until it is fixed** -- a
+    mistimed splice can damage a track (one corrupted a CP/M image during this
+    bring-up; rewriting the image cured a scary but false 'firmware' regression
+    -- media, not code).
 - **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
   testing (the `wrsoak` run so far is minutes, not hours, and has met only one
   spindle), catching the rare boot `FD:Loading error` with `firstfail`.

@@ -46,10 +46,24 @@ static constexpr int FDC_SIZE_CACHE_N = FDC_MAX_CYLINDER + 1;
 // hardware has no select line for; those report NOT READY.
 static constexpr int FDC_DRIVE_MAX = 2;
 // One track's worth of host-visible bytes. A DD track at 250 kbit/s and 300 rpm
-// is ~6250 bytes; the margin covers a slow spindle and READ TRACK's inserted
-// sync-mark bytes. This bounds WRITE TRACK, so a host that never stops sending
-// cannot run off the end of it.
-static constexpr uint16_t FDC_TRACK_IMAGE_MAX = 7200;
+// is ~6250 bytes; an HD track at 500 kbit/s is ~12500. Sized for HD plus the
+// margin that covers a slow spindle and READ TRACK's inserted sync-mark bytes.
+// This bounds WRITE TRACK, so a host that never stops sending cannot run off
+// the end of it.
+static constexpr uint16_t FDC_TRACK_IMAGE_MAX = 13000;
+// A format image whose declared sectors need more on-disk room than any DD
+// track has (~6250 bytes) is an HD format. Measured from the image's SECTOR
+// CENSUS -- the IDAM preambles it contains and their size codes -- and never
+// from the image's raw length: the host is entitled to keep streaming bytes
+// for as long as DRQ stays up (on a real WD the index pulse ends WRITE TRACK,
+// not the host), so stream length says how patient the host is, not what it
+// means to write. CP/M's FORMAT4 does exactly that, filling whatever buffer we
+// offer even for a plain DD format. The census footprints are far apart --
+// ~5.3k for 9x512 DD, ~10.4k for 18x512 HD -- so one threshold separates them.
+// This is what lets a host format a BLANK disk at the density it intends,
+// which auto-detection from the media cannot do (blank media decodes at no
+// density).
+static constexpr uint32_t FDC_TRACK_CONTENT_HD_MIN = 8000;
 // The host has stopped shifting format bytes in. A real WD ends WRITE TRACK on
 // the index pulse and simply ignores anything still coming; we have to buffer
 // the image before writing it, so instead we take a gap in the byte stream as
@@ -60,10 +74,12 @@ static constexpr uint32_t FDC_TRACK_IDLE_US = 4000;
 // bytes and even a minimal one-sector format runs far longer; this bound exists
 // to reject glitches, not to validate geometry.
 static constexpr uint16_t FDC_TRACK_IMAGE_MIN = 256;
-// Flux budget for one formatted track. A revolution is ~43.5k transitions
-// (measured); 48k leaves the write with flux still queued when the terminating
-// index pulse arrives, which is what stops it running out early.
-static constexpr size_t FDC_TRACK_FLUX_MAX = 48000;
+// Flux budget for one formatted track. A DD revolution is ~43.5k transitions
+// (measured) and an HD one about double; the margin leaves the write with flux
+// still queued when the terminating index pulse arrives, which is what stops
+// it running out early.
+static constexpr size_t FDC_TRACK_FLUX_MAX_DD = 48000;
+static constexpr size_t FDC_TRACK_FLUX_MAX_HD = 96000;
 
 // Size code N means 128 << N bytes, so 512 is 2. MZ-800 CP/M data tracks are
 // 9x512 (N=2); the boot track is 16x256 (N=1).
@@ -82,7 +98,15 @@ struct FdcState {
   volatile bool motor_on = false;
   volatile uint8_t drive_sel = 0;
   volatile bool side1 = false;
-  volatile bool density_single = false;
+  // Port 0xDE b0 as the host last wrote it, and whether it has EVER been
+  // written since power-up / bus reset. The polarity stopped being a guess
+  // the day CP/M 4.1's FORMAT4 was watched doing an HD format: 608 writes of
+  // 0x00 during ordinary DD operation, then 0x81 exactly as it switched to
+  // its HD phase -- b0 = 1 means HD, observed in both states. The valid flag
+  // is what keeps the boot ROM safe: it never writes the port, so boot-time
+  // density falls back to the per-drive latch (default DD).
+  volatile bool density_host_hd = false;
+  volatile bool density_host_valid = false;
 
   // Seek handshake core1 -> core0.
   volatile uint32_t op_seq = 0;  // bumped by core1 to request a physical move
@@ -231,6 +255,60 @@ struct FdcState {
   volatile uint8_t wr_ab_side = 0;
   volatile uint32_t wr_splice_us = 0;     // last splice: search time
   volatile uint16_t wr_ids_seen = 0;      // last splice: ID fields decoded
+  // Ring of the last 8 FAILED host writes. The cumulative counters said "37
+  // splice RNFs while CP/M copied files" and could not say WHICH writes --
+  // whether the failures cluster on a sector number, a track, a side, or
+  // scatter randomly is precisely what separates 'geometry mismatch' from
+  // 'marginal decode', and a rate that ignored a doubled search window says
+  // they are deterministic, i.e. the WHICH is the whole diagnosis.
+  volatile uint8_t wrf_trk[8] = {0};
+  volatile uint8_t wrf_sec[8] = {0};
+  volatile uint8_t wrf_side[8] = {0};
+  volatile uint16_t wrf_ids[8] = {0};  // IDs the failed hunt decoded
+  volatile uint32_t wrf_us[8] = {0};   // ...and how long it hunted
+  // The environment of the failed hunt -- what separates "wrong bit clock"
+  // from "spindle not turning" from "flux flowed but would not decode":
+  // b0 splice result id_found, b1 cyl_mismatch, b2 size_mismatch, b3 late,
+  // b4 NO_FLUX (capture produced nothing), b5 hunted at HD clock,
+  // b6 0xDE declaration valid, b7 declaration said HD.
+  volatile uint8_t wrf_flags[8] = {0};
+  // Context at the hunt: b0 host motor bit, b1 spindle applied, b2-3 the
+  // host's 0xDC drive field, b4-5 the drive core0 actually had selected
+  // (3 = none), b6/b7 the LIVE levels of ~DS0/~DS1 (0 = asserted).
+  volatile uint8_t wrf_ctx[8] = {0};
+  volatile uint8_t wrf_phys[8] = {0};  // drive position belief (0xFE unknown)
+  // Post-mortem of a BLIND hunt (flux flowed, nothing decoded): the flux that
+  // was under the head, recaptured and decoded at both clocks. Whatever it
+  // turns out to be -- the DD boot track, the other drive's disk, the wrong
+  // side -- is the answer to 'what was the splice actually looking at'.
+  volatile uint8_t wrf_pm_cyl[8] = {0};  // first ID's cylinder; 0xFF = nothing
+  volatile uint8_t wrf_pm_info[8] = {0}; // b0 head, b1 decoded at HD, b7 valid
+  // The hunt's own view: sync marks it found, ID candidates that failed CRC,
+  // and whether the DMA ring overran. Zero syncs = the symbol stream was
+  // garbage the whole time; syncs with all-bad IDs = a marginal read.
+  volatile uint8_t wrf_syncs[8] = {0};
+  volatile uint8_t wrf_badid[8] = {0};
+  volatile uint8_t wrf_ovr[8] = {0};
+  volatile uint8_t wrf_pos = 0;
+  volatile uint32_t wrf_n = 0; // total failed host writes (ring wraps)
+  // Ring of the last 8 host WRITE TRACKs. A format is positionally BLIND --
+  // index-to-index at wherever the head is, no ID field to compare -- so
+  // when tracks turn up mislabeled or hybrid on the media, the questions are
+  // WHEN each track went down, at which believed position, with what census
+  // and what density decision. FORMAT4's sequencing (when the 16x256 boot
+  // track is written, what 0xDE said at that moment) is otherwise invisible.
+  volatile uint32_t twr_ms[8] = {0};  // ms since boot
+  volatile uint8_t twr_trk[8] = {0};  // Track register at the write
+  volatile uint8_t twr_side[8] = {0};
+  volatile uint8_t twr_phys[8] = {0}; // drive's position belief (0xFE unknown)
+  volatile uint8_t twr_nsec[8] = {0}; // census: sectors declared
+  volatile uint16_t twr_census[8] = {0}; // census: on-disk bytes estimate
+  volatile uint16_t twr_len[8] = {0};    // image length collected
+  // flags: b0 encoded HD, b1 declaration valid, b2 declaration said HD,
+  //        b3 census said HD, b4 write reached the media
+  volatile uint8_t twr_flags[8] = {0};
+  volatile uint8_t twr_pos = 0;
+  volatile uint32_t twr_n = 0;
   volatile uint8_t wr_last_result = 0;    // b0 wrote b1 id_found b2 cyl_mismatch
                                           // b3 size_mismatch b4 late b5 no_flux
   // One-sector transfer buffer. core0 fills it and raises `drq`; core1 hands the
@@ -259,7 +337,7 @@ struct FdcState {
   volatile uint32_t rd_capture_us = 0;  // wall time spent in the capture window
   volatile uint32_t rd_search_us = 0;   // wall time spent decoding
   volatile uint8_t rd_ids_seen = 0;     // ID fields decoded in that flux
-  volatile uint8_t rd_ids[16] = {0};    // the sector numbers actually found
+  volatile uint8_t rd_ids[FDC_IDS_N] = {0}; // sector numbers actually found
   volatile uint8_t rd_want = 0;         // sector the host asked for
   volatile uint8_t rd_result = 0;       // b0 found b1 has_data b2 crc_ok b3 del
 
@@ -345,11 +423,13 @@ struct FdcState {
   volatile uint8_t ff_side = 0;
   volatile uint8_t ff_seen_cyl = 0xFF; // what the disk said instead
   volatile uint8_t ff_seen_head = 0xFF;
+  volatile uint8_t ff_drive = 0xFF; // unit core0 was driving at the failure
+  volatile uint8_t ff_motor = 0;    // b0 host motor bit, b1 spindle applied
   volatile uint8_t ff_capture_ok = 0;
   volatile uint32_t ff_flux_n = 0;
   volatile uint32_t ff_capture_us = 0;
   volatile uint8_t ff_ids_seen = 0;
-  volatile uint8_t ff_ids[16] = {0}; // the sector numbers really on the track
+  volatile uint8_t ff_ids[FDC_IDS_N] = {0}; // sector numbers really on the track
 
   volatile uint32_t status_polls = 0;
   volatile uint32_t status_last_us = 0;
@@ -425,6 +505,14 @@ struct FdcState {
   volatile uint8_t bt_rd_last_got = 0;
   volatile uint32_t bt_rd_bit_high[8] = {0};
 
+  // Every distinct RAW command byte seen since power-up, as a 256-bit map.
+  // The bus-health screen needs a line's activity across the whole session's
+  // command vocabulary: 16 recent commands from a copy loop share bits by
+  // coincidence and cried 'stuck line' at a bus that had just passed 365k
+  // loopback cycles clean. Dozens of distinct raw command bytes accumulate
+  // over a boot + CP/M session; a bit that is constant across ALL of them is
+  // the genuine D7-class signature.
+  volatile uint32_t cmd_seen[8] = {0};
   // Ring log of recent command opcodes (true values), for debugging.
   volatile uint8_t cmd_hist[16] = {0};
   volatile uint8_t cmd_raw_hist[16] = {0};
@@ -584,6 +672,22 @@ volatile bool g_format_enable = true;
 // have to be removable without a reflash when the seek path is under suspicion.
 volatile bool g_posfix_enabled = true;
 
+// Type I STATUS Index bit (b1), live from the physical ~INDEX pin. A real
+// WD179x reports the raw IP input here and an HD-aware formatter NEEDS it:
+// FORMAT4's HD path times the spindle by polling this bit, and with it
+// hardwired to 0 the machine froze polling STATUS forever (65535+ reads of
+// 0x04, measured in `iotrace`).
+//
+// But an earlier live-index experiment regressed the boot ROM's RESTORE
+// completion check into an infinite retry loop, and enabling the bit
+// unconditionally on HD evidence alone put that risk back on every DD boot.
+// So, by default, the bit is visible ONLY while the host has declared HD on
+// 0xDE -- the one world that is known to need it. The boot ROM never writes
+// 0xDE and CP/M writes 0x00 for DD, so the DD world keeps exactly the pre-HD
+// status semantics. Modes: 0 = never, 1 = HD-declared only (default),
+// 2 = always (experiment). `mzp_probe.py idxbit N`.
+volatile uint8_t g_index_bit_mode = 1;
+
 namespace {
 
 // Record one register access. Values are stored exactly as they appear on the
@@ -740,6 +844,12 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
     S.trk_op = 0;
 
+  // 3b. The resetting host's 0xDE density declaration dies with it: the
+  //     machine comes back up in the boot ROM, which never writes the port,
+  //     and must find the DD boot disk readable via the per-drive latch.
+  S.density_host_valid = false;
+  S.density_host_hd = false;
+
   // 4. WD Master Reset also loads 01 into the Sector register. It additionally
   //    executes a RESTORE, which we deliberately do NOT do: that would drive
   //    the head on a signal the host never asked us to act on, and every host
@@ -754,6 +864,17 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
 bool g_applied_select = false;
 bool g_applied_motor = false; // physical motor state (may lag S.motor_on)
 int g_applied_side = -1;
+int g_applied_density = -1; // DENSEL pin shadow: -1 unknown, 0 DD, 1 HD
+// Bench override for the DENSEL pin, decoupled from the encode/decode density:
+// -1 = follow the effective density (default), 0/1 = pin that level. Exists to
+// answer a question the media raised: FORMAT4's DD boot track on an HD disk
+// came back with 9 of 16 data fields CRC-bad while IDs decoded fine -- a
+// weakly RECORDED track, i.e. the drive's write mode, not our flux timing.
+// Drives that honour pin 2 (most 3.5" drives go by the media hole and ignore
+// it) would have written that track in DD mode onto HD media. The override
+// lets the bench write the same track with the pin at either level and scan
+// the difference.
+volatile int8_t g_densel_override = -1;
 bool g_timing_set = false;
 uint32_t g_motor_off_at = 0; // deferred motor-stop deadline (ms; 0 = none)
 // Has this drive's spindle been confirmed turning (index seen) since boot?
@@ -916,9 +1037,124 @@ static bool fdc_apply_drive_select(void) {
   return true;
 }
 
-// MZ-800 disks are MFM double-density: 250 kbit/s -> 2.0 µs nominal bit time.
-// (FM/single-density decode is out of scope until 3.4; see 0xDE density port.)
+// MZ-800 native disks are MFM double-density: 250 kbit/s -> 2.0 µs nominal bit
+// time. HD (3.5" 1.44M-style) is 500 kbit/s -> 1.0 µs at the same 300 rpm --
+// only the bit clock changes, the revolution time does not, which is what lets
+// one time-based capture window serve both. (FM/single density remains out of
+// scope; see the 0xDE density port.)
 static constexpr float FDC_DD_BIT_US = 2.0f;
+static constexpr float FDC_HD_BIT_US = 1.0f;
+
+// ---- Density (DD vs HD) ----------------------------------------------------
+//
+// Nothing on the MZ-800 side reliably says which density a disk is: the Disk
+// BASIC ROM never writes the density port (0xDE), and its bit polarity is
+// unknowable from the ROM alone. So the density used for decode/encode is OURS
+// to determine:
+//   mode 0 = force DD, 1 = force HD (bench/probe override, `density dd|hd`),
+//   mode 2 = AUTO (default): a valid host 0xDE declaration decides; with no
+//     declaration (the boot ROM), the per-drive latch decides. NO media
+//     probing -- the boot/DD path stays byte-for-byte the pre-HD behaviour.
+//   mode 3 = DETECT: auto, plus media probing for declaration-less hosts -- a
+//     capture that decodes to nothing at the latched bit clock is cheaply
+//     probed at the other one (first CRC-valid ID field) and a proven ID
+//     flips the latch. Useful for HD media under a host that never writes
+//     0xDE; off by default because it adds a code path to the boot ROM's
+//     failure handling for a case this machine does not have.
+// The latch is per drive for the same reason the size cache is: two drives can
+// hold different media. Default DD -- the machine's native format, and what
+// every boot must assume. Writes never auto-detect: a splice rides the disk
+// live, so it uses the latched density, which any host will have established
+// by reading (or READ ADDRESS) before it writes. Formatting a blank disk
+// cannot auto-detect from media; the format IMAGE length decides instead (see
+// FDC_TRACK_IMAGE_HD_MIN).
+volatile uint8_t g_density_mode = 2;
+volatile bool g_drive_hd[FDC_DRIVE_MAX] = {false, false};
+volatile uint32_t g_dens_flips = 0;
+
+ALWAYS_INLINE bool fdc_is_hd(void) {
+  if (g_density_mode == 0)
+    return false;
+  if (g_density_mode == 1)
+    return true;
+  // Auto: the host's own 0xDE declaration wins once it has made one (CP/M 4.1
+  // writes the port routinely -- 0 for DD, 1 for HD); the per-drive detected
+  // latch covers hosts that never do (the boot ROM).
+  if (S.density_host_valid)
+    return S.density_host_hd;
+  return g_drive_hd[fdc_cur_idx()];
+}
+ALWAYS_INLINE float fdc_bit_us(void) {
+  return fdc_is_hd() ? FDC_HD_BIT_US : FDC_DD_BIT_US;
+}
+ALWAYS_INLINE size_t fdc_track_flux_max(void) {
+  return fdc_is_hd() ? FDC_TRACK_FLUX_MAX_HD : FDC_TRACK_FLUX_MAX_DD;
+}
+
+// Drive DENSEL to the level the override or the effective density asks for.
+// Best-effort and idempotent; called from the disk task on every pass and
+// from every bench entry point before it touches the media, so a bench
+// experiment and the host path see the same pin policy.
+static void fdc_apply_densel(void) {
+  if (!DRV)
+    return;
+  int want = (g_densel_override >= 0) ? (int)g_densel_override
+                                      : (fdc_is_hd() ? 1 : 0);
+  if (want != g_applied_density) {
+    DRV->set_density(want != 0);
+    g_applied_density = want;
+  }
+}
+
+// Record an observed density for the drive core0 is driving (auto mode only --
+// a forced mode is a bench statement of fact and must not be second-guessed).
+static void fdc_note_density(bool hd) {
+  if (g_density_mode < 2)
+    return;
+  int d = fdc_cur_idx();
+  if (g_drive_hd[d] != hd) {
+    g_drive_hd[d] = hd;
+    g_dens_flips++;
+  }
+}
+
+// A decode at the latched bit clock found NOTHING -- is the disk written at
+// the other density? Re-scan the same flux at the other clock; an ID field
+// with a valid CRC there (the CRC is what stops noise flipping the latch) is
+// proof, so flip the latch and tell the caller to re-decode. The flux needs no
+// recapture: the window is sized in time, so it holds a full revolution at
+// either density, and the deltas themselves are clock-agnostic.
+//
+// Only for auto mode, and callers must gate it on the current density seeing
+// NO valid ID anywhere in the capture -- a wrong-cylinder or wrong-sector
+// result means the current clock is reading the media fine and the problem is
+// positional, not spectral.
+//
+// The proof is mfm_read_address -- the FIRST ID field with a valid CRC -- and
+// deliberately not a full track scan. This probe sits on failure paths with
+// real deadlines over them (Type I Verify under the boot ROM's status-poll
+// timeout, READ ADDRESS under CP/M's ~52 ms patience), and a scan decodes
+// every sector's data on top of the ID hunt. The first version used the scan,
+// and the added latency on every marginal capture broke booting outright --
+// "FD:Loading error" on most attempts. One CRC-valid ID is the same standard
+// of proof at a fraction of the cost, and on flux of the WRONG density it
+// terminates after a single cheap sync-hunt pass, since no ID can decode.
+static bool fdc_try_other_density(const uint8_t *flux, size_t n_flux) {
+  if (g_density_mode != 3 || n_flux == 0)
+    return false;
+  // Once the host has declared a density on 0xDE, do not second-guess it: a
+  // flip of our latch could not take effect anyway (the declaration
+  // outranks it), and a real WD given the wrong density by its host simply
+  // fails the read -- which is the honest answer here too.
+  if (S.density_host_valid)
+    return false;
+  float other = fdc_is_hd() ? FDC_DD_BIT_US : FDC_HD_BIT_US;
+  uint8_t id[6];
+  if (!mfm_read_address(flux, n_flux, other, id))
+    return false;
+  fdc_note_density(!fdc_is_hd());
+  return true;
+}
 
 // Index is active-low. Waiting for a falling edge aligns capture close to the
 // start of a revolution (sector 1 conventionally follows index).
@@ -937,24 +1173,54 @@ static bool wait_for_index_falling_edge_ms(uint32_t timeout_ms) {
   return true;
 }
 
-// Type-I Verify can tolerate a longer pre-capture wait.
-// One disk revolution is ~43.5k flux transitions at DD (measured with `scan`).
-// Capture ~1.05 revolutions: enough that every sector passes the head once,
-// with a small margin for spindle-speed variation. The host's measured patience
-// after a READ is ~285 ms (25k STATUS polls, see `rddiag`) and a revolution is
-// ~200 ms, so this window has to stay tight -- 1.25 revolutions left only ~7 ms
-// of headroom. Used by both the Type II read window and the Type I Verify pass.
-static constexpr size_t FDC_READ_CAPTURE_BYTES = 45700;
-// Safety bound on any capture window (a revolution is ~200 ms).
+// The capture window is sized in BYTES -- ~1.05 revolutions at the effective
+// density -- and NOT in time. Byte-sizing is rotation-relative: flux bytes
+// arrive exactly as fast as disk content passes the head, so a byte target
+// spans the same fraction of a revolution on any spindle. A time window does
+// not: HD support briefly used 210 ms here (nominal 1.05 rev at 300.0 rpm),
+// and on a real drive turning slightly slow it captured 0.96 of a revolution
+// -- measured: 41765 bytes against the ~43.5k of one turn -- so any sector
+// straddling the window boundary decoded truncated, throwing spurious CRC
+// errors and RNFs whose victims moved with rotational phase. FORMAT4's
+// verify pass failed on half its tracks that way while bench scans (whose
+// window is longer) showed a perfectly formatted disk.
+//
+// A DD revolution is ~43.5k transitions (measured with `scan`); HD is about
+// double. The host's measured patience after a READ is ~285 ms (25k STATUS
+// polls, see `rddiag`), so the window must stay near 1.05 revolutions -- 1.25
+// left only ~7 ms of decode headroom. Used by the Type II read window and the
+// Type I Verify pass.
+//
+// Auto-detect note: a DD-sized capture of an HD disk holds ~half an HD
+// revolution -- plenty for the cheap first-ID probe that flips the latch; the
+// first re-decode may then miss its sector, and the host's retry recaptures
+// at the flipped density's full size.
+static constexpr size_t FDC_READ_CAPTURE_BYTES_DD = 45700;
+static constexpr size_t FDC_READ_CAPTURE_BYTES_HD = 91400;
+// Safety bound on any capture window (a revolution is ~200 ms); the byte
+// target is what normally ends it.
 static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
+
+ALWAYS_INLINE size_t fdc_read_capture_bytes(void) {
+  return fdc_is_hd() ? FDC_READ_CAPTURE_BYTES_HD : FDC_READ_CAPTURE_BYTES_DD;
+}
 
 static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
 
-// How long the write splice hunts for its sector's ID field. One revolution is
-// ~200 ms, so 1.25 of them guarantees every sector on the track passes the head
-// at least once -- if it is there at all, we have seen it. Longer would only
-// delay the RNF; the host is polling BUSY throughout.
-static constexpr uint32_t FDC_WRITE_SEARCH_TIMEOUT_US = 250000;
+// How long the write splice hunts for its sector's ID field. This was 250 ms
+// on the reasoning that 1.25 revolutions sees every sector once -- but the
+// real spindle turns in 218.7 ms (measured), making that only 1.14 rev, and a
+// host writes MICROSECONDS after its seek, so the hunt's first stretch runs
+// over head-settle garble; lose decoder sync there and the wanted ID slips
+// through the remainder. Measured cost: 35 splice RNFs in 476 write commands
+// (7.4%) while CP/M copied files to an HD disk -- and a host BIOS that does
+// not retry leaves each one as a hole of format fill in the file, which is
+// exactly a .COM that "runs" and does nothing. A real WD1793 hunts for FIVE
+// index pulses before Write-RNF; ~2.3 revolutions is still less patient than
+// the chip we emulate. The host polls BUSY throughout, and a host that gives
+// up mid-hunt (Force Interrupt) costs nothing: the splice result is only
+// published if the command is still live.
+static constexpr uint32_t FDC_WRITE_SEARCH_TIMEOUT_US = 500000;
 // NOTE: a set of "ROM bring-up workarounds" used to live here -- command
 // aliases 0x14->0x94 and 0x58->0xD8, a relaxed Verify seek-error gate, an
 // any-sector read fallback, and a BUSY hold. They existed because the ROM
@@ -974,6 +1240,17 @@ static constexpr uint32_t FDC_FORCE_INT_DEFER_IDLE_US = 2000;
 // that a host which never reads DATA at all recovers promptly instead of
 // deadlocking.
 static constexpr uint32_t FDC_DRQ_STALL_TIMEOUT_US = 250000;
+// ...but a READ whose host never takes even the FIRST byte is not a slow
+// drainer, it is a status-only verifier: FORMAT4 checks each sector's CRC via
+// STATUS and lets the data spill, which a real WD permits (it clocks the
+// sector past regardless and sets LOST DATA; the command still completes in
+// one sector time). Holding DRQ for the full generous budget above turned
+// that idiom into 250 ms PER SECTOR -- an 18-sector HD verify spent 4.5 s a
+// track waiting for a drain that was never coming, most of an 11-minute
+// format. A draining host takes its first byte within microseconds of DRQ
+// (it is polling STATUS at ~11 us), so an untouched buffer after 15 ms --
+// ~1000 byte times -- is unambiguous. Mid-drain stalls keep the full budget.
+static constexpr uint32_t FDC_READ_DRQ_FIRSTBYTE_US = 15000;
 
 // DRQ window for READ ADDRESS. Long enough that any polling host notices DRQ and
 // takes all six ID bytes (the boot ROM polls STATUS every ~11 us), short enough
@@ -1021,7 +1298,7 @@ static bool fdc_verify_track(uint8_t track) {
   // The old loop also had no timeout: its only exit was `n < cap`, so a drive
   // producing no transitions at all (motor not up to speed, no disk) left it
   // spinning forever with BUSY held.
-  size_t want = (cap < FDC_READ_CAPTURE_BYTES) ? cap : FDC_READ_CAPTURE_BYTES;
+  size_t want = (cap < fdc_read_capture_bytes()) ? cap : fdc_read_capture_bytes();
   size_t n = 0;
   uint32_t t0 = time_us_32();
   while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US)
@@ -1029,8 +1306,9 @@ static bool fdc_verify_track(uint8_t track) {
   rp2040_flux_capture_stop();
 
   S.verify_n = (uint32_t)n;
-  bool ok = (n > 0) && mfm_verify_track(flux, n, FDC_DD_BIT_US, track);
+  bool ok = (n > 0) && mfm_verify_track(flux, n, fdc_bit_us(), track);
 
+  bool any_valid_id = ok;
   if (!ok && n > 0) {
     // Compatibility fallback for ROM bring-up: some media/boot tracks can carry
     // non-canonical C bytes while still being readable. If strict WD-style
@@ -1038,15 +1316,27 @@ static bool fdc_verify_track(uint8_t track) {
     // is visible on-track. This keeps the ROM path moving while preserving
     // strict read CRC/RNF checks in Type II data transfer.
     SectorInfo ids[32];
-    int ns = mfm_scan_track(flux, n, FDC_DD_BIT_US, ids, 32, g_secbuf,
+    int ns = mfm_scan_track(flux, n, fdc_bit_us(), ids, 32, g_secbuf,
                             sizeof(g_secbuf));
     for (int i = 0; i < ns; ++i) {
       if (ids[i].id_crc_ok) {
+        any_valid_id = true;
         ok = true;
         break;
       }
     }
   }
+
+  // Only a capture with NO valid ID at the latched clock justifies the
+  // other-density probe. The order matters: the boot ROM exercises the
+  // fallback above on marginal captures, under its own status-poll timeout,
+  // and the first version of HD support ran the (then much more expensive)
+  // probe BEFORE the fallback on every strict-verify miss -- which broke
+  // booting outright. A DD->HD disk swap still gets noticed here: the swapped
+  // disk yields no valid ID at the old clock, the probe proves the new one,
+  // and the verify is repeated at the flipped density.
+  if (!any_valid_id && n > 0 && fdc_try_other_density(flux, n))
+    ok = mfm_verify_track(flux, n, fdc_bit_us(), track);
 
   return ok; // capture already stopped above, before the decode
 }
@@ -1122,10 +1412,15 @@ static bool fdc_read_address_search(uint8_t *id_out) {
         g_flux_n = rp2040_flux_capture_drain(flux, limit, g_flux_n,
                                              /*store_greaseweazle=*/false);
       }
-      found = mfm_read_address(flux, g_flux_n, FDC_DD_BIT_US, id_out);
+      found = mfm_read_address(flux, g_flux_n, fdc_bit_us(), id_out);
     }
     rp2040_flux_capture_stop();
     g_stream_active = false;
+    // No ID inside the whole search budget: try the other density on what was
+    // captured. READ ADDRESS is how CP/M probes a disk it knows nothing about,
+    // so this is the auto-detect path an HD disk usually takes first.
+    if (!found && fdc_try_other_density(flux, g_flux_n))
+      found = mfm_read_address(flux, g_flux_n, fdc_bit_us(), id_out);
   }
   S.rd_capture_us = time_us_32() - t0;
   S.rd_flux_n = g_flux_n;
@@ -1136,10 +1431,10 @@ static bool fdc_read_address_search(uint8_t *id_out) {
 // wanted 3" is a diagnosis; "RNF" is not.
 static void fdc_note_track_ids(const uint8_t *flux, size_t n_flux) {
   SectorInfo ids[40];
-  int ns = mfm_scan_track(flux, n_flux, FDC_DD_BIT_US, ids, 40, g_secbuf,
+  int ns = mfm_scan_track(flux, n_flux, fdc_bit_us(), ids, 40, g_secbuf,
                           sizeof(g_secbuf));
   S.rd_ids_seen = (ns < 0) ? 0 : (uint8_t)ns;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     S.rd_ids[k] = (k < ns) ? ids[k].sec : 0;
 }
 
@@ -1175,11 +1470,13 @@ static void fdc_note_failure(uint8_t kind, uint8_t want_sec, uint8_t seen_cyl,
   S.ff_side = S.side1 ? 1 : 0;
   S.ff_seen_cyl = seen_cyl;
   S.ff_seen_head = seen_head;
+  S.ff_drive = (g_cur_drive < 0) ? 0xFF : (uint8_t)g_cur_drive;
+  S.ff_motor = (uint8_t)((S.motor_on ? 1 : 0) | (g_applied_motor ? 2 : 0));
   S.ff_capture_ok = S.rd_capture_ok ? 1 : 0;
   S.ff_flux_n = S.rd_flux_n;
   S.ff_capture_us = S.rd_capture_us;
   S.ff_ids_seen = S.rd_ids_seen;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     S.ff_ids[k] = S.rd_ids[k];
 }
 
@@ -1267,14 +1564,22 @@ inline uint8_t compose_status() {
       st |= 0x40; // WRITE PROTECT (b6 in the Type II layout, write commands
                   // only). Set only by the WRITE SECTOR stub -- see 3.3.
   } else {
-    // Type I layout: b2 Track00, b6 WriteProtect. Index (b1) intentionally left
-    // at 0 — tried tying it live to the physical ~INDEX pin, but the pulse is
-    // wide enough to persist across multiple STATUS polls, and the MZ-800 boot
-    // ROM's RESTORE-completion check turned out to be an exact/tight match that
-    // doesn't tolerate it toggling mid-check (unlike Disk BASIC's, which
-    // explicitly masks bit1 out of its own check) — regressed RESTORE into an
-    // infinite retry loop. A real WD presents Index as a one-shot edge-latched
-    // pulse, not a live level; revisit with that semantics if actually needed.
+    // Type I layout: b1 Index, b2 Track00, b6 WriteProtect.
+    // Index is the LIVE ~INDEX sense (active low -> bit set during the pulse,
+    // ~2% duty), which is what a real WD179x reports. It stopped being
+    // optional when FORMAT4's HD path was watched freezing on it: the
+    // formatter times the spindle by polling this bit. An earlier live-index
+    // attempt regressed the boot ROM's RESTORE check -- hence g_index_bit
+    // stays runtime-removable (`idxbit 0`) until a boot has been seen clean
+    // with it on. Gated on motor_on so an idle spindle shows no phantom
+    // pulses; one gpio_get on a STATUS read costs nothing that matters.
+    {
+      bool idx_on = (g_index_bit_mode == 2) ||
+                    (g_index_bit_mode == 1 && S.density_host_valid &&
+                     S.density_host_hd);
+      if (idx_on && S.motor_on && !gpio_get(PIN_INDEX))
+        st |= 0x02; // INDEX
+    }
     if (S.at_track0)
       st |= 0x04; // TRACK 00
     if (S.seek_error)
@@ -1330,6 +1635,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     S.command = cmd;
     S.cmd_hist[S.cmd_pos & 15] = cmd;
     S.cmd_raw_hist[S.cmd_pos & 15] = raw;
+    S.cmd_seen[raw >> 5] |= (1u << (raw & 31));
     S.cmd_pos++;
     S.cmd_count++;
     S.cmd_gap_us = time_us_32() - S.last_ready_us; // diagnostic: see last_ready_us
@@ -1688,13 +1994,15 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     S.side1 = g_invert_side ? !rom_side1 : rom_side1;
     break;
   }
-  case 0xDE: // DENSITY (not CPL'd): b0 = density select.
-    // Latched only -- deliberately not driven onto DENSEL. The Disk BASIC ROM
-    // defines this port and never writes it, so nothing has ever told us which
-    // way round b0 goes, and the two documented readings disagree. Guessing
-    // would risk a machine that currently boots in order to serve media this
-    // platform does not have. See docs/wd-fidelity.md.
-    S.density_single = (raw & 0x01) != 0;
+  case 0xDE: // DENSITY (not CPL'd): b0 = density select, 1 = HD.
+    // The polarity is OBSERVED, not guessed: CP/M 4.1 writes 0x00 here
+    // throughout ordinary DD operation (608 writes counted in one session)
+    // and 0x81 at the moment FORMAT4 switches to an HD format. This is the
+    // host's density declaration and, in auto mode, the primary source of
+    // truth -- see fdc_is_hd(). The Disk BASIC boot ROM never writes the
+    // port, which is what the valid flag is for.
+    S.density_host_hd = (raw & 0x01) != 0;
+    S.density_host_valid = true;
     // Bus-test read-back channel: during the 0xDF loopback the test program
     // writes here whatever it just read from 0xDF. Compare against the byte we
     // drove. (Purely additive -- density still applies as normal.)
@@ -1856,6 +2164,11 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
   }
 }
 
+void fdc_cmd_seen(uint32_t out[8]) {
+  for (int k = 0; k < 8; ++k)
+    out[k] = S.cmd_seen[k];
+}
+
 uint8_t fdc_debug_cmdlog(uint8_t *out_decoded, uint8_t *out_raw,
                          uint16_t *count) {
   uint8_t n = (S.cmd_count < 16) ? (uint8_t)S.cmd_count : 16;
@@ -1932,7 +2245,7 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->rd_capture_us = S.rd_capture_us;
   o->rd_search_us = S.rd_search_us;
   o->rd_ids_seen = S.rd_ids_seen;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     o->rd_ids[k] = S.rd_ids[k];
   o->rd_want = S.rd_want;
   o->rd_result = S.rd_result;
@@ -1967,6 +2280,45 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->wr_late = S.wr_late;
   o->wr_splice_us = S.wr_splice_us;
   o->wr_ids_seen = S.wr_ids_seen;
+  // Failed-write ring, emitted oldest -> newest so the probe prints it as-is.
+  o->wrf_n = S.wrf_n;
+  {
+    uint8_t n = (S.wrf_n < 8) ? (uint8_t)S.wrf_n : 8;
+    uint8_t start = (uint8_t)((S.wrf_pos - n) & 7);
+    for (uint8_t k = 0; k < 8; ++k) {
+      uint8_t idx = (uint8_t)((start + k) & 7);
+      o->wrf_trk[k] = S.wrf_trk[idx];
+      o->wrf_sec[k] = S.wrf_sec[idx];
+      o->wrf_side[k] = S.wrf_side[idx];
+      o->wrf_ids[k] = S.wrf_ids[idx];
+      o->wrf_us[k] = S.wrf_us[idx];
+      o->wrf_flags[k] = S.wrf_flags[idx];
+      o->wrf_ctx[k] = S.wrf_ctx[idx];
+      o->wrf_phys[k] = S.wrf_phys[idx];
+      o->wrf_pm_cyl[k] = S.wrf_pm_cyl[idx];
+      o->wrf_pm_info[k] = S.wrf_pm_info[idx];
+      o->wrf_syncs[k] = S.wrf_syncs[idx];
+      o->wrf_badid[k] = S.wrf_badid[idx];
+      o->wrf_ovr[k] = S.wrf_ovr[idx];
+    }
+  }
+  // Track-write ring, same ordering.
+  o->twr_n = S.twr_n;
+  {
+    uint8_t n = (S.twr_n < 8) ? (uint8_t)S.twr_n : 8;
+    uint8_t start = (uint8_t)((S.twr_pos - n) & 7);
+    for (uint8_t k = 0; k < 8; ++k) {
+      uint8_t idx = (uint8_t)((start + k) & 7);
+      o->twr_ms[k] = S.twr_ms[idx];
+      o->twr_trk[k] = S.twr_trk[idx];
+      o->twr_side[k] = S.twr_side[idx];
+      o->twr_phys[k] = S.twr_phys[idx];
+      o->twr_nsec[k] = S.twr_nsec[idx];
+      o->twr_flags[k] = S.twr_flags[idx];
+      o->twr_census[k] = S.twr_census[idx];
+      o->twr_len[k] = S.twr_len[idx];
+    }
+  }
   o->wr_last_result = S.wr_last_result;
   o->wr_flags = (uint8_t)((S.writing ? 0x01 : 0) | (S.wr_armed ? 0x02 : 0) |
                           (g_write_enable ? 0x04 : 0) |
@@ -2003,11 +2355,13 @@ void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->side = S.ff_side;
   o->seen_cyl = S.ff_seen_cyl;
   o->seen_head = S.ff_seen_head;
+  o->drive = S.ff_drive;
+  o->motor = S.ff_motor;
   o->capture_ok = S.ff_capture_ok;
   o->flux_n = S.ff_flux_n;
   o->capture_us = S.ff_capture_us;
   o->ids_seen = S.ff_ids_seen;
-  for (int k = 0; k < 16; ++k)
+  for (int k = 0; k < FDC_IDS_N; ++k)
     o->ids[k] = S.ff_ids[k];
   o->reset_events = S.reset_events;
   o->reset_at_ms = S.reset_at_ms;
@@ -2174,6 +2528,7 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
 
   size_t cap = 0;
@@ -2216,6 +2571,7 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
 
   S.write_attempts++;
@@ -2227,7 +2583,7 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
 
   SpliceResult sr =
       mfm_write_sector(sector, (int)track, data, n, /*deleted=*/false,
-                       FDC_DD_BIT_US, FDC_WRITE_SEARCH_TIMEOUT_US);
+                       fdc_bit_us(), FDC_WRITE_SEARCH_TIMEOUT_US);
   fdc_record_splice(sr);
   if (sr.id_found) {
     fdc_note_size_code(track, sr.size_n);
@@ -2317,6 +2673,7 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
   if (DRV->get_write_protect()) {
     if (out_result)
@@ -2326,14 +2683,22 @@ uint16_t fdc_bench_format(uint8_t track, uint8_t side, uint8_t n_sectors,
 
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
-  size_t limit = (cap < FDC_TRACK_FLUX_MAX) ? cap : FDC_TRACK_FLUX_MAX;
-  size_t n_flux = mfm_encode_format_image(flux, limit, img, n, FDC_DD_BIT_US);
-  if (!n_flux) {
+  // Encoded at the EFFECTIVE density (`density dd|hd` from the probe, or the
+  // drive's latched density in auto mode) -- formatting is the one operation
+  // where the media cannot say, so the knob is the authority on the bench.
+  size_t limit = (cap < fdc_track_flux_max()) ? cap : fdc_track_flux_max();
+  bool enc_overflow = false;
+  size_t n_flux =
+      mfm_encode_format_image(flux, limit, img, n, fdc_bit_us(), &enc_overflow);
+  // Unlike the host path, a bench format that does not fit is an ERROR: this
+  // path exists to validate exact geometry, so silently clipping the last
+  // sectors would report success for a track that scans back short.
+  if (!n_flux || enc_overflow) {
     if (out_result)
       *out_result = 2; // image would not fit
     return 0;
   }
-  n_flux = mfm_encode_gap_fill(flux, n_flux, limit, FDC_DD_BIT_US);
+  n_flux = mfm_encode_gap_fill(flux, n_flux, limit, fdc_bit_us());
   bool ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
                              /*use_index=*/true);
   if (out_result)
@@ -2360,13 +2725,14 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
   DRV->select(true);
   g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
   DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
   DRV->goto_track(track);
 
   int32_t idx = 0;
   size_t nflux = DRV->capture_track(flux_buf, flux_cap, &idx,
                                     /*store_greaseweazle=*/false,
                                     /*capture_ms=*/220, /*index_wait_ms=*/250);
-  size_t n = mfm_read_track_raw(flux_buf, nflux, FDC_DD_BIT_US,
+  size_t n = mfm_read_track_raw(flux_buf, nflux, fdc_bit_us(),
                                 (uint8_t *)S.track_buf, FDC_TRACK_IMAGE_MAX);
   S.trk_last_bytes = (uint16_t)n;
   return (uint16_t)n;
@@ -2377,6 +2743,7 @@ const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
 FloppyDrive *fdc_bench_drive(void) {
   if (!fdc_apply_drive_select())
     return nullptr;
+  fdc_apply_densel();
   return DRV;
 }
 
@@ -2404,6 +2771,8 @@ bool fdc_drive_state(int unit, int *track, int *target, uint8_t *flags) {
       f |= 0x02;
     if (unit == g_cur_drive && g_applied_select)
       f |= 0x04;
+    if (g_drive_hd[unit])
+      f |= 0x08; // latched density: HD (auto-detected or bench-forced)
     *flags = f;
   }
   return true;
@@ -2428,6 +2797,39 @@ bool fdc_get_posfix(void) { return g_posfix_enabled; }
 bool fdc_get_write_enable(void) { return g_write_enable; }
 bool fdc_is_active(void) { return S.active; }
 
+void fdc_set_density_mode(uint8_t mode) {
+  g_density_mode = (mode > 3) ? 3 : mode;
+  // Forcing a density also teaches the latch: when the mode later returns to
+  // auto, the drive starts from the density the bench just proved, not from a
+  // stale guess.
+  if (g_density_mode == 0)
+    g_drive_hd[fdc_cur_idx()] = false;
+  else if (g_density_mode == 1)
+    g_drive_hd[fdc_cur_idx()] = true;
+}
+uint8_t fdc_get_density_mode(void) { return g_density_mode; }
+void fdc_density_host(bool *valid, bool *hd) {
+  if (valid)
+    *valid = S.density_host_valid;
+  if (hd)
+    *hd = S.density_host_hd;
+}
+void fdc_set_densel(int8_t mode) {
+  g_densel_override = (mode < 0) ? -1 : (mode ? 1 : 0);
+  fdc_apply_densel(); // take effect now if a drive is live
+}
+int8_t fdc_get_densel(void) { return g_densel_override; }
+int fdc_get_densel_level(void) { return g_applied_density; }
+
+void fdc_set_index_bit(uint8_t mode) {
+  g_index_bit_mode = (mode > 2) ? 2 : mode;
+}
+uint8_t fdc_get_index_bit(void) { return g_index_bit_mode; }
+bool fdc_drive_density_hd(int unit) {
+  return (unit >= 0 && unit < FDC_DRIVE_MAX) ? g_drive_hd[unit] : false;
+}
+uint32_t fdc_density_flips(void) { return g_dens_flips; }
+
 // ---- core0 (disk) ---------------------------------------------------------
 
 
@@ -2436,12 +2838,25 @@ void fdc_disk_task(void) {
     return; // idle until the MZ-800 talks to us (don't fight USB/gw drive use)
 
   // Apply drive select FIRST -- everything below actuates DRV, which does not
-  // exist until this has run once. Only between operations: a switch hands over
-  // the shared lines and drops any captured flux, so doing it under a read or a
-  // splice would move the flux path to another spindle mid-sector. A select
-  // that arrives during a transfer simply takes effect when that transfer ends,
-  // which is also what a real drive does with a select line that moves while
-  // its head is over data.
+  // exist until this has run once. Only between operations here: a switch
+  // hands over the shared lines and drops any captured flux, so doing it
+  // mid-transfer would move the flux path to another spindle mid-sector.
+  //
+  // BUT this idle-path gate alone is not enough, and the gap cost weeks: the
+  // host's per-command setup (density, track, DRIVE, sector, side, command)
+  // executes in microseconds, so when core0 is still busy finishing the
+  // PREVIOUS operation -- a 240 ms capture on drive A, say -- the new
+  // command's reading/writing flag is already set by the time core0 returns,
+  // this gate never opens, and the operation runs against the OLD drive.
+  // Measured: every blind write hunt during a CP/M A:->B: copy (clk=HD,
+  // decl=HD, motor on, flux flowing, ZERO ids in 2.3 revolutions -- HD decode
+  // of drive A's DD flux), deterministic at the file layout's A/B alternation
+  // points, ending in CP/M's own "Disk Select Error"; and both head strands,
+  // which were seeks executed against the wrong drive's head walking the two
+  // positions apart until a recalibrate died at an end stop. So each
+  // operation-execution block below ALSO applies the select at its start --
+  // the point where nothing is in flight for the new command yet, which is
+  // exactly where a select is safe.
   if (!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) {
     if (!fdc_apply_drive_select())
       return; // no such unit; STATUS already reports NOT READY
@@ -2496,6 +2911,13 @@ void fdc_disk_task(void) {
     // Side changed: any captured flux belongs to the old head.
     g_flux_n = 0;
   }
+  // Drive DENSEL from the effective density. Best-effort: the target 3.5"
+  // drives sense HD from the media hole and most ignore pin 2 entirely, and
+  // this board's ~DEN_RDY net is shared/direction-ambiguous between J2 and J3
+  // (see hardware-notes) -- so nothing here RELIES on the pin. The captured
+  // flux is deliberately NOT dropped on a change: flux deltas are
+  // clock-agnostic, the density only tells the decoder how to read them.
+  fdc_apply_densel();
 
   // Execute a pending physical seek.
   if (S.op_done != S.op_seq) {
@@ -2503,6 +2925,30 @@ void fdc_disk_task(void) {
     bool restore = (S.restore_done != S.restore_req);
     uint32_t rseq = S.restore_req;
     bool verify = S.op_verify;
+
+    // The select may be stale if this seek landed while core0 was busy (see
+    // the select-gate comment above). Stepping the WRONG drive's head is how
+    // the two units' positions walked apart until a recalibrate stranded one
+    // at an end stop.
+    if (!fdc_apply_drive_select() || !DRV)
+      return;
+
+    // NEVER step with the spindle down. This drive does not step reliably
+    // unless the disk is turning (the documented spin-up quirk: TRK00 is
+    // never reached from a cold spindle), and a host is entitled to command
+    // motor-off and then seek -- FORMAT4's detect phase does exactly that
+    // (0xDC = 0x00 mid-flow, caught in iotrace). A motor-off seek is how a
+    // head gets STRANDED: the recalibrate fails, position belief goes
+    // unknown, and the next positionally-blind WRITE TRACK formats the wrong
+    // cylinder. Measured aftermath: head found sitting over cylinder 19 with
+    // head_target=0 and phys_track unknown. Spin up for the move; the normal
+    // motor logic re-schedules the deferred stop afterwards if the host
+    // still wants the motor off.
+    if (!g_applied_motor) {
+      g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+      g_applied_motor = true;
+      g_motor_off_at = 0;
+    }
 
     // Do NOT write S.track back from the physical position: the Track register
     // is the host's belief and
@@ -2562,6 +3008,11 @@ void fdc_disk_task(void) {
     // one sector's data field.
     if (S.op_done != S.op_seq)
       return;
+    // Stale-select check (see the select-gate comment above): a track op is
+    // positionally blind, so running it against the wrong DRIVE would format
+    // or dump another disk entirely.
+    if (!fdc_apply_drive_select() || !DRV)
+      return;
 
     if (S.trk_op == 1) { // READ TRACK
       if (S.trk_done != S.trk_seq) {
@@ -2569,12 +3020,25 @@ void fdc_disk_task(void) {
         size_t cap = 0;
         uint8_t *flux = mzp_flux_buffer(&cap);
         uint32_t t0 = time_us_32();
-        fdc_capture_window(FDC_READ_CAPTURE_BYTES);
+        fdc_capture_window(fdc_read_capture_bytes());
         if (!S.trk_op) // aborted while we were blocked capturing
           return;
-        size_t n = mfm_read_track_raw(flux, g_flux_n, FDC_DD_BIT_US,
+        size_t n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
                                       (uint8_t *)S.track_buf,
                                       FDC_TRACK_IMAGE_MAX);
+        // Free-running decode yields SOMETHING at any clock, so "n == 0" is
+        // not the density-detect trigger here. Instead: no ID field at the
+        // latched clock (cheap first-ID check) but a proven one at the other
+        // -> flip the latch and re-decode.
+        {
+          uint8_t idtmp[6];
+          if (g_flux_n > 0 &&
+              !mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
+              fdc_try_other_density(flux, g_flux_n))
+            n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
+                                   (uint8_t *)S.track_buf,
+                                   FDC_TRACK_IMAGE_MAX);
+        }
         S.trk_last_us = time_us_32() - t0;
         S.trk_last_bytes = (uint16_t)n;
         if (n == 0) {
@@ -2662,24 +3126,31 @@ void fdc_disk_task(void) {
     // one 7200-byte image in ten thousand even for uniformly random bytes, and
     // this is not random bytes, it is a stream that only exists at all if a
     // command was already mis-decoded.
-    bool plausible = S.trk_len >= FDC_TRACK_IMAGE_MIN;
-    if (plausible) {
-      bool found = false;
+    // One pass does double duty: it is the plausibility gate (at least one
+    // real IDAM preamble) AND the sector census the density inference needs
+    // (see FDC_TRACK_CONTENT_HD_MIN). Each preamble's size code -- 4 bytes
+    // past the 0xFE, after cyl/side/sec -- says how much disk the sector will
+    // occupy; the per-sector 62 covers its ID field, presync runs, DAM, CRCs
+    // and Gap 2/3, and the 150 the index preamble and Gap 1.
+    int census_sectors = 0;
+    uint32_t census_disk_bytes = 150;
+    {
       uint16_t run = 0;
-      for (uint16_t k = 0; k < S.trk_len; ++k) {
+      for (uint16_t k = 0; k + 4 < S.trk_len; ++k) {
         uint8_t b = S.track_buf[k];
         if (b == 0xF5) {
           run++;
-        } else {
-          if (b == 0xFE && run >= 2) {
-            found = true;
-            break;
-          }
-          run = 0;
+          continue;
         }
+        if (b == 0xFE && run >= 2) {
+          census_sectors++;
+          census_disk_bytes +=
+              (uint32_t)(128u << (S.track_buf[k + 4] & 7)) + 62;
+        }
+        run = 0;
       }
-      plausible = found;
     }
+    bool plausible = S.trk_len >= FDC_TRACK_IMAGE_MIN && census_sectors > 0;
 
     bool ok = false;
     uint32_t t0 = time_us_32();
@@ -2688,18 +3159,47 @@ void fdc_disk_task(void) {
     } else if (!S.write_protect) {
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
+      // Density for the encode: a valid 0xDE declaration is trusted OUTRIGHT,
+      // exactly as a real WD trusts its DENSEL input -- the controller never
+      // second-guesses density. The track-write ring settled this in one
+      // instrumented format run: this BIOS declares before EVERY operation,
+      // always correctly, and on an HD disk it deliberately declares DD for
+      // the 16x256 BOOT track (cyl 0 / head 1) so the DD-only boot ROM can
+      // still boot the disk -- HD data tracks, DD boot track, one disk, by
+      // design.
+      //
+      // Two earlier generations of this code overrode the declaration with
+      // the image's sector census, and each broke a different track. The
+      // census is measured over the WHOLE 13000-byte collection, and we hold
+      // DRQ up for all of it -- MORE than the host's real image (a real WD
+      // stops clocking bytes in at the index pulse), so the tail is host
+      // memory junk that can carry phantom F5F5+FE patterns. Ring-recorded:
+      // the DD boot image censused as '22 sectors, 8938 bytes' -- over the HD
+      // threshold -- so the override invalidated the host's own FRESH DD
+      // declaration and encoded the boot track at the HD clock: sectors
+      // missing on readback, FORMAT4 stuck retrying track 1 forever.
+      //
+      // The census's one legitimate job is hosts that never write 0xDE at
+      // all (Disk BASIC-era software) -- there it sets the latch, and
+      // imperfect evidence beats none.
+      if (!S.density_host_valid)
+        fdc_note_density(census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN);
       // Cap the flux at a bit over one revolution: the write is terminated by
-      // the index pulse anyway, and encoding more is wasted time.
-      size_t limit = (cap < FDC_TRACK_FLUX_MAX) ? cap : FDC_TRACK_FLUX_MAX;
+      // the index pulse anyway, and encoding more is wasted time. An image
+      // needing more than the cap is fine for the same reason -- the encoder
+      // reports the overflow but fills the buffer with the image's first
+      // revolution-and-a-bit, which is all the index lets onto the disk. A
+      // real WD fed a too-long image behaves identically.
+      size_t limit = (cap < fdc_track_flux_max()) ? cap : fdc_track_flux_max();
       size_t n_flux = mfm_encode_format_image(
-          flux, limit, (const uint8_t *)S.track_buf, S.trk_len, FDC_DD_BIT_US);
+          flux, limit, (const uint8_t *)S.track_buf, S.trk_len, fdc_bit_us());
       if (n_flux) {
         // Pad to the end of the buffer with gap bytes. A short image would
         // otherwise leave the tail of the OLD track standing past the end of
         // the new one -- half of each format, spliced wherever the host
         // happened to stop. The index pulse cuts the write off at the right
         // place; our job is only to have flux ready to write until it comes.
-        n_flux = mfm_encode_gap_fill(flux, n_flux, limit, FDC_DD_BIT_US);
+        n_flux = mfm_encode_gap_fill(flux, n_flux, limit, fdc_bit_us());
         // use_index: start at the index pulse and stop at the next one. That
         // is what makes this a *track* write rather than a very long splice --
         // there is no timing window to hit, which is why formatting is the
@@ -2710,6 +3210,26 @@ void fdc_disk_task(void) {
     }
     S.trk_last_us = time_us_32() - t0;
     S.trk_last_bytes = S.trk_len;
+    {
+      uint8_t p = S.twr_pos;
+      S.twr_ms[p] = to_ms_since_boot(get_absolute_time());
+      S.twr_trk[p] = S.track;
+      S.twr_side[p] = S.side1 ? 1 : 0;
+      int pt = DRV ? DRV->track() : -1;
+      S.twr_phys[p] = (pt < 0) ? 0xFE : (uint8_t)pt;
+      S.twr_nsec[p] = (census_sectors > 255) ? 255 : (uint8_t)census_sectors;
+      S.twr_census[p] = (census_disk_bytes > 0xFFFF)
+                            ? 0xFFFF
+                            : (uint16_t)census_disk_bytes;
+      S.twr_len[p] = S.trk_len;
+      S.twr_flags[p] = (uint8_t)(
+          (fdc_is_hd() ? 0x01 : 0) | (S.density_host_valid ? 0x02 : 0) |
+          (S.density_host_hd ? 0x04 : 0) |
+          ((census_disk_bytes >= FDC_TRACK_CONTENT_HD_MIN) ? 0x08 : 0) |
+          (ok ? 0x10 : 0));
+      S.twr_pos = (uint8_t)((p + 1) & 7);
+      S.twr_n++;
+    }
     if (ok) {
       S.trk_ok++;
     } else {
@@ -2785,6 +3305,14 @@ void fdc_disk_task(void) {
     if (S.op_done != S.op_seq)
       return;
 
+    // Stale-select check (see the select-gate comment above). This is the
+    // exact site of the blind write hunts: the splice was searching drive A's
+    // DD flux at the HD clock -- zero IDs in 2.3 revolutions, deterministic
+    // at the copy's A/B alternation points, surfacing as CP/M's
+    // "Disk Select Error".
+    if (!fdc_apply_drive_select() || !DRV)
+      return;
+
     uint32_t seq = S.wr_seq; // snapshot
     uint8_t want = S.wr_sector;
     uint16_t n = S.xfer_len;
@@ -2825,7 +3353,7 @@ void fdc_disk_task(void) {
 
     SpliceResult sr =
         mfm_write_sector(want, (int)S.track, g_secbuf, n, S.wr_deleted,
-                         FDC_DD_BIT_US, FDC_WRITE_SEARCH_TIMEOUT_US);
+                         fdc_bit_us(), FDC_WRITE_SEARCH_TIMEOUT_US);
 
     fdc_record_splice(sr);
     if (sr.id_found)
@@ -2846,6 +3374,56 @@ void fdc_disk_task(void) {
       // Everything that is not a completed write is RNF to the host: the WD has
       // exactly one "the sector I was told to write is not under this head"
       // status bit. fdc_record_splice's counters are what tell the causes apart.
+      {
+        uint8_t p = S.wrf_pos;
+        S.wrf_trk[p] = S.track;
+        S.wrf_sec[p] = want;
+        S.wrf_side[p] = S.side1 ? 1 : 0;
+        S.wrf_ids[p] = sr.ids_seen;
+        S.wrf_us[p] = sr.search_us;
+        S.wrf_flags[p] = (uint8_t)(
+            (sr.id_found ? 0x01 : 0) | (sr.cyl_mismatch ? 0x02 : 0) |
+            (sr.size_mismatch ? 0x04 : 0) | (sr.late ? 0x08 : 0) |
+            (sr.no_flux ? 0x10 : 0) | (fdc_is_hd() ? 0x20 : 0) |
+            (S.density_host_valid ? 0x40 : 0) |
+            (S.density_host_hd ? 0x80 : 0));
+        S.wrf_ctx[p] = (uint8_t)(
+            (S.motor_on ? 0x01 : 0) | (g_applied_motor ? 0x02 : 0) |
+            ((S.drive_sel & 3) << 2) |
+            (((g_cur_drive < 0) ? 3 : (g_cur_drive & 3)) << 4) |
+            (gpio_get(PIN_DS0) ? 0x40 : 0) | (gpio_get(PIN_DS1) ? 0x80 : 0));
+        {
+          int pt = DRV ? DRV->track() : -1;
+          S.wrf_phys[p] = (pt < 0) ? 0xFE : (uint8_t)pt;
+        }
+        // Post-mortem for a blind hunt: what WAS under the head? One capture,
+        // decoded at both clocks, first ID wins. ~240 ms on a command that
+        // has already failed and that the host is still waiting on.
+        S.wrf_pm_cyl[p] = 0xFF;
+        S.wrf_pm_info[p] = 0;
+        S.wrf_syncs[p] = (uint8_t)((sr.syncs > 255) ? 255 : sr.syncs);
+        S.wrf_badid[p] = (uint8_t)((sr.bad_idam > 255) ? 255 : sr.bad_idam);
+        S.wrf_ovr[p] = (uint8_t)((sr.overrun ? 1 : 0) |
+                                 (sr.pio_overflow ? 2 : 0));
+        if (sr.ids_seen == 0 && !sr.no_flux) {
+          size_t cap = 0;
+          uint8_t *flux = mzp_flux_buffer(&cap);
+          fdc_capture_window(fdc_read_capture_bytes());
+          uint8_t id[6];
+          if (g_flux_n > 0) {
+            if (mfm_read_address(flux, g_flux_n, FDC_HD_BIT_US, id)) {
+              S.wrf_pm_cyl[p] = id[0];
+              S.wrf_pm_info[p] = (uint8_t)(0x80 | 0x02 | (id[1] & 1));
+            } else if (mfm_read_address(flux, g_flux_n, FDC_DD_BIT_US, id)) {
+              S.wrf_pm_cyl[p] = id[0];
+              S.wrf_pm_info[p] = (uint8_t)(0x80 | (id[1] & 1));
+            }
+          }
+          g_flux_n = 0;
+        }
+        S.wrf_pos = (uint8_t)((p + 1) & 7);
+        S.wrf_n++;
+      }
       S.err_rnf = true;
       if (sr.cyl_mismatch) {
         S.sec_cyl_mismatch++;
@@ -2920,8 +3498,10 @@ void fdc_disk_task(void) {
     // took the bytes. Holding BUSY until a drain that never comes deadlocks that
     // host -- observed as CP/M 4.1 looping RESTORE / READ ADDRESS forever, 27031
     // STATUS polls per attempt and xfer=0/6 every time.
-    uint32_t drq_budget =
-        S.read_addr ? FDC_READADDR_DRQ_WINDOW_US : FDC_DRQ_STALL_TIMEOUT_US;
+    uint32_t drq_budget = S.read_addr ? FDC_READADDR_DRQ_WINDOW_US
+                          : (S.xfer_pos == 0)
+                              ? FDC_READ_DRQ_FIRSTBYTE_US
+                              : FDC_DRQ_STALL_TIMEOUT_US;
     if (S.reading && S.drq && !S.pending_force_int &&
         (time_us_32() - S.last_data_read_us) > drq_budget) {
       // Completing an undrained READ ADDRESS is normal, not an error: do not
@@ -2965,6 +3545,11 @@ void fdc_disk_task(void) {
       return;
 
     if (S.rd_fresh) {
+      // Stale-select check (see the select-gate comment above): capturing the
+      // other drive's flux cost a retry per A/B alternation. Only on a FRESH
+      // window -- mid-command (multi-sector reuse) the select must not move.
+      if (!fdc_apply_drive_select() || !DRV)
+        return;
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
       // sync -- a 1.25-revolution window contains every sector regardless of
@@ -2972,7 +3557,7 @@ void fdc_disk_task(void) {
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);
       else
-        fdc_capture_window(FDC_READ_CAPTURE_BYTES);
+        fdc_capture_window(fdc_read_capture_bytes());
       S.rd_fresh = false;
       // core1 can have aborted us while we were blocked capturing.
       if (!S.reading)
@@ -3011,8 +3596,42 @@ void fdc_disk_task(void) {
         }
       } else if (g_flux_n > 0) {
         // WD ID track compare against the Track register -- see MFM_ANY_CYL.
-        sd = mfm_read_sector(flux, g_flux_n, FDC_DD_BIT_US, want, S.track,
+        sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                              g_secbuf, sizeof(g_secbuf));
+        // Nothing AT ALL at the latched density -- not even a wrong-cylinder
+        // ID, which would prove the clock is right and the problem positional.
+        // Re-decode the same window at the other bit clock before reporting
+        // RNF; this is how a swapped-in disk of the other density gets noticed
+        // mid-session. No recapture: the window is time-sized, so it already
+        // holds a full revolution at either density. Gated on a cheap
+        // first-ID check at the CURRENT density: a genuine RNF on readable
+        // media (sector not on this track) must not pay for a probe, and the
+        // check stops at the first ID it finds -- a few ms of flux at most.
+        if (!sd.found && !sd.cyl_mismatch) {
+          uint8_t idtmp[6];
+          if (!mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
+              fdc_try_other_density(flux, g_flux_n))
+            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
+                                 g_secbuf, sizeof(g_secbuf));
+        }
+        // Still not found: grant ONE more revolution before reporting RNF. A
+        // real WD1793 is more patient than a single window -- it keeps
+        // matching ID fields until the FOURTH index pulse. Our single
+        // 1.05-rev capture missed its sector ~0.5% of the time at HD
+        // (measured: 2 RNFs in ~630 format-verify reads, the wanted sector
+        // sitting in the window's wrap region both times), and FORMAT4
+        // aborts the whole format after two closely-spaced misses. A fresh
+        // capture starts at a different rotational phase, so a double miss
+        // is ~0.003%. Costs nothing on the success path; skipped when the
+        // host has already Force-Interrupted (the answer would be dropped)
+        // and on a wrong-cylinder result (another revolution cannot move
+        // the head -- the resync below is the fix for that).
+        if (!sd.found && !sd.cyl_mismatch && S.reading) {
+          fdc_capture_window(fdc_read_capture_bytes());
+          if (S.reading && g_flux_n > 0)
+            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
+                                 g_secbuf, sizeof(g_secbuf));
+        }
       }
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;

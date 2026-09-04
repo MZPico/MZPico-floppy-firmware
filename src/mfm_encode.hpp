@@ -58,10 +58,18 @@ size_t mfm_encode_data_field(uint8_t *flux, size_t max_flux,
 // address marks are ordinary bytes that simply accumulate. MZ-800 media is MFM
 // throughout.
 //
-// Returns flux bytes produced, or 0 if the image would not fit.
+// Returns flux bytes produced. If the image needs more flux than `max_flux`,
+// the buffer is left FULL (the first max_flux transitions of the image),
+// max_flux is returned, and *out_overflow (if given) is set. That is NOT an
+// error for a track write: the write is terminated by the index pulse, so a
+// buffer holding at least one revolution behaves exactly like a real WD being
+// fed a longer image than the track can take -- the index cuts it off. The
+// caller that must not truncate (a bench format validating exact geometry)
+// checks the flag.
 size_t mfm_encode_format_image(uint8_t *flux, size_t max_flux,
                                const uint8_t *image, size_t n_image,
-                               float nominal_bit_time_us);
+                               float nominal_bit_time_us,
+                               bool *out_overflow = nullptr);
 
 // Fill `flux` from `n_flux` onward with encoded 0x4E gap bytes, up to
 // `max_flux`. A track image shorter than one revolution would otherwise leave

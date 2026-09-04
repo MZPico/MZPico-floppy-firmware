@@ -46,7 +46,13 @@ struct SpliceResult {
   bool no_flux;      // no transitions at all (no disk / motor not up)
   uint8_t seen_cyl, seen_head; // ID bytes of the mismatching candidate
   uint8_t size_n;              // size code from the matched ID
-  uint16_t ids_seen;           // ID fields decoded during the search
+  uint16_t ids_seen;           // ID fields decoded (valid CRC) during the search
+  uint16_t syncs;              // triple sync marks found -- a hunt with zero of
+                               // these saw a garbage stream, not bad IDs
+  uint16_t bad_idam;           // sync followed by a non-ID mark or a bad ID CRC
+  bool overrun;                // the DMA ring overran during the hunt
+  bool pio_overflow;           // the PIO RX FIFO overflowed (samples lost at
+                               // the source -- a starved capture pipeline)
   uint32_t search_us;          // time from capture start to the splice/timeout
 };
 
@@ -69,3 +75,11 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
                               const uint8_t *data, uint16_t n_data,
                               bool deleted, float nominal_bit_time_us,
                               uint32_t timeout_us);
+
+// Raw deltas (24 MHz ticks, byte-clamped) of the last BLIND write hunt -- the
+// stream the live decoder saw when it found zero sync marks. `out` must hold
+// 512 bytes; *n is how many, *valid is 0 until a blind hunt has occurred.
+// which: 0 = last BLIND hunt, 1 = first SUCCESSFUL hunt (kept for an A/B of the
+// same code path on the same machine). `out` holds 512 bytes.
+void mfm_splice_debug_flux(uint8_t which, uint8_t *out, uint16_t *n,
+                           uint8_t *valid);
