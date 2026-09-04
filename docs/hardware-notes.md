@@ -118,6 +118,42 @@ VBUS and MZ +5 V into the regulator input.
 While there: add ~10 µF bulk on 3V3. Two 100 n for two '245s plus the module is
 thin.
 
+### 2b. RDATA vs. C0..C7 crosstalk at HD — **the HD write-splice blocker** (field-confirmed 2026-08)
+
+The HD data path works: HD tracks format, read and (on the bench, core1 idle)
+splice-write flawlessly, 160/160. But the HD **write splice under CP/M** fails
+~7% of the time, and exhaustive firmware instrumentation traced it to the
+board, not the code. The failing splice's live decoder sees a garbage symbol
+stream (zero sync marks in 2.3 revolutions) on flux that a fresh capture
+decodes perfectly ~240 ms later; the PIO's RXSTALL flag proves **no samples
+were dropped** — the RDATA *edges themselves* were wrong at capture time.
+
+Why the write splice and not reads, through the same GPIO20: during the splice
+hunt the host polls STATUS thousands of times (~24k), so core1 switches
+`C0..C7` through U2 continuously right next to `~RDATA`. Reads capture once and
+retry on a bad CRC, so they tolerate the occasional corrupted edge (rddiag: 786
+clean, 1 stray bad CRC); the live splice decodes across the whole noisy polling
+window and cannot. **HD only** — the 1 µs bit cell has no margin for the
+coupled noise; DD's 2 µs does (DD is byte-for-byte clean: 530/530 host writes,
+full soaks).
+
+This is the item-1/item-3 signal integrity gap made concrete. Fixes, cheapest
+first:
+- **33 Ω series at U2 on `C0..C7`** (and the `D0..D7` side) to slow the edges
+  that couple — the single highest-value change, already listed in item 3.
+- **Ground the ribbon properly** and keep `~RDATA`'s trace away from the bus;
+  a ground guard trace beside GPIO20.
+- **The buffered input stage (item 1)** with a Schmitt `74LVC17A`/`74LVC14A` on
+  `~RDATA` — hysteresis is exactly the defence against coupled noise on a slow
+  open-collector line, and it settles this for good.
+
+A firmware mitigation exists if the board cannot be changed: capture a full
+revolution first (as a read does, tolerant + retryable), decode it to find the
+target sector's rotational offset from index, then time a blind write into its
+Gap 2 on the following revolution — an **index-relative splice** that decouples
+the noisy decode from the write timing. It is a real amount of new code and is
+not written; the hardware fix is preferred.
+
 ### 3. MZ-800 bus side — mostly right, three additions
 
 The bus side is already sound in principle: `SN74LVC245A` at 3V3 has 5.5 V

@@ -395,7 +395,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
     capture buffer already fit a full HD revolution). Verify bench-first:
     `enctest 18 2 1` (no disk), then `density hd; fmtverify` on a scratch HD
-    disk. See [docs/wd-fidelity.md](docs/wd-fidelity.md).
+    disk. See [docs/wd-fidelity.md](docs/wd-fidelity.md). **HD read/format/bench-write are
+    hardware-verified; the HD write SPLICE under CP/M is blocked by RDATA vs
+    C0..C7 crosstalk at the 1 µs bit cell** (~7% of splices see corrupted
+    flux edges while the host storm-polls STATUS; DD's 2 µs cell is immune,
+    DD is 530/530 clean). Every firmware cause was instrumented out (PIO
+    drops nothing; reads through the same pin are clean and retry). It is a
+    signal-integrity limit of the bare board -- see the RDATA-crosstalk item
+    in [docs/hardware-notes.md](docs/hardware-notes.md) for the fixes (33 Ω
+    series on the bus, grounding, or the buffered input stage) and the
+    index-relative-splice firmware mitigation.
 - **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
   testing (the `wrsoak` run so far is minutes, not hours, and has met only one
   spindle), catching the rare boot `FD:Loading error` with `firstfail`.
