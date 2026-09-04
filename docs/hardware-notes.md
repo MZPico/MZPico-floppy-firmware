@@ -91,7 +91,7 @@ Default to the '07 plus option 1; add headroom only on `~WDATA`/`~STEP` if
 
 **Then move the pull-ups where they belong.** Once the inputs sit behind
 5 V-tolerant buffers, fit proper **1 kΩ to +5 V** at the connector, exactly like
-a real controller, instead of the current 1 kΩ-to-3.3 V bodge on `~RDATA`.
+a real controller, instead of the current 4k7-to-3.3 V bodge on `~RDATA`.
 Better noise margin over a long ribbon, and it is the level the drives were
 designed against. **Do not do this while the pins are bare** — that is precisely
 the hazard above.
@@ -137,8 +137,18 @@ window and cannot. **HD only** — the 1 µs bit cell has no margin for the
 coupled noise; DD's 2 µs does (DD is byte-for-byte clean: 530/530 host writes,
 full soaks).
 
+**Root cause found (2026-08): the RDATA pull-up bodge is 4k7, not the 1 kΩ this
+doc had assumed.** RDATA is open-collector from the drive, so the pull-up alone
+sets the rise time — 4k7 into ~1.5 m of ribbon (~150 pF) is ~0.7 µs, which eats
+the HD 1 µs bit cell and leaves the slow, high-impedance node wide open to
+coupling from the C0..C7 switching next to it. DD's 2 µs cell tolerates it.
+
 This is the item-1/item-3 signal integrity gap made concrete. Fixes, cheapest
 first:
+- **Fit a stiffer RDATA pull-up: 1 kΩ or 680 Ω to 3.3 V** in place of the 4k7 —
+  faster edge, lower impedance, less coupling. A 2-minute resistor swap and the
+  first thing to try; safe (pull-up to 3.3 V on an input, not the 5 V-terminator
+  hazard of item 1).
 - **33 Ω series at U2 on `C0..C7`** (and the `D0..D7` side) to slow the edges
   that couple — the single highest-value change, already listed in item 3.
 - **Ground the ribbon properly** and keep `~RDATA`'s trace away from the bus;

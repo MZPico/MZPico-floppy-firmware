@@ -231,7 +231,7 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Phase 0 (hardware bring-up): DONE** — the board reads *and* writes real
   floppies over USB via the Adafruit greaseweazle Arduino sketch. See
   [docs/PHASE0.md](docs/PHASE0.md) and [docs/hardware-notes.md](docs/hardware-notes.md).
-  One bodge in place: 1 kΩ pull-up on `~RDATA` (GPIO20) to 3.3 V.
+  One bodge in place: **4k7** pull-up on `~RDATA` (GPIO20) to 3.3 V (too weak for HD — a 1 kΩ / 680 Ω swap is the first HD write-splice fix to try; see docs/hardware-notes.md RDATA crosstalk item).
 - **Phase 1 (Pico-SDK greaseweazle firmware): DONE** — a bare Pico-SDK +
   TinyUSB firmware that speaks the greaseweazle protocol, ported from
   Adafruit_Floppy. Builds to `mzpico_floppy.uf2`. See [README.md](README.md).
