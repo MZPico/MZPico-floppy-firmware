@@ -399,11 +399,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     hardware-verified; the HD write SPLICE under CP/M is blocked by RDATA vs
     C0..C7 crosstalk at the 1 µs bit cell** (~7% of splices see corrupted
     flux edges while the host storm-polls STATUS; DD's 2 µs cell is immune,
-    DD is 530/530 clean). Every firmware cause was instrumented out (PIO
-    drops nothing; reads through the same pin are clean and retry). It is a
-    signal-integrity limit of the bare board -- see the RDATA-crosstalk item
-    in [docs/hardware-notes.md](docs/hardware-notes.md) for the fixes (33 Ω
-    series on the bus, grounding, or the buffered input stage) and the
+    DD is 530/530 clean). Every firmware cause was instrumented out across many
+    builds (no PIO RX overflow, no DMA ring lap under a corrected absolute
+    detector, deltas identical to the working read path, and every bench
+    variable -- cadence, read-then-write, cross-drive A→B -- clean); the one
+    remaining difference is core1 driving the bus during the hunt, and the
+    PIO captured garbage edges. A 4k7→1 kΩ RDATA pull-up swap changed nothing,
+    pointing at ground-bounce/shared-return coupling rather than rise time.
+    It is a signal-integrity limit of the bare board -- see the RDATA item in
+    [docs/hardware-notes.md](docs/hardware-notes.md) for the fixes (grounding
+    first, then a Schmitt `~RDATA` buffer or 33 Ω on the bus) and the
     index-relative-splice firmware mitigation.
 - **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
   testing (the `wrsoak` run so far is minutes, not hours, and has met only one

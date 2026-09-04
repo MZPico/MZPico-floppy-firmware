@@ -137,18 +137,39 @@ window and cannot. **HD only** — the 1 µs bit cell has no margin for the
 coupled noise; DD's 2 µs does (DD is byte-for-byte clean: 530/530 host writes,
 full soaks).
 
-**Root cause found (2026-08): the RDATA pull-up bodge is 4k7, not the 1 kΩ this
-doc had assumed.** RDATA is open-collector from the drive, so the pull-up alone
-sets the rise time — 4k7 into ~1.5 m of ribbon (~150 pF) is ~0.7 µs, which eats
-the HD 1 µs bit cell and leaves the slow, high-impedance node wide open to
-coupling from the C0..C7 switching next to it. DD's 2 µs cell tolerates it.
+**Firmware fully ruled out (2026-08), by exhaustive instrumentation.** Across
+many builds the failing splice was shown to have: no PIO RX-FIFO overflow
+(RXSTALL clear, no samples dropped at the source); no DMA ring lap (with a
+corrected absolute-counter overrun detector — the earlier index-masked one
+could alias a full lap, which is why it was rebuilt); deltas computed by the
+identical code the working read path uses; and clean reproduction of every
+bench variable *except* one — cadence, read-then-write, and even the
+read-drive-0-then-write-drive-1 (A→B) topology all splice 160/160 on the
+bench. The single difference left is **core1 driving the Z80 bus during the
+hunt**, and the PIO faithfully captured garbage edges: the RDATA signal was
+electrically corrupted.
 
-This is the item-1/item-3 signal integrity gap made concrete. Fixes, cheapest
-first:
-- **Fit a stiffer RDATA pull-up: 1 kΩ or 680 Ω to 3.3 V** in place of the 4k7 —
-  faster edge, lower impedance, less coupling. A 2-minute resistor swap and the
-  first thing to try; safe (pull-up to 3.3 V on an input, not the 5 V-terminator
-  hazard of item 1).
+**Not the pull-up rise time.** Swapping the RDATA bodge 4k7 → 1 kΩ changed
+nothing (41 → 44 failures). That argues against simple slow-edge/capacitive
+coupling and points at **ground bounce / shared-return coupling**: when core1
+switches the eight C0..C7 lines plus the buffer through the daisy-chained
+grounds, the reference under RDATA moves, and a pull-up to VCC cannot fix a
+moving ground. The board's daisy-chained ribbon grounds (item 1's "give every
+odd pin its own via") are the suspect. HD-only because the 1 µs bit cell has
+no margin for the reference excursion; DD's 2 µs does (DD copies are
+byte-for-byte clean).
+
+This is the item-1/item-3 signal-integrity gap made concrete. Fixes to try,
+cheapest first:
+- **Grounding first, since the pull-up did nothing:** star-ground the ribbon's
+  odd (GND) pins each to the plane instead of daisy-chaining, and add a ground
+  guard trace beside `~RDATA`. This is the change most consistent with the
+  pull-up-insensitive, ground-bounce reading.
+- **A Schmitt buffer on `~RDATA`** (`74LVC17A`/`74LVC14A`, item 1) — hysteresis
+  rejects the reference excursion outright and is the definitive fix.
+- **33 Ω series at U2 on `C0..C7`** to slow the aggressor edges (item 3).
+- A stiffer RDATA pull-up (1 kΩ/680 Ω) is worth keeping anyway but is **not**
+  sufficient on its own — measured.
 - **33 Ω series at U2 on `C0..C7`** (and the `D0..D7` side) to slow the edges
   that couple — the single highest-value change, already listed in item 3.
 - **Ground the ribbon properly** and keep `~RDATA`'s trace away from the bus;
