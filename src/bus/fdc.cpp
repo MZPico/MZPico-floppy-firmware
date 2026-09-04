@@ -3403,7 +3403,8 @@ void fdc_disk_task(void) {
         S.wrf_pm_info[p] = 0;
         S.wrf_syncs[p] = (uint8_t)((sr.syncs > 255) ? 255 : sr.syncs);
         S.wrf_badid[p] = (uint8_t)((sr.bad_idam > 255) ? 255 : sr.bad_idam);
-        S.wrf_ovr[p] = sr.overrun ? 1 : 0;
+        S.wrf_ovr[p] = (uint8_t)((sr.overrun ? 1 : 0) |
+                                 (sr.pio_overflow ? 2 : 0));
         if (sr.ids_seen == 0 && !sr.no_flux) {
           size_t cap = 0;
           uint8_t *flux = mzp_flux_buffer(&cap);

@@ -242,6 +242,7 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
 
   r.no_flux = l.dead && r.ids_seen == 0;
   r.overrun = rp2040_flux_capture_overrun();
+  r.pio_overflow = rp2040_flux_capture_pio_overflow();
   rp2040_flux_capture_stop();
   restore_interrupts(irq);
   rp2040_flux_write_release();

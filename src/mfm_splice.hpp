@@ -51,6 +51,8 @@ struct SpliceResult {
                                // these saw a garbage stream, not bad IDs
   uint16_t bad_idam;           // sync followed by a non-ID mark or a bad ID CRC
   bool overrun;                // the DMA ring overran during the hunt
+  bool pio_overflow;           // the PIO RX FIFO overflowed (samples lost at
+                               // the source -- a starved capture pipeline)
   uint32_t search_us;          // time from capture start to the splice/timeout
 };
 

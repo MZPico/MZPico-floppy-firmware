@@ -68,6 +68,13 @@ int rp2040_flux_capture_next(uint32_t timeout_us);
 // tens of milliseconds of neglect, not the FIFO's 12-24 us.
 bool rp2040_flux_capture_overrun(void);
 
+// True if the PIO RX FIFO overflowed during the capture -- the PIO dropped
+// flux samples because nothing drained the FIFO fast enough. This is loss at
+// the SOURCE, upstream of the ring, and the sticky flag is cleared at each
+// capture start. Distinguishes a starved capture pipeline (this set) from a
+// corrupted RDATA signal (this clear, but decode still garbage).
+bool rp2040_flux_capture_pio_overflow(void);
+
 // Drain and sum whatever deltas are already queued in the ring, in 24 MHz
 // ticks. That backlog is disk time that has ALREADY passed under the head, so
 // a splice that measures its gap with a wall clock has to subtract it.

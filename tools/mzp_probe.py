@@ -922,7 +922,8 @@ def do_wrdiag(s):
             trk, sec, side, ids = r[off], r[off + 1], r[off + 2], r[off + 3]
             fl, ctx, syncs = r[off + 4], r[off + 5], r[off + 6]
             phys, pm_cyl, pm_info = r[off + 7], r[off + 8], r[off + 9]
-            badid, ovr = (pm_info >> 3) & 0xF, bool(pm_info & 4)
+            badid, ovr = (pm_info >> 3) & 0x7, bool(pm_info & 4)
+            pio_ovf = bool(pm_info & 0x40)
             decl = ("decl=" + ("HD" if fl & 0x80 else "DD")) if fl & 0x40 \
                 else "decl=none"
             core0 = (ctx >> 4) & 3
@@ -932,11 +933,18 @@ def do_wrdiag(s):
                   f"clk={'HD' if fl & 0x20 else 'DD'} {decl}  "
                   f"motor={'on' if ctx & 2 else 'OFF!'}"
                   f"{'  RING OVERRUN' if ovr else ''}"
+                  f"{'  PIO FIFO OVERFLOW' if pio_ovf else ''}"
                   f"{'  NO FLUX' if fl & 0x10 else ''}"
                   f"{'  late' if fl & 8 else ''}")
             if ids == 0 and syncs == 0 and not (fl & 0x10):
-                print("        ^ NO sync marks in the whole hunt: the symbol "
-                      "stream was garbage, not a marginal read")
+                if pio_ovf:
+                    print("        ^ NO syncs AND the PIO FIFO overflowed: the "
+                          "capture pipeline was STARVED -- samples lost at the "
+                          "source, not a corrupted signal")
+                else:
+                    print("        ^ NO syncs, PIO FIFO did NOT overflow: the "
+                          "PIO captured every sample and the deltas were still "
+                          "garbage -> the RDATA signal itself was corrupted")
             elif ids == 0 and syncs:
                 print("        ^ syncs found but every ID failed: marginal "
                       "read (or the stream corrupts right after each sync)")

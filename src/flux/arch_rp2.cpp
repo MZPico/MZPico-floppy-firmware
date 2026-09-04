@@ -171,6 +171,16 @@ static void ring_start(void) {
   channel_config_set_dreq(&c, pio_get_dreq(g_reader.pio, g_reader.sm, false));
   g_ring_rd = 0;
   g_ring_overrun = false;
+  // Clear the PIO's sticky RX-FIFO-overflow flag so it reflects only THIS
+  // capture. If it is set at the end, the DMA (or, before it, the CPU) could
+  // not drain the RX FIFO fast enough and the PIO dropped samples at the
+  // source -- which no amount of ring buffering downstream can recover, and
+  // which is what a starved capture pipeline looks like as opposed to a
+  // corrupted RDATA signal (the PIO captures that one just fine, flag clear).
+  // RXSTALL is the RP2040 sticky flag for "the SM tried to push to a full RX
+  // FIFO" -- i.e. a flux sample was dropped because nothing drained fast
+  // enough. Write-1-to-clear so it reflects only this capture.
+  g_reader.pio->fdebug = (1u << (PIO_FDEBUG_RXSTALL_LSB + g_reader.sm));
   // 2^32-1 transfers is ~8 hours at HD rates: effectively endless for any
   // capture this firmware runs. Stopped explicitly by ring_stop().
   dma_channel_configure(g_ring_dma, &c, g_ring, &g_reader.pio->rxf[g_reader.sm],
@@ -403,6 +413,11 @@ int rp2040_flux_capture_next(uint32_t timeout_us) {
 }
 
 bool rp2040_flux_capture_overrun(void) { return g_ring_overrun; }
+
+bool rp2040_flux_capture_pio_overflow(void) {
+  return g_reader.pio &&
+         (g_reader.pio->fdebug & (1u << (PIO_FDEBUG_RXSTALL_LSB + g_reader.sm)));
+}
 
 uint32_t rp2040_flux_capture_backlog(void) {
   uint32_t sum = 0;
