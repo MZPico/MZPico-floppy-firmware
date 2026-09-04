@@ -178,6 +178,7 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
   while (!l.dead && (int32_t)(time_us_32() - deadline) < 0) {
     if (!live_find_sync(&l, deadline))
       break;
+    r.syncs++;
 
     uint8_t idam[1 + mfm_io_idam_size + mfm_io_crc_size]; // mark + ID + CRC
     uint16_t crc = live_receive(&l, idam, sizeof(idam));
@@ -187,8 +188,10 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
     // measured against it, and the checks below cost microseconds.
     uint32_t t_id = time_us_32();
 
-    if (idam[0] != MFM_IO_IDAM || crc != 0)
+    if (idam[0] != MFM_IO_IDAM || crc != 0) {
+      r.bad_idam++;
       continue; // not an ID field, or unreadable -> wait for the next one
+    }
     r.ids_seen++;
     if (idam[3] != want_sec)
       continue;
@@ -238,6 +241,7 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
   }
 
   r.no_flux = l.dead && r.ids_seen == 0;
+  r.overrun = rp2040_flux_capture_overrun();
   rp2040_flux_capture_stop();
   restore_interrupts(irq);
   rp2040_flux_write_release();

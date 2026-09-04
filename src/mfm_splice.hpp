@@ -46,7 +46,11 @@ struct SpliceResult {
   bool no_flux;      // no transitions at all (no disk / motor not up)
   uint8_t seen_cyl, seen_head; // ID bytes of the mismatching candidate
   uint8_t size_n;              // size code from the matched ID
-  uint16_t ids_seen;           // ID fields decoded during the search
+  uint16_t ids_seen;           // ID fields decoded (valid CRC) during the search
+  uint16_t syncs;              // triple sync marks found -- a hunt with zero of
+                               // these saw a garbage stream, not bad IDs
+  uint16_t bad_idam;           // sync followed by a non-ID mark or a bad ID CRC
+  bool overrun;                // the DMA ring overran during the hunt
   uint32_t search_us;          // time from capture start to the splice/timeout
 };
 

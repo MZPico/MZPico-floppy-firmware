@@ -1465,8 +1465,10 @@ void gw_task() {
     // motor, hunt_ms(2)], oldest -> newest. 76 bytes -> 144.
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (d.wrf_n >> (8 * k)) & 0xFF;
-    // 10 bytes per entry: [trk, sec, side, ids(1), flags, ctx, hunt_10ms,
-    // phys, pm_cyl, pm_info]. 76 + 4 + 80 = 160 so far.
+    // 10 bytes per entry: [trk, sec, side, ids(1), flags, ctx, syncs,
+    // phys, pm_cyl, pm_info | (overrun<<2) | (min(badid,15)<<3)].
+    // 76 + 4 + 80 = 160 so far. (The hunt length is always the timeout on a
+    // failure, so that byte now carries the sync count instead.)
     for (int e = 0; e < 8; e++) {
       reply_buffer[i++] = d.wrf_trk[e];
       reply_buffer[i++] = d.wrf_sec[e];
@@ -1475,11 +1477,12 @@ void gw_task() {
           (uint8_t)((d.wrf_ids[e] > 255) ? 255 : d.wrf_ids[e]);
       reply_buffer[i++] = d.wrf_flags[e];
       reply_buffer[i++] = d.wrf_ctx[e];
-      uint32_t t10 = d.wrf_us[e] / 10000;
-      reply_buffer[i++] = (uint8_t)((t10 > 255) ? 255 : t10);
+      reply_buffer[i++] = d.wrf_syncs[e];
       reply_buffer[i++] = d.wrf_phys[e];
       reply_buffer[i++] = d.wrf_pm_cyl[e];
-      reply_buffer[i++] = d.wrf_pm_info[e];
+      uint8_t bad = (d.wrf_badid[e] > 15) ? 15 : d.wrf_badid[e];
+      reply_buffer[i++] = (uint8_t)(d.wrf_pm_info[e] | (d.wrf_ovr[e] ? 0x04 : 0) |
+                                    (bad << 3));
     }
     // Track-write ring: twr_n(4), then 8 x [ds(2), trk, side, phys, nsec,
     // flags, census(2), len(2)] with timestamps in DECISECONDS (u16 covers

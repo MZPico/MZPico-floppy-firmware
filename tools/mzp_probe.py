@@ -24,6 +24,7 @@ Usage:
     python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
+    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed]  # !! back-to-back splices, no read-back (CP/M cadence)
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -919,17 +920,26 @@ def do_wrdiag(s):
         for e in range(shown):  # snapshot emits oldest -> newest in slots 0..n-1
             off = 80 + e * 10
             trk, sec, side, ids = r[off], r[off + 1], r[off + 2], r[off + 3]
-            fl, ctx, t10 = r[off + 4], r[off + 5], r[off + 6]
+            fl, ctx, syncs = r[off + 4], r[off + 5], r[off + 6]
             phys, pm_cyl, pm_info = r[off + 7], r[off + 8], r[off + 9]
+            badid, ovr = (pm_info >> 3) & 0xF, bool(pm_info & 4)
             decl = ("decl=" + ("HD" if fl & 0x80 else "DD")) if fl & 0x40 \
                 else "decl=none"
             core0 = (ctx >> 4) & 3
             print(f"    trk={trk:3d} side={side} sec={sec:2d}  "
-                  f"ids_seen={ids:2d}  hunted {t10 * 10} ms  "
+                  f"ids_seen={ids:2d}  syncs={syncs:3d}  bad-ID={badid}"
+                  f"{'+' if badid == 15 else ''}  "
                   f"clk={'HD' if fl & 0x20 else 'DD'} {decl}  "
                   f"motor={'on' if ctx & 2 else 'OFF!'}"
+                  f"{'  RING OVERRUN' if ovr else ''}"
                   f"{'  NO FLUX' if fl & 0x10 else ''}"
                   f"{'  late' if fl & 8 else ''}")
+            if ids == 0 and syncs == 0 and not (fl & 0x10):
+                print("        ^ NO sync marks in the whole hunt: the symbol "
+                      "stream was garbage, not a marginal read")
+            elif ids == 0 and syncs:
+                print("        ^ syncs found but every ID failed: marginal "
+                      "read (or the stream corrupts right after each sync)")
             print(f"        host drv={(ctx >> 2) & 3}  core0 drv="
                   f"{'none' if core0 == 3 else core0}  "
                   f"~DS0={'asserted' if not (ctx & 0x40) else 'released'} "
@@ -1514,6 +1524,23 @@ def main():
             dens = (int(sys.argv[6]) if len(sys.argv) > 6
                     else effective_density(s))
             do_fdcread(s, track, sector, side, dens)
+        elif cmd == "wrburst":
+            # !! WRITES THE DISK. Consecutive splices on one track with NO
+            # read-back between them -- CP/M's cadence (the next WRITE lands
+            # milliseconds after the previous WGATE release), which the soak
+            # never reproduces because it reads back after every write.
+            track = int(sys.argv[3])
+            side = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+            nsec = int(sys.argv[5]) if len(sys.argv) > 5 else 18
+            seed = int(sys.argv[6], 0) if len(sys.argv) > 6 else 0x5A
+            fails = 0
+            for sec in range(1, nsec + 1):
+                ok = do_fdcwrite(s, track, sec, side, 2, 2, (seed + sec) & 0xFF)
+                if not ok:
+                    fails += 1
+            print(f"burst done: {nsec - fails}/{nsec} spliced on track {track} "
+                  f"side {side}; now `wrdiag` for the ring and "
+                  f"`scan {track} {side}` for the media")
         elif cmd in ("fdcwrite", "wrverify"):
             # THESE WRITE TO THE DISK. args: track sector [side] [sizecode]
             #                                [mode] [seed]
