@@ -24,7 +24,7 @@ Usage:
     python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
-    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack]  # !! back-to-back splices; rdtrack = read that track before each (CP/M read->write)
+    python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive]  # !! splices; read rdtrack (from rddrive) before each = CP/M A->B
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -1548,20 +1548,43 @@ def main():
             nsec = int(sys.argv[5]) if len(sys.argv) > 5 else 18
             seed = int(sys.argv[6], 0) if len(sys.argv) > 6 else 0x5A
             rdtrack = int(sys.argv[7]) if len(sys.argv) > 7 else -1
+            # 8th arg = drive to READ from before each splice (default: the
+            # write drive). CP/M copies A->B: it reads the source from drive 0,
+            # then SELECTS drive 1 and writes. Every earlier bench test stayed
+            # on one drive; this alternates, so the drive-0-read -> drive-1-write
+            # transition -- and any cross-drive RDATA bleed from the spinning
+            # source drive -- is finally on the bench.
+            rddrive = int(sys.argv[8]) if len(sys.argv) > 8 else -1
+            wrdrive = None
+            if rddrive >= 0:
+                # remember the write drive so we can flip back to it
+                s.write(bytes([MZP_CMD_DRVSEL, 3, 4]))  # query
+                s.flush()
+                q = read_exact(s, 5)
+                wrdrive = q[2] if len(q) == 5 else 1
             fails = 0
             for sec in range(1, nsec + 1):
                 if rdtrack >= 0:
+                    if rddrive >= 0:
+                        s.write(bytes([MZP_CMD_DRVSEL, 3, rddrive]))
+                        s.flush(); read_exact(s, 5)
                     dens = effective_density(s)
                     s.write(bytes([MZP_CMD_FDCREAD, 6, rdtrack, 1, side, dens]))
                     s.flush()
                     hdr = read_exact(s, 5)
                     if len(hdr) == 5 and hdr[3] | (hdr[4] << 8):
                         read_exact(s, hdr[3] | (hdr[4] << 8))
+                    if rddrive >= 0 and wrdrive is not None:
+                        s.write(bytes([MZP_CMD_DRVSEL, 3, wrdrive]))
+                        s.flush(); read_exact(s, 5)
                 ok = do_fdcwrite(s, track, sec, side, 2, 2, (seed + sec) & 0xFF)
                 if not ok:
                     fails += 1
-            note = f" (reading track {rdtrack} before each)" if rdtrack >= 0 \
-                else ""
+            note = ""
+            if rdtrack >= 0:
+                note = f" (reading track {rdtrack}" + \
+                    (f" from drive {rddrive}" if rddrive >= 0 else "") + \
+                    " before each)"
             print(f"burst done: {nsec - fails}/{nsec} spliced on track {track} "
                   f"side {side}{note}; now `wrdiag` for the ring and "
                   f"`scan {track} {side}` for the media")
