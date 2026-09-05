@@ -1,8 +1,6 @@
 #include "mfm_splice.hpp"
 
 #include "board_config.h"
-#include "hardware/gpio.h"
-#include "hardware/structs/sio.h"
 #include "flux/arch_rp2.h"
 #include "mfm_encode.hpp"
 
@@ -40,57 +38,14 @@ constexpr uint32_t SPLICE_SYMBOL_TIMEOUT_US = 10000;
 // signal, noise, a wrong clock, zeros and a stuck line all look different in
 // the raw deltas. Recorded during every hunt; latched on a blind failure.
 constexpr int HUNT_DBG_N = 512;
-static uint8_t g_hunt_dbg[HUNT_DBG_N]; // ring: holds the LAST HUNT_DBG_N symbols
-static uint32_t g_hunt_dbg_wr = 0;     // total symbols this hunt (ring wr index)
+static uint8_t g_hunt_dbg[HUNT_DBG_N];
+static uint16_t g_hunt_dbg_n = 0;
 static uint8_t g_hunt_fail[HUNT_DBG_N];
 static uint16_t g_hunt_fail_n = 0;
-static uint32_t g_hunt_fail_total = 0; // total symbols the failed hunt processed
 static bool g_hunt_fail_valid = false;
 static uint8_t g_hunt_ok[HUNT_DBG_N];
 static uint16_t g_hunt_ok_n = 0;
 static bool g_hunt_ok_valid = false;
-// Sync-search forensics for the last blind hunt: symbol histogram and how many
-// of the 14-symbol 0xA1 triple-sync the matcher ever got right in a row.
-static uint32_t g_sym_2t, g_sym_3t, g_sym_4t;
-static uint8_t g_sync_best; // best partial match, in symbols (max 14)
-static uint32_t g_sym_2t_f, g_sym_3t_f, g_sym_4t_f;
-static uint8_t g_sync_best_f;
-// Pin state during the hunt. The blind-hunt flux is a clean ~1 MHz tone that
-// cannot be the disk (the same track post-mortems fine 240 ms later), so
-// something DRIVES GPIO20 while the splice's state is active. Measure the
-// pins rather than reason about them: raw GPIO input word, output-enable
-// word, and GPIO20's pad function, at hunt start and end.
-struct HuntPins { uint32_t in_start, in_end, oe_start, oe_end; uint8_t f20, f17, f18; };
-static HuntPins g_hunt_pins_cur, g_hunt_pins_fail;
-// Pulse widths (low, high alternating, u16-clamped counts) of the first 512
-// pulses of the last BLIND hunt and of the FIRST successful hunt (reference).
-constexpr int PWMON_N = 1024;
-static uint16_t g_pw_fail[PWMON_N];
-static uint16_t g_pw_fail_n = 0;
-static bool g_pw_fail_valid = false;
-static uint16_t g_pw_ok[PWMON_N];
-static uint16_t g_pw_ok_n = 0;
-static bool g_pw_ok_valid = false;
-static void hunt_dbg_linearise(uint8_t *dst, uint16_t *dst_n) {
-  uint32_t total = g_hunt_dbg_wr;
-  uint32_t cnt = total < HUNT_DBG_N ? total : HUNT_DBG_N;
-  uint32_t first = total - cnt; // absolute index of the oldest kept symbol
-  for (uint32_t k = 0; k < cnt; ++k)
-    dst[k] = g_hunt_dbg[(first + k) % HUNT_DBG_N];
-  *dst_n = (uint16_t)cnt;
-}
-static void pw_latch(uint16_t *dst, uint16_t *dst_n, uint32_t n) {
-  const uint32_t *src = rp2040_pwmon_buf();
-  if (n > PWMON_N)
-    n = PWMON_N;
-  for (uint32_t k = 0; k < n; ++k)
-    dst[k] = (uint16_t)(src[k] > 0xFFFF ? 0xFFFF : src[k]);
-  *dst_n = (uint16_t)n;
-}
-static inline void snap_pins(uint32_t *in, uint32_t *oe) {
-  *in = sio_hw->gpio_in;
-  *oe = sio_hw->gpio_oe;
-}
 
 // Live MFM symbol source: the buffered decoder's mfm_io_read_symbol() reads
 // pulses[pos++] out of an array, this one takes the next transition off the
@@ -106,25 +61,21 @@ struct LiveIo {
 
 inline int live_symbol(LiveIo *l) {
   int d = rp2040_flux_capture_next(SPLICE_SYMBOL_TIMEOUT_US);
-  g_hunt_dbg[g_hunt_dbg_wr % HUNT_DBG_N] =
-      (d < 0) ? 0 : (d > 255 ? 255 : (uint8_t)d);
-  g_hunt_dbg_wr++;
+  if (g_hunt_dbg_n < HUNT_DBG_N)
+    g_hunt_dbg[g_hunt_dbg_n++] = (d < 0) ? 0 : (d > 255 ? 255 : (uint8_t)d);
   if (d < 0) {
     l->dead = true;
     return mfm_io_pulse_10; // harmless filler; callers check `dead`
   }
   l->nsym++;
   if (d > (int)l->T3_max) {
-    g_sym_4t++;
     l->saw_long = true;
     return mfm_io_pulse_1000;
   }
   if (d > (int)l->T2_max) {
-    g_sym_3t++;
     l->saw_long = true;
     return mfm_io_pulse_100;
   }
-  g_sym_2t++;
   return mfm_io_pulse_10;
 }
 
@@ -133,13 +84,6 @@ bool live_find_sync(LiveIo *l, uint32_t deadline_us) {
   uint32_t state = 0;
   while (state != mfm_io_triple_mark_magic) {
     state = ((state << 2) | (uint32_t)live_symbol(l)) & mfm_io_triple_mark_mask;
-    // How many trailing 2-bit symbols of `state` agree with the target: the
-    // depth the matcher reached before a symbol broke the run.
-    uint32_t diff = (state ^ mfm_io_triple_mark_magic) & mfm_io_triple_mark_mask;
-    uint8_t match = 0;
-    while (match < 14 && (diff & 3u) == 0) { diff >>= 2; match++; }
-    if (match > g_sync_best)
-      g_sync_best = match;
     if (l->dead)
       return false;
     // Wrong bit clock: at the correct density every gap and ID carries 3T/4T
@@ -206,30 +150,6 @@ uint16_t live_receive(LiveIo *l, uint8_t *buf, size_t n) {
 
 } // namespace
 
-void mfm_splice_debug_pw(uint8_t which, const uint16_t **out, uint16_t *n,
-                         uint8_t *valid) {
-  *out = which ? g_pw_ok : g_pw_fail;
-  *n = which ? g_pw_ok_n : g_pw_fail_n;
-  *valid = (which ? g_pw_ok_valid : g_pw_fail_valid) ? 1 : 0;
-}
-
-void mfm_splice_debug_pins(uint32_t *in_start, uint32_t *in_end,
-                           uint32_t *oe_start, uint32_t *oe_end,
-                           uint8_t *f20, uint8_t *f17, uint8_t *f18) {
-  *in_start = g_hunt_pins_fail.in_start;
-  *in_end = g_hunt_pins_fail.in_end;
-  *oe_start = g_hunt_pins_fail.oe_start;
-  *oe_end = g_hunt_pins_fail.oe_end;
-  *f20 = g_hunt_pins_fail.f20;
-  *f17 = g_hunt_pins_fail.f17;
-  *f18 = g_hunt_pins_fail.f18;
-}
-
-uint32_t mfm_splice_debug_flux_total(void) { return g_hunt_fail_total; }
-void mfm_splice_debug_sync(uint32_t *n2t, uint32_t *n3t, uint32_t *n4t,
-                           uint8_t *best) {
-  *n2t = g_sym_2t_f; *n3t = g_sym_3t_f; *n4t = g_sym_4t_f; *best = g_sync_best_f;
-}
 void mfm_splice_debug_flux(uint8_t which, uint8_t *out, uint16_t *n,
                            uint8_t *valid) {
   const uint8_t *src = which ? g_hunt_ok : g_hunt_fail;
@@ -279,16 +199,9 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
     return r;
 
   LiveIo l;
-  g_hunt_dbg_wr = 0;
-  g_sym_2t = g_sym_3t = g_sym_4t = 0;
-  g_sync_best = 0;
+  g_hunt_dbg_n = 0;
   uint32_t irq = save_and_disable_interrupts();
   uint32_t t_start = time_us_32();
-  snap_pins(&g_hunt_pins_cur.in_start, &g_hunt_pins_cur.oe_start);
-  g_hunt_pins_cur.f20 = (uint8_t)gpio_get_function(PIN_RDATA);
-  g_hunt_pins_cur.f17 = (uint8_t)gpio_get_function(PIN_WGATE);
-  g_hunt_pins_cur.f18 = (uint8_t)gpio_get_function(PIN_WDATA);
-  bool pwmon_on = false;
 
   if (!rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA)) {
     restore_interrupts(irq);
@@ -296,7 +209,6 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
     r.no_flux = true;
     return r;
   }
-  pwmon_on = rp2040_pwmon_start(PIN_RDATA); // pulse-shape monitor, DMA-fed
 
   l.T2_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 2.5e-6f);
   l.T3_max = (uint16_t)lroundf(GW_SF * nominal_bit_time_us * 3.5e-6f);
@@ -372,24 +284,18 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
   }
 
   r.no_flux = l.dead && r.ids_seen == 0;
-  snap_pins(&g_hunt_pins_cur.in_end, &g_hunt_pins_cur.oe_end);
-  uint32_t pw_n = pwmon_on ? rp2040_pwmon_stop() : 0;
   r.overrun = rp2040_flux_capture_overrun();
   r.pio_overflow = rp2040_flux_capture_pio_overflow();
   rp2040_flux_capture_stop();
   if (r.ids_seen == 0 && !r.no_flux) { // blind: latch the stream we just saw
-    g_hunt_pins_fail = g_hunt_pins_cur;
-    pw_latch(g_pw_fail, &g_pw_fail_n, pw_n);
-    g_pw_fail_valid = pw_n > 0;
-    hunt_dbg_linearise(g_hunt_fail, &g_hunt_fail_n);
-    g_hunt_fail_total = g_hunt_dbg_wr;
-    g_sym_2t_f = g_sym_2t; g_sym_3t_f = g_sym_3t; g_sym_4t_f = g_sym_4t;
-    g_sync_best_f = g_sync_best;
+    g_hunt_fail_n = g_hunt_dbg_n;
+    for (uint16_t k = 0; k < g_hunt_dbg_n; ++k)
+      g_hunt_fail[k] = g_hunt_dbg[k];
     g_hunt_fail_valid = true;
   } else if (r.id_found && !g_hunt_ok_valid) { // first good hunt: keep for A/B
-    pw_latch(g_pw_ok, &g_pw_ok_n, pw_n);
-    g_pw_ok_valid = pw_n > 0;
-    hunt_dbg_linearise(g_hunt_ok, &g_hunt_ok_n);
+    g_hunt_ok_n = g_hunt_dbg_n;
+    for (uint16_t k = 0; k < g_hunt_dbg_n; ++k)
+      g_hunt_ok[k] = g_hunt_dbg[k];
     g_hunt_ok_valid = true;
   }
   restore_interrupts(irq);

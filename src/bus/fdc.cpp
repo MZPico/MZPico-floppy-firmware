@@ -3367,9 +3367,31 @@ void fdc_disk_task(void) {
       return;
     }
 
+    float bit = fdc_bit_us();
     SpliceResult sr =
         mfm_write_sector(want, (int)S.track, g_secbuf, n, S.wr_deleted,
-                         fdc_bit_us(), FDC_WRITE_SEARCH_TIMEOUT_US);
+                         bit, FDC_WRITE_SEARCH_TIMEOUT_US);
+
+    // Wrong bit clock? A hunt that saw flux but found ZERO sync marks is the
+    // signature of decoding at the wrong density: an HD track read with DD
+    // thresholds classifies every interval as 2T, so the 0xA1 sync (which
+    // needs 3T/4T) can never form. fdc_is_hd() reads the host's 0xDE
+    // declaration, and a cross-core read of it can lag the write that
+    // prompted this splice, so the density can be momentarily wrong here.
+    // Nothing was written (no ID matched), so retry once at the other density
+    // -- the read path already does the same -- and adopt whichever works.
+    // The hunt itself bails after ~12k symbols with no 3T/4T (see
+    // live_find_sync), so the wrong-density attempt costs milliseconds.
+    if (sr.syncs == 0 && !sr.id_found && !sr.no_flux) {
+      float other = (bit == FDC_HD_BIT_US) ? FDC_DD_BIT_US : FDC_HD_BIT_US;
+      SpliceResult sr2 =
+          mfm_write_sector(want, (int)S.track, g_secbuf, n, S.wr_deleted,
+                           other, FDC_WRITE_SEARCH_TIMEOUT_US);
+      if (sr2.id_found || sr2.syncs > 0) {
+        sr = sr2;
+        fdc_note_density(other == FDC_HD_BIT_US);
+      }
+    }
 
     fdc_record_splice(sr);
     if (sr.id_found)
