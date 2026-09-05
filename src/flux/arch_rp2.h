@@ -97,3 +97,11 @@ void rp2040_flux_write_release(void);
 #ifdef __cplusplus
 }
 #endif
+
+// RDATA pulse-width monitor (diagnostic): a spare PIO SM measures every pulse's
+// LOW then HIGH duration (alternating u32 counts, 3 PIO cycles per count at
+// clkdiv 1 -> width_ns = count * 3e9 / clk_sys). A one-shot DMA captures the
+// first 1024 words (512 pulses) after start. Zero cost to the capture path.
+bool rp2040_pwmon_start(int read_pin);
+uint32_t rp2040_pwmon_stop(void);      // returns words captured (<= 1024)
+const uint32_t *rp2040_pwmon_buf(void); // the captured counts

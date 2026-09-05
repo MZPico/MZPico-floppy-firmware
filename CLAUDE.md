@@ -395,28 +395,37 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
     capture buffer already fit a full HD revolution). Verify bench-first:
     `enctest 18 2 1` (no disk), then `density hd; fmtverify` on a scratch HD
-    disk. See [docs/wd-fidelity.md](docs/wd-fidelity.md). **HD read/format/bench-write are
-    hardware-verified; the HD write SPLICE under CP/M is blocked by RDATA vs
-    C0..C7 crosstalk at the 1 µs bit cell** (~7% of splices see corrupted
-    flux edges while the host storm-polls STATUS; DD's 2 µs cell is immune,
-    DD is 530/530 clean). Every firmware cause was instrumented out across many
-    builds (no PIO RX overflow, no DMA ring lap under a corrected absolute
-    detector, deltas identical to the working read path, and every bench
-    variable -- cadence, read-then-write, cross-drive A→B -- clean); the one
-    remaining difference is core1 driving the bus during the hunt, and the
-    PIO captured garbage edges. A 4k7→1 kΩ RDATA pull-up swap changed nothing,
-    pointing at ground-bounce/shared-return coupling rather than rise time.
-    It is a signal-integrity limit of the bare board -- see the RDATA item in
-    [docs/hardware-notes.md](docs/hardware-notes.md) for the fixes (grounding
-    first, then a Schmitt `~RDATA` buffer or 33 Ω on the bus) and the
-    index-relative-splice firmware mitigation. `huntflux` later
-    showed the failing hunt reads the real HD signal with DOUBLED transition
-    density (extra edges), i.e. coupled noise or a second drive's flux
-    superimposing on the shared RDATA -- a hardware limit, not firmware.
-    **Do not host-write HD disks you care about until it is fixed** -- a
-    mistimed splice can damage a track (one corrupted a CP/M image during this
-    bring-up; rewriting the image cured a scary but false 'firmware' regression
-    -- media, not code).
+    disk. See [docs/wd-fidelity.md](docs/wd-fidelity.md). **HD: read, format, data-disk use and single-drive host
+    writes are hardware-verified** (CP/M `SAVE` to B: 143/143, RNF 0). Two
+    real bugs were found and fixed on the way, and both had been masquerading
+    as "corrupted RDATA" for a long time -- the signal was clean throughout,
+    proven by a PIO pulse-width monitor (`pwmon`):
+    1. **The splice decoded HD flux at DD thresholds** intermittently
+       (`fdc_bit_us()` reads the host's 0xDE declaration, which a cross-core
+       read can lag): every interval classified as 2T, so the 0xA1 sync (3T/
+       4T) could never form -- `syncs=0` for 2 revolutions of a perfect
+       signal. Fixed: a hunt that sees flux but zero syncs bails in ~24 ms
+       and retries at the other density, adopting whichever works.
+    2. **SEEK folded `Data - Track` into head_target.** That reaches Data only
+       while the host's Track register equals our position, and by design
+       they are free to disagree. Fixed: SEEK folds the absolute cylinder.
+    Also added: every multi-step seek (and the select catch-up seek) is
+    verified by reading an ID before the Type II guard opens
+    (`fdc_verify_arrival`, counted in `firstfail`).
+    **Open item -- two-drive A->B copy under CP/M.** ~7 of ~540 writes fail
+    wrong-cylinder: CP/M returns to the directory (track 2) with a STEP-OUT/
+    FORCE-INT burst and the head physically stops short (disk says 4..15,
+    head_target correctly 2). Everything firmware-side is excluded: core1
+    folds every STEP (head_target is right), the firmware resync is innocent
+    (`posfix 0` gives identical failures), the verified seek paths never fire,
+    and the identical A/B alternation with seeks to 0 is clean on the bench
+    (`fdcseek`, core1 idle). The remaining difference is core1 bus activity
+    during the move. **Next measurement is a scope on STEP (GPIO14) and DIR
+    (GPIO15) during `PIP B:=A:*.*`** -- pulses present while the head stays
+    put means the drive/cable, pulses absent or DIR glitching means the
+    board. The ID track compare makes this fail safe: no wrong-cylinder write
+    has ever reached the media. Two-drive HD copies therefore end with a
+    "Verify" error on some directory updates; single-drive HD use is fine.
 - **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
   testing (the `wrsoak` run so far is minutes, not hours, and has met only one
   spindle), catching the rare boot `FD:Loading error` with `firstfail`.

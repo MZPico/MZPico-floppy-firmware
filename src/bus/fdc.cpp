@@ -1664,13 +1664,22 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       bool update = (cmd & 0x10) != 0; // WD 'u' bit (STEP / STEP IN / STEP OUT)
       int steps = 0;
       bool restore = false;
+      bool seek_abs = false;
       switch (hi) {
       case 0x0: // RESTORE: step out to TRK00, Track := 0
         restore = true;
         S.track = 0;
         break;
-      case 0x1: // SEEK: step (Data - Track) cylinders, Track := Data
-        steps = (int)S.data - (int)S.track;
+      case 0x1: // SEEK: go to the ABSOLUTE cylinder in Data, Track := Data.
+        // A real WD steps (Data - Track) times, which reaches Data only while
+        // its Track register is accurate. Ours is the HOST's bookkeeping and is
+        // free to disagree with head_target, our real position (see the
+        // head-position design) -- and it does: in an A->B copy CP/M restores
+        // drive B's Track register on re-select, and if that value is stale
+        // a delta fold computes the wrong step count. The host's intent with
+        // SEEK is "be at cylinder Data", so fold that absolute target rather
+        // than a delta from a register we do not trust.
+        seek_abs = true;
         S.track = S.data;
         break;
       case 0x2:
@@ -1699,6 +1708,13 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       if (restore) {
         S.head_target[fdc_drive_idx()] = 0;
         S.restore_req++; // force a physical TRK00 seek even if we think we're there
+      } else if (seek_abs) {
+        int t = (int)S.data;
+        if (t < 0)
+          t = 0;
+        if (t > FDC_MAX_CYLINDER)
+          t = FDC_MAX_CYLINDER;
+        S.head_target[fdc_drive_idx()] = (int16_t)t;
       } else {
         // Clamp HERE, per command -- this is the end-stop absorption a real
         // drive performs on every surplus pulse. See head_target.

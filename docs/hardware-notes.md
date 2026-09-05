@@ -118,6 +118,40 @@ VBUS and MZ +5 V into the regulator input.
 While there: add ~10 µF bulk on 3V3. Two 100 n for two '245s plus the module is
 thin.
 
+### 2c. **CONCLUSION (2026-08): the HD write faults were firmware, not signal integrity** -- 2b is superseded
+
+The RDATA-integrity conclusion in 2b was overturned by direct measurement. A
+firmware pulse-width monitor (an independent PIO state machine, 15 ns
+resolution) measured the RDATA pulses during an actual blind hunt: LOW ~465 ns,
+HIGH ~1500 ns, period ~1965 ns -- a clean 2 us MFM train, byte-for-byte the
+same shape as a successful bench hunt. No doubling, no glitching, no noise on
+the wire. The "2x density / halved intervals" reading was a misinterpretation:
+a delta of ~48 is the CORRECT reading of a uniform 2T field (a run of 0x00 --
+exactly what CP/M SAVE writes, and what a presync looks like). The pin snapshot
+separately showed WGATE not asserted and RDATA a proper input we do not drive.
+
+So the signal is clean and the fault is in the DECODE PIPELINE under core1
+activity: the live sync search fails to lock on a clean signal during a host
+STATUS-poll storm, while the bench (same clean signal, core1 idle) always
+locks. This is a FIRMWARE problem, not a board one. The buffered-RDATA / 33 ohm
+hardware fixes in 2b remain good hygiene for the next board but are NOT the fix
+for this fault.
+
+**Final state.** Two firmware bugs were the cause of the blind hunts: the
+splice decoding HD flux at DD thresholds (intermittent, from a lagging
+cross-core read of the host's 0xDE declaration) and SEEK folding a Track-
+register delta instead of the absolute cylinder. Both fixed; HD read, format,
+data-disk use and single-drive host writes are verified. One item remains
+open and is NOT firmware: in a two-drive A->B copy CP/M's STEP-OUT/FORCE-INT
+burst back to the directory track leaves drive B's head physically short
+(~7 of ~540 writes), while the identical alternation is clean on the bench
+with core1 idle, every STEP is folded correctly, and the firmware resync is
+proven innocent (`posfix 0` identical). The remaining difference is core1 bus
+activity during the move, so the next measurement is a scope on STEP (GPIO14)
+and DIR (GPIO15) during the copy. The 2b hardware items (buffered RDATA, 33 R
+on the bus, grounding) remain good next-revision hygiene but are not the fix
+for anything observed.
+
 ### 2b. RDATA vs. C0..C7 crosstalk at HD — **the HD write-splice blocker** (field-confirmed 2026-08)
 
 The HD data path works: HD tracks format, read and (on the bench, core1 idle)
@@ -177,6 +211,39 @@ cheapest first:
 - **The buffered input stage (item 1)** with a Schmitt `74LVC17A`/`74LVC14A` on
   `~RDATA` — hysteresis is exactly the defence against coupled noise on a slow
   open-collector line, and it settles this for good.
+
+**Single-drive test settles it (2026-08): coupled noise, NOT two-drive
+superposition.** With the other drive's disk ejected -- one drive, nothing else
+to overlay flux on the shared RDATA -- an HD write from CP/M (`SAVE` to B:, A:
+ejected so nothing reloads) STILL blind-hunts: 4 RNF in ~145 sector writes,
+syncs=0, and `huntflux` shows the same ~2x transition density (48/72/96 vs a
+good hunt's 95/143/192). So the extra edges are injected by core1's bus
+switching during the hunt, not by a second drive. The second drive only makes
+it worse (~7% two-drive vs ~2.8% single-drive -- more RDATA activity/loading).
+Then with drive A's data cable physically OFF the rate was unchanged (5 RNF in
+143 writes): drive A is fully exonerated, cable loading included. And the raw
+stream refines the mechanism: it is NOT random noise. huntflux shows a tightly
+clustered, PERIODIC (period-6) pattern -- the structure of a repeating byte,
+MFM-encoded, at 2x the good hunt's rate. Random coupled edges would smear the
+intervals; this is a SYSTEMATIC doubling -- a consistent extra edge per
+transition (double-triggering on the RDATA pulse's recovery edge, pushed over
+the input threshold by core1's switching), or a coherent 2x-rate signal on the
+line. Either way hysteresis on the RDATA input is the direct defence.
+**Firmware fully cleared (2026-08, fee9e29 pin snapshot).** On a blind hunt:
+WGATE high (OE=0, not asserted), RDATA a proper SIO input (OE=0, we are not
+driving it), WDATA the prepared write SM held static high. So it is not a
+stuck WGATE, not us driving our own input, not a pad misconfig. The min-low
+deglitch (require the line low >= ~83 ns) did NOT reduce the failures, so the
+extra transitions are REAL full-width pulses, not brief threshold glitches.
+And every blind-hunt interval (49..95) is shorter than a good hunt's smallest
+valid interval (2T ~= 95), so RDATA physically carries a ~2x-density pulse
+train during the hunt -- twice the transitions the disk should produce --
+which vanishes by the post-mortem 240 ms later. This is a physical signal on
+the wire, from the drive/line, that no firmware change touches.
+
+**The decisive next measurement is an oscilloscope on GPIO20 during an HD
+`SAVE`: do the RDATA pulses double-bottom / double up?** That ends the
+question outright. Fix is RDATA vs the bus, not the drive/cable/select side:
 
 **Raw-flux evidence (2026-08, `huntflux`):** a successful HD hunt reads a clean
 2:3:4 interval distribution (this disk's true 2T/3T/4T); a failed hunt reads the

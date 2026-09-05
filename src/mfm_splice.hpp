@@ -83,3 +83,23 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
 // same code path on the same machine). `out` holds 512 bytes.
 void mfm_splice_debug_flux(uint8_t which, uint8_t *out, uint16_t *n,
                            uint8_t *valid);
+// Total symbols the last blind hunt processed (the dump above is its LAST 512).
+uint32_t mfm_splice_debug_flux_total(void);
+// Sync-search forensics of the last blind hunt: symbol histogram (2T/3T/4T)
+// and the best partial match of the 14-symbol sync the matcher reached.
+void mfm_splice_debug_sync(uint32_t *n2t, uint32_t *n3t, uint32_t *n4t,
+                           uint8_t *best);
+
+// Pin state latched on the last BLIND hunt: raw GPIO input and output-enable
+// words at hunt start/end, and the pad function of RDATA(20)/WGATE(17)/
+// WDATA(18). Answers "was WGATE asserted?" and "was anything driving GPIO20?"
+void mfm_splice_debug_pins(uint32_t *in_start, uint32_t *in_end,
+                           uint32_t *oe_start, uint32_t *oe_end,
+                           uint8_t *f20, uint8_t *f17, uint8_t *f18);
+
+// Pulse widths of the first 512 pulses of the last BLIND hunt (which=0) or the
+// first successful hunt (which=1): alternating LOW, HIGH counts, 3 PIO cycles
+// each at clk_sys (u16-clamped). Reconstructs the pulse shape of the event
+// the scope could not trigger on.
+void mfm_splice_debug_pw(uint8_t which, const uint16_t **out, uint16_t *n,
+                         uint8_t *valid);
