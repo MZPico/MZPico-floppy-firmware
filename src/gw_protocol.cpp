@@ -83,7 +83,6 @@
 #define MZP_CMD_IDXBIT 0x9F    // Type I STATUS Index bit on/off (default on)
 #define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
 #define MZP_CMD_DENSEL 0xA1    // DENSEL pin override: 0/1 force, 2 auto, 3 query
-#define MZP_CMD_HUNTFLUX 0xA3  // raw deltas of the last blind write hunt
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1339,22 +1338,6 @@ void gw_task() {
     cdc_write_all(reply_buffer, i);
   }
 
-  else if (cmd == MZP_CMD_HUNTFLUX) {
-    // [cmd, ACK, valid, n_lo, n_hi, deltas[n]] -- the stream a blind hunt saw.
-    static uint8_t fx[512];
-    uint16_t n = 0;
-    uint8_t valid = 0;
-    uint8_t which = cmd_buffer[2]; // 0 = blind hunt, 1 = successful hunt
-    mfm_splice_debug_flux(which, fx, &n, &valid);
-    reply_buffer[i++] = GW_ACK_OK;
-    reply_buffer[i++] = valid;
-    reply_buffer[i++] = (uint8_t)(n & 0xFF);
-    reply_buffer[i++] = (uint8_t)(n >> 8);
-    cdc_write_all(reply_buffer, i);
-    if (n)
-      cdc_write_all(fx, n);
-  }
-
   else if (cmd == MZP_CMD_DENSEL) {
     // cmd_buffer[2]: 0/1 = pin that level, 2 = follow density, 3 = query.
     // Reply: [cmd, ACK, override(-1/0/1 as u8), pin level now (0xFF unknown)].
@@ -1483,10 +1466,8 @@ void gw_task() {
     // motor, hunt_ms(2)], oldest -> newest. 76 bytes -> 144.
     for (int k = 0; k < 4; k++)
       reply_buffer[i++] = (d.wrf_n >> (8 * k)) & 0xFF;
-    // 10 bytes per entry: [trk, sec, side, ids(1), flags, ctx, syncs,
-    // phys, pm_cyl, pm_info | (ringovr<<2) | (min(badid,7)<<3) | (pioovf<<6)].
-    // 76 + 4 + 80 = 160 so far. (The hunt length is always the timeout on a
-    // failure, so that byte now carries the sync count instead.)
+    // 10 bytes per entry: [trk, sec, side, ids(1), flags, ctx, hunt_10ms,
+    // phys, 0, 0]. 76 + 4 + 80 = 160 so far.
     for (int e = 0; e < 8; e++) {
       reply_buffer[i++] = d.wrf_trk[e];
       reply_buffer[i++] = d.wrf_sec[e];
@@ -1495,14 +1476,11 @@ void gw_task() {
           (uint8_t)((d.wrf_ids[e] > 255) ? 255 : d.wrf_ids[e]);
       reply_buffer[i++] = d.wrf_flags[e];
       reply_buffer[i++] = d.wrf_ctx[e];
-      reply_buffer[i++] = d.wrf_syncs[e];
+      uint32_t t10 = d.wrf_us[e] / 10000;
+      reply_buffer[i++] = (uint8_t)((t10 > 255) ? 255 : t10);
       reply_buffer[i++] = d.wrf_phys[e];
-      reply_buffer[i++] = d.wrf_pm_cyl[e];
-      uint8_t bad = (d.wrf_badid[e] > 7) ? 7 : d.wrf_badid[e];
-      reply_buffer[i++] = (uint8_t)(d.wrf_pm_info[e] |
-                                    ((d.wrf_ovr[e] & 1) ? 0x04 : 0) |
-                                    (bad << 3) |
-                                    ((d.wrf_ovr[e] & 2) ? 0x40 : 0));
+      reply_buffer[i++] = 0; // reserved (keeps the 10-byte entry stride)
+      reply_buffer[i++] = 0;
     }
     // Track-write ring: twr_n(4), then 8 x [ds(2), trk, side, phys, nsec,
     // flags, census(2), len(2)] with timestamps in DECISECONDS (u16 covers

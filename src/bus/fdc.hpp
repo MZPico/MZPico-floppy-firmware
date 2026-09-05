@@ -239,11 +239,6 @@ struct FdcDebug {
   uint8_t wrf_ctx[8];   // b0 host motor b1 spindle b2-3 host drive b4-5 core0
                         // drive (3 none) b6 ~DS0 level b7 ~DS1 level
   uint8_t wrf_phys[8];  // position belief at the hunt (0xFE unknown)
-  uint8_t wrf_pm_cyl[8]; // blind-hunt post-mortem: first ID's cyl (0xFF none)
-  uint8_t wrf_pm_info[8]; // b0 head, b1 decoded at HD clock, b7 valid
-  uint8_t wrf_syncs[8];  // sync marks the hunt found (capped 255)
-  uint8_t wrf_badid[8];  // ID candidates with bad CRC / non-ID mark (capped)
-  uint8_t wrf_ovr[8];    // DMA ring overran during the hunt
   // Ring of the last 8 host WRITE TRACKs, oldest -> newest (twr_n = total).
   // A format writes blind at the believed head position, so this is the only
   // record of where each track actually went down and with which density

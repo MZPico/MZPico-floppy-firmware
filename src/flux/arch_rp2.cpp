@@ -24,34 +24,15 @@ static inline uint32_t millis() {
 
 // ---- PIO programs (unchanged from Adafruit_Floppy) ----
 
-// Flux capture with a minimum-low-duration DEGLITCH (assembled by pioasm from
-// the source in the commit message; the Adafruit original captured the instant
-// the pin went low).
-//
-// Why: the RDATA rise is a slow RC curve (scope: sharp fall, ~1 us exponential
-// recovery). At HD the line spends a large part of every 2 us interval near
-// the input threshold, where core1's ground bounce as it switches the bus
-// re-crosses it, and instant-capture records a spurious extra edge per pulse
-// -- intervals halved, the exact huntflux signature of the blind HD write
-// hunts. DD's 4 us interval leaves the line settled on a flat top, hence
-// immune. A real drive pulse stays low >= ~150-300 ns; a threshold re-crossing
-// is a dip of tens of ns. So after seeing low, require it to STAY low for 2
-// iterations (3 instr each @ 72 MHz = ~83 ns) before capturing; if it goes
-// high again first it was a glitch. x keeps decrementing throughout, so the
-// capture offset is constant and intervals are unchanged.
 static const uint16_t fluxread[] = {
-    0x0041, //  0 wait_one:       jmp x--, wait_one_next
-    0x00c3, //  1 wait_one_next:  jmp pin, wait_zero
-    0x0000, //  2                 jmp wait_one
-    0x0044, //  3 wait_zero:      jmp x--, wait_zero_next
-    0x01c3, //  4 wait_zero_next: jmp pin, wait_zero [1]
-    0xe042, //  5                 set y, 2        ; low seen: debounce
-    0x0047, //  6 deb:            jmp x--, deb_chk ; keep the counter running
-    0x00c3, //  7 deb_chk:        jmp pin, wait_zero ; high again = glitch
-    0x0086, //  8                 jmp y--, deb
-    0x4001, //  9                 in pins, 1      ; stayed low: capture
-    0x402f, // 10                 in x, 15
-    0x0040, // 11                 jmp x--, wait_one
+    0x0041, // wait_one:  jmp x--, wait_one_next
+    0x00c3, // wait_one_next: jmp pin wait_zero
+    0x0000, //            jmp wait_one
+    0x0044, // wait_zero: jmp x--, wait_zero_next
+    0x01c3, // wait_zero_next: jmp pin wait_zero [1]
+    0x4001, //            in pins, 1
+    0x402f, //            in x, 15
+    0x0040, //            jmp x--, wait_one
 };
 static const pio_program_t fluxread_struct = {
     .instructions = fluxread,
@@ -110,83 +91,6 @@ static bool allocate_pio_set_program(floppy_singleton_t *info,
   return false;
 }
 
-// ---- RDATA pulse-width monitor (diagnostic) --------------------------------
-//
-// A spare state machine on the read pin measures every pulse: the LOW
-// duration, then the HIGH duration that follows, pushed alternately as
-// counts of 3 PIO cycles at clkdiv 1 (width_ns = count * 3e9 / clk_sys, ~15 ns
-// resolution). A one-shot DMA drops the first PWMON_WORDS samples (512
-// pulses) of a capture into a buffer at zero cost to whoever is decoding, so
-// the pulse SHAPE of the blind HD write hunts -- a 2x-density train the scope
-// could not trigger on -- is recorded for exactly the event that fails.
-// Assembled by pioasm from:
-//   wait_low:  jmp pin, wait_low
-//              mov x, ~null
-//   low_loop:  jmp x--, low_chk
-//   low_chk:   jmp pin, low_done
-//              jmp low_loop
-//   low_done:  mov isr, ~x ; push noblock
-//              mov x, ~null
-//   high_loop: jmp x--, high_chk
-//   high_chk:  jmp pin, high_loop [1]
-//              mov isr, ~x ; push noblock
-static const uint16_t pwmon_prog[] = {
-    0x00c0, 0xa02b, 0x0043, 0x00c5, 0x0002, 0xa0c9,
-    0x8000, 0xa02b, 0x0049, 0x01c8, 0xa0c9, 0x8000,
-};
-static const pio_program_t pwmon_struct = {
-    .instructions = pwmon_prog,
-    .length = sizeof(pwmon_prog) / sizeof(pwmon_prog[0]),
-    .origin = -1};
-static floppy_singleton_t g_pwmon;
-#define PWMON_WORDS 1024 // 512 pulses x (low, high)
-static uint32_t g_pwmon_buf[PWMON_WORDS];
-static int g_pwmon_dma = -1;
-
-bool rp2040_pwmon_start(int read_pin) {
-  if (!g_pwmon.pio) {
-    if (!allocate_pio_set_program(&g_pwmon, &pwmon_struct))
-      return false;
-    pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_wrap(&c, g_pwmon.offset,
-                       g_pwmon.offset + pwmon_struct.length - 1);
-    sm_config_set_jmp_pin(&c, read_pin);
-    sm_config_set_clkdiv(&c, 1.0f);
-    sm_config_set_in_shift(&c, false, false, 32); // manual push only
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
-    pio_sm_init(g_pwmon.pio, g_pwmon.sm, g_pwmon.offset, &c);
-  }
-  pio_sm_set_enabled(g_pwmon.pio, g_pwmon.sm, false);
-  pio_sm_clear_fifos(g_pwmon.pio, g_pwmon.sm);
-  pio_sm_restart(g_pwmon.pio, g_pwmon.sm);
-  pio_sm_exec(g_pwmon.pio, g_pwmon.sm, pio_encode_jmp(g_pwmon.offset));
-  if (g_pwmon_dma < 0)
-    g_pwmon_dma = dma_claim_unused_channel(true);
-  dma_channel_config dc = dma_channel_get_default_config(g_pwmon_dma);
-  channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
-  channel_config_set_read_increment(&dc, false);
-  channel_config_set_write_increment(&dc, true);
-  channel_config_set_dreq(&dc, pio_get_dreq(g_pwmon.pio, g_pwmon.sm, false));
-  dma_channel_configure(g_pwmon_dma, &dc, g_pwmon_buf,
-                        &g_pwmon.pio->rxf[g_pwmon.sm], PWMON_WORDS, true);
-  pio_sm_set_enabled(g_pwmon.pio, g_pwmon.sm, true);
-  return true;
-}
-
-uint32_t rp2040_pwmon_stop(void) {
-  if (!g_pwmon.pio)
-    return 0;
-  pio_sm_set_enabled(g_pwmon.pio, g_pwmon.sm, false);
-  uint32_t remaining = 0;
-  if (g_pwmon_dma >= 0) {
-    remaining = dma_hw->ch[g_pwmon_dma].transfer_count;
-    dma_channel_abort(g_pwmon_dma);
-  }
-  return PWMON_WORDS - remaining; // words actually captured
-}
-
-const uint32_t *rp2040_pwmon_buf(void) { return g_pwmon_buf; }
-
 // ---- Capture ----
 
 static bool init_capture(int index_pin, int read_pin) {
@@ -198,12 +102,6 @@ static bool init_capture(int index_pin, int read_pin) {
   }
 
   gpio_pull_up(index_pin);
-  // The RP2040 pad's own Schmitt trigger: on by default, but set it explicitly
-  // so no pad reconfiguration can ever drop it -- it is the first line of
-  // defence against threshold re-crossing on the slow RDATA rise (see the
-  // deglitch note on the capture program).
-  gpio_set_input_hysteresis_enabled(read_pin, true);
-  gpio_set_input_hysteresis_enabled(index_pin, true);
 
   pio_sm_config c = {0, 0, 0};
   sm_config_set_wrap(&c, g_reader.offset,
@@ -263,7 +161,6 @@ static inline uint32_t ring_written(void) {
 // words have been overwritten. The old index-masked version wrapped a full
 // lap back to a small number and reported "caught up" while handing out
 // overwritten, out-of-sequence samples -- garbage deltas with no flag, which
-// is exactly the HD write-splice signature (RXSTALL clear, ring flag clear).
 static inline uint32_t ring_unread(void) {
   return ring_written() - g_ring_consumed;
 }
@@ -279,16 +176,6 @@ static void ring_start(void) {
   channel_config_set_dreq(&c, pio_get_dreq(g_reader.pio, g_reader.sm, false));
   g_ring_consumed = 0;
   g_ring_overrun = false;
-  // Clear the PIO's sticky RX-FIFO-overflow flag so it reflects only THIS
-  // capture. If it is set at the end, the DMA (or, before it, the CPU) could
-  // not drain the RX FIFO fast enough and the PIO dropped samples at the
-  // source -- which no amount of ring buffering downstream can recover, and
-  // which is what a starved capture pipeline looks like as opposed to a
-  // corrupted RDATA signal (the PIO captures that one just fine, flag clear).
-  // RXSTALL is the RP2040 sticky flag for "the SM tried to push to a full RX
-  // FIFO" -- i.e. a flux sample was dropped because nothing drained fast
-  // enough. Write-1-to-clear so it reflects only this capture.
-  g_reader.pio->fdebug = (1u << (PIO_FDEBUG_RXSTALL_LSB + g_reader.sm));
   // 2^32-1 transfers is ~8 hours at HD rates: effectively endless for any
   // capture this firmware runs. Stopped explicitly by ring_stop().
   dma_channel_configure(g_ring_dma, &c, g_ring, &g_reader.pio->rxf[g_reader.sm],
@@ -527,11 +414,6 @@ int rp2040_flux_capture_next(uint32_t timeout_us) {
 }
 
 bool rp2040_flux_capture_overrun(void) { return g_ring_overrun; }
-
-bool rp2040_flux_capture_pio_overflow(void) {
-  return g_reader.pio &&
-         (g_reader.pio->fdebug & (1u << (PIO_FDEBUG_RXSTALL_LSB + g_reader.sm)));
-}
 
 uint32_t rp2040_flux_capture_backlog(void) {
   uint32_t sum = 0;

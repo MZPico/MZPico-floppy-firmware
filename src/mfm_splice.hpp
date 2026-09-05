@@ -47,12 +47,9 @@ struct SpliceResult {
   uint8_t seen_cyl, seen_head; // ID bytes of the mismatching candidate
   uint8_t size_n;              // size code from the matched ID
   uint16_t ids_seen;           // ID fields decoded (valid CRC) during the search
-  uint16_t syncs;              // triple sync marks found -- a hunt with zero of
-                               // these saw a garbage stream, not bad IDs
-  uint16_t bad_idam;           // sync followed by a non-ID mark or a bad ID CRC
-  bool overrun;                // the DMA ring overran during the hunt
-  bool pio_overflow;           // the PIO RX FIFO overflowed (samples lost at
-                               // the source -- a starved capture pipeline)
+  uint16_t syncs;              // triple sync marks found; zero of them in a hunt
+                               // that saw flux means the wrong bit clock (the
+                               // caller retries at the other density)
   uint32_t search_us;          // time from capture start to the splice/timeout
 };
 
@@ -75,31 +72,3 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
                               const uint8_t *data, uint16_t n_data,
                               bool deleted, float nominal_bit_time_us,
                               uint32_t timeout_us);
-
-// Raw deltas (24 MHz ticks, byte-clamped) of the last BLIND write hunt -- the
-// stream the live decoder saw when it found zero sync marks. `out` must hold
-// 512 bytes; *n is how many, *valid is 0 until a blind hunt has occurred.
-// which: 0 = last BLIND hunt, 1 = first SUCCESSFUL hunt (kept for an A/B of the
-// same code path on the same machine). `out` holds 512 bytes.
-void mfm_splice_debug_flux(uint8_t which, uint8_t *out, uint16_t *n,
-                           uint8_t *valid);
-// Total symbols the last blind hunt processed (the dump above is its LAST 512).
-uint32_t mfm_splice_debug_flux_total(void);
-// Sync-search forensics of the last blind hunt: symbol histogram (2T/3T/4T)
-// and the best partial match of the 14-symbol sync the matcher reached.
-void mfm_splice_debug_sync(uint32_t *n2t, uint32_t *n3t, uint32_t *n4t,
-                           uint8_t *best);
-
-// Pin state latched on the last BLIND hunt: raw GPIO input and output-enable
-// words at hunt start/end, and the pad function of RDATA(20)/WGATE(17)/
-// WDATA(18). Answers "was WGATE asserted?" and "was anything driving GPIO20?"
-void mfm_splice_debug_pins(uint32_t *in_start, uint32_t *in_end,
-                           uint32_t *oe_start, uint32_t *oe_end,
-                           uint8_t *f20, uint8_t *f17, uint8_t *f18);
-
-// Pulse widths of the first 512 pulses of the last BLIND hunt (which=0) or the
-// first successful hunt (which=1): alternating LOW, HIGH counts, 3 PIO cycles
-// each at clk_sys (u16-clamped). Reconstructs the pulse shape of the event
-// the scope could not trigger on.
-void mfm_splice_debug_pw(uint8_t which, const uint16_t **out, uint16_t *n,
-                         uint8_t *valid);

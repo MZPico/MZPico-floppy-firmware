@@ -118,152 +118,65 @@ VBUS and MZ +5 V into the regulator input.
 While there: add ~10 µF bulk on 3V3. Two 100 n for two '245s plus the module is
 thin.
 
-### 2c. **CONCLUSION (2026-08): the HD write faults were firmware, not signal integrity** -- 2b is superseded
+### 2b. HD write faults — what was measured, what was fixed, what is open (2026-08)
 
-The RDATA-integrity conclusion in 2b was overturned by direct measurement. A
-firmware pulse-width monitor (an independent PIO state machine, 15 ns
-resolution) measured the RDATA pulses during an actual blind hunt: LOW ~465 ns,
-HIGH ~1500 ns, period ~1965 ns -- a clean 2 us MFM train, byte-for-byte the
-same shape as a successful bench hunt. No doubling, no glitching, no noise on
-the wire. The "2x density / halved intervals" reading was a misinterpretation:
-a delta of ~48 is the CORRECT reading of a uniform 2T field (a run of 0x00 --
-exactly what CP/M SAVE writes, and what a presync looks like). The pin snapshot
-separately showed WGATE not asserted and RDATA a proper input we do not drive.
+An extended investigation of unreliable HD host writes under CP/M. Recorded here
+because the *hardware* hypotheses it went through were all disproved by
+measurement, and the next person should not repeat them.
 
-So the signal is clean and the fault is in the DECODE PIPELINE under core1
-activity: the live sync search fails to lock on a clean signal during a host
-STATUS-poll storm, while the bench (same clean signal, core1 idle) always
-locks. This is a FIRMWARE problem, not a board one. The buffered-RDATA / 33 ohm
-hardware fixes in 2b remain good hygiene for the next board but are NOT the fix
-for this fault.
+**Signal integrity was NOT the cause.** The RDATA signal was captured during
+actual failing hunts by an independent PIO pulse-width monitor (15 ns
+resolution): LOW ~465 ns, HIGH ~1500 ns, period ~1965 ns — a clean 2 µs MFM
+train, identical in shape to a successful bench hunt. No doubling, no glitch, no
+noise. A scope confirmed a sharp falling edge with a slow (~1 µs RC) rise, and
+that the drive mutes RDATA while WGATE is asserted. A 4k7→1 kΩ RDATA pull-up
+swap changed nothing. A min-low-duration deglitch in the capture program
+changed nothing. Both the deglitch and the pull-up theory are retired; the
+original Adafruit capture program is back. (Items 1 and 3 below remain good
+hygiene for the next revision — buffered Schmitt inputs, 33 Ω on the bus,
+proper grounds — but they are not the fix for anything observed.)
 
-**Final state.** Two firmware bugs were the cause of the blind hunts: the
-splice decoding HD flux at DD thresholds (intermittent, from a lagging
-cross-core read of the host's 0xDE declaration) and SEEK folding a Track-
-register delta instead of the absolute cylinder. Both fixed; HD read, format,
-data-disk use and single-drive host writes are verified. One item remains
-open and is NOT firmware: in a two-drive A->B copy CP/M's STEP-OUT/FORCE-INT
-burst back to the directory track leaves drive B's head physically short
-(~7 of ~540 writes), while the identical alternation is clean on the bench
-with core1 idle, every STEP is folded correctly, and the firmware resync is
-proven innocent (`posfix 0` identical). The remaining difference is core1 bus
-activity during the move, so the next measurement is a scope on STEP (GPIO14)
-and DIR (GPIO15) during the copy. The 2b hardware items (buffered RDATA, 33 R
-on the bus, grounding) remain good next-revision hygiene but are not the fix
-for anything observed.
+**Two firmware bugs were the cause of the "blind hunts"** (zero sync marks in
+two revolutions of clean flux); both fixed:
+1. The write splice intermittently decoded HD flux at **DD thresholds** —
+   `fdc_bit_us()` reads the host's `0xDE` declaration through a cross-core path
+   that can lag the write it belongs to. At DD thresholds every HD interval is
+   2T and the `0xA1` sync (3T/4T) never forms. Proven by a symbol histogram
+   (100 % 2T while the raw deltas held 3T and 4T). Fix: bail after ~12k
+   symbols without a 3T/4T and retry at the other density.
+2. `SEEK` folded a `Data − Track` delta into `head_target`; the host's Track
+   register is free to disagree with our position by design, and CP/M rewrites
+   it on drive switches. Fix: fold the absolute cylinder.
 
-### 2b. RDATA vs. C0..C7 crosstalk at HD — **the HD write-splice blocker** (field-confirmed 2026-08)
+**Open, and where work stopped:** HD two-drive copies (A: DD → B: HD) still
+fail ~1.5 % of positioning bursts to the directory track with the head
+physically short, and bulk-copied files can hold another sector's content with
+the directory sometimes wrong too. Established by measurement: identical rate on
+two unrelated drives (ALPS DF354H090F, Mitsumi D359M3) → not the drive; every
+STEP folded (`head_target` correct); firmware resync innocent (`posfix 0`
+identical); bench reproduction of the same A/B alternation with seeks to 0
+clean with core1 idle; Z80 bus clean (0 missed / 0 corrupt host writes on the
+Track, Sector and Data ports over ~280k writes, per-port counted); all GPIO
+writes on both cores atomic; bench HD writes byte-exact. Not yet split: whether
+B:'s own write/read corrupts or only the A→B interplay does (a `SAVE`→run test
+on B: alone, and a single-file `PIP`, decide it); the ID **head** byte was never
+compared (an attempt to enforce it broke booting — MZ media does not guarantee
+head byte == physical side; measure per physical side instead of enforcing);
+LOST-DATA sectors (CP/M's status mask ignores that bit). The one physical
+measurement not yet taken: STEP (GPIO14) and DIR (GPIO15) on a scope during
+`PIP B:=A:*.*` — pulses present while the head stays put points at the
+drive/cable, pulses absent or DIR glitching at the board or timing.
 
-The HD data path works: HD tracks format, read and (on the bench, core1 idle)
-splice-write flawlessly, 160/160. But the HD **write splice under CP/M** fails
-~7% of the time, and exhaustive firmware instrumentation traced it to the
-board, not the code. The failing splice's live decoder sees a garbage symbol
-stream (zero sync marks in 2.3 revolutions) on flux that a fresh capture
-decodes perfectly ~240 ms later; the PIO's RXSTALL flag proves **no samples
-were dropped** — the RDATA *edges themselves* were wrong at capture time.
-
-Why the write splice and not reads, through the same GPIO20: during the splice
-hunt the host polls STATUS thousands of times (~24k), so core1 switches
-`C0..C7` through U2 continuously right next to `~RDATA`. Reads capture once and
-retry on a bad CRC, so they tolerate the occasional corrupted edge (rddiag: 786
-clean, 1 stray bad CRC); the live splice decodes across the whole noisy polling
-window and cannot. **HD only** — the 1 µs bit cell has no margin for the
-coupled noise; DD's 2 µs does (DD is byte-for-byte clean: 530/530 host writes,
-full soaks).
-
-**Firmware fully ruled out (2026-08), by exhaustive instrumentation.** Across
-many builds the failing splice was shown to have: no PIO RX-FIFO overflow
-(RXSTALL clear, no samples dropped at the source); no DMA ring lap (with a
-corrected absolute-counter overrun detector — the earlier index-masked one
-could alias a full lap, which is why it was rebuilt); deltas computed by the
-identical code the working read path uses; and clean reproduction of every
-bench variable *except* one — cadence, read-then-write, and even the
-read-drive-0-then-write-drive-1 (A→B) topology all splice 160/160 on the
-bench. The single difference left is **core1 driving the Z80 bus during the
-hunt**, and the PIO faithfully captured garbage edges: the RDATA signal was
-electrically corrupted.
-
-**Not the pull-up rise time.** Swapping the RDATA bodge 4k7 → 1 kΩ changed
-nothing (41 → 44 failures). That argues against simple slow-edge/capacitive
-coupling and points at **ground bounce / shared-return coupling**: when core1
-switches the eight C0..C7 lines plus the buffer through the daisy-chained
-grounds, the reference under RDATA moves, and a pull-up to VCC cannot fix a
-moving ground. The board's daisy-chained ribbon grounds (item 1's "give every
-odd pin its own via") are the suspect. HD-only because the 1 µs bit cell has
-no margin for the reference excursion; DD's 2 µs does (DD copies are
-byte-for-byte clean).
-
-This is the item-1/item-3 signal-integrity gap made concrete. Fixes to try,
-cheapest first:
-- **Grounding first, since the pull-up did nothing:** star-ground the ribbon's
-  odd (GND) pins each to the plane instead of daisy-chaining, and add a ground
-  guard trace beside `~RDATA`. This is the change most consistent with the
-  pull-up-insensitive, ground-bounce reading.
-- **A Schmitt buffer on `~RDATA`** (`74LVC17A`/`74LVC14A`, item 1) — hysteresis
-  rejects the reference excursion outright and is the definitive fix.
-- **33 Ω series at U2 on `C0..C7`** to slow the aggressor edges (item 3).
-- A stiffer RDATA pull-up (1 kΩ/680 Ω) is worth keeping anyway but is **not**
-  sufficient on its own — measured.
-- **33 Ω series at U2 on `C0..C7`** (and the `D0..D7` side) to slow the edges
-  that couple — the single highest-value change, already listed in item 3.
-- **Ground the ribbon properly** and keep `~RDATA`'s trace away from the bus;
-  a ground guard trace beside GPIO20.
-- **The buffered input stage (item 1)** with a Schmitt `74LVC17A`/`74LVC14A` on
-  `~RDATA` — hysteresis is exactly the defence against coupled noise on a slow
-  open-collector line, and it settles this for good.
-
-**Single-drive test settles it (2026-08): coupled noise, NOT two-drive
-superposition.** With the other drive's disk ejected -- one drive, nothing else
-to overlay flux on the shared RDATA -- an HD write from CP/M (`SAVE` to B:, A:
-ejected so nothing reloads) STILL blind-hunts: 4 RNF in ~145 sector writes,
-syncs=0, and `huntflux` shows the same ~2x transition density (48/72/96 vs a
-good hunt's 95/143/192). So the extra edges are injected by core1's bus
-switching during the hunt, not by a second drive. The second drive only makes
-it worse (~7% two-drive vs ~2.8% single-drive -- more RDATA activity/loading).
-Then with drive A's data cable physically OFF the rate was unchanged (5 RNF in
-143 writes): drive A is fully exonerated, cable loading included. And the raw
-stream refines the mechanism: it is NOT random noise. huntflux shows a tightly
-clustered, PERIODIC (period-6) pattern -- the structure of a repeating byte,
-MFM-encoded, at 2x the good hunt's rate. Random coupled edges would smear the
-intervals; this is a SYSTEMATIC doubling -- a consistent extra edge per
-transition (double-triggering on the RDATA pulse's recovery edge, pushed over
-the input threshold by core1's switching), or a coherent 2x-rate signal on the
-line. Either way hysteresis on the RDATA input is the direct defence.
-**Firmware fully cleared (2026-08, fee9e29 pin snapshot).** On a blind hunt:
-WGATE high (OE=0, not asserted), RDATA a proper SIO input (OE=0, we are not
-driving it), WDATA the prepared write SM held static high. So it is not a
-stuck WGATE, not us driving our own input, not a pad misconfig. The min-low
-deglitch (require the line low >= ~83 ns) did NOT reduce the failures, so the
-extra transitions are REAL full-width pulses, not brief threshold glitches.
-And every blind-hunt interval (49..95) is shorter than a good hunt's smallest
-valid interval (2T ~= 95), so RDATA physically carries a ~2x-density pulse
-train during the hunt -- twice the transitions the disk should produce --
-which vanishes by the post-mortem 240 ms later. This is a physical signal on
-the wire, from the drive/line, that no firmware change touches.
-
-**The decisive next measurement is an oscilloscope on GPIO20 during an HD
-`SAVE`: do the RDATA pulses double-bottom / double up?** That ends the
-question outright. Fix is RDATA vs the bus, not the drive/cable/select side:
-
-**Raw-flux evidence (2026-08, `huntflux`):** a successful HD hunt reads a clean
-2:3:4 interval distribution (this disk's true 2T/3T/4T); a failed hunt reads the
-SAME signal with roughly DOUBLED transition density -- intervals halved and
-scrambled, so the missing-clock sync never forms (syncs=0). Doubled edges on
-the shared RDATA line come from one of two places, both hardware: coupled noise
-injecting edges, or a SECOND drive's flux superimposing (both drives spin on the
-shared MOTOR line, and RDATA is one wire gated by select -- a source drive that
-does not cleanly release RDATA on deselect overlays its own flux). The clean
-half-cluster favours superposition over random noise. Distinguishing test: a
-single-drive HD write (no other drive on the cable) -- if it is clean, it is
-superposition and the fix is drive/cable/select-side; if it still fails, it is
-coupled noise. Either way the buffered Schmitt `~RDATA` input (item 1) fixes it.
-
-A firmware mitigation exists if the board cannot be changed: capture a full
-revolution first (as a read does, tolerant + retryable), decode it to find the
-target sector's rotational offset from index, then time a blind write into its
-Gap 2 on the following revolution — an **index-relative splice** that decouples
-the noisy decode from the write timing. It is a real amount of new code and is
-not written; the hardware fix is preferred.
+**Diagnostics built and then removed in the consolidation** (speculative, or a
+cost on the timed paths; recoverable from pre-consolidation history): raw-delta
+recorder in the live hunt (`huntflux`), PIO pulse-width monitor (`pwmon`),
+sync-search histogram/best-match, per-seek ID verification with resync, in-
+operation wrong-cylinder retry, per-port bus-lateness counters, drive-tagged
+command history in the failed-write ring, a bench "bus aggressor". What
+survived, because it is measurement rather than speculation: the DMA-fed
+capture ring with absolute-counter overrun detection, `fwver`, `health`,
+`firstfail`, the failed-write and track-write rings, `bustest` +
+`BUSTEST.MZF`, `fdcseek`, `wrburst`, and the density/idxbit/densel controls.
 
 ### 3. MZ-800 bus side — mostly right, three additions
 

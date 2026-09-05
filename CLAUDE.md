@@ -155,11 +155,11 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   HD** and a host declaration now outranks the auto-detect latch. The Disk
   BASIC ROM still never writes it, which is why the per-drive latch remains
   the boot-time fallback. DENSEL is driven best-effort from the same model.
-- **HD support: write path hardware-verified** (HD `fmtverify` track scans
-  back CRC-clean at 500 kbit/s; `enctest 18 2 1` round-trips). A full CP/M HD
-  format ran up to FORMAT4's spindle-timing phase, which exposed the missing
-  Type I Index bit (now live — see the Status entry); the end-to-end HD
-  format is the remaining verification.
+- **HD support: read, format and data-disk use verified; two-drive host
+  writes not reliable.** Full account — the two firmware bugs fixed, what was
+  ruled out by measurement, the exact resumption plan — in the HD status
+  bullet under Phase 3 below and in
+  [docs/hardware-notes.md](docs/hardware-notes.md) §2b.
 - ~~**`~EXWAIT` budget**~~ — ✅ resolved: core1 comfortably services a register
   access inside the ~560 ns Z80 I/O window without wait states (see
   [docs/phase3-plan.md](docs/phase3-plan.md), risk #4).
@@ -355,77 +355,76 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
       originally used the greaseweazle drive object, hardwired to `~DS0`, so
       `drive 1; scan` silently read drive 0 — and `fmtverify` would have
       formatted one disk and verified another.
-  - **HD (500 kbit/s) support: implemented, not yet hardware-verified.** Target
+  - **HD (500 kbit/s) support — read, format and data-disk use verified;
+    two-drive host writes NOT reliable. Left in as a documented base.** Target
     is 3.5" HD at 300 rpm — the revolution time is unchanged, only the bit
-    clock halves. The capture window stays **byte-sized** (~1.05 rev:
-    45700 bytes DD / 91400 HD) — byte windows are rotation-relative, adapting
-    to the spindle's real speed, where a time window on a slightly-slow drive
-    captured 0.96 rev and threw phase-dependent CRC errors (a lesson learned
-    the hard way; see `fdc_read_capture_bytes`). Density (`mzp_probe.py density dd|hd|auto|detect`, default auto):
-    a valid host `0xDE` declaration decides, else a per-drive latch (default
-    DD) — **no media probing by default**, so the boot-ROM/DD read path is
-    the pre-HD behaviour exactly; `detect` adds probing (a nothing-decodes
-    capture re-decoded at the other bit clock, CRC-valid ID flips the latch)
-    for `0xDE`-less hosts with HD media, which this machine does not have. **Port
-    `0xDE` is the host's density declaration and, when valid, is trusted
-    OUTRIGHT in auto mode** — a real WD never second-guesses its DENSEL
-    input. Polarity observed from CP/M 4.1 (`0x00` throughout DD operation,
-    `0x81` entering an HD format): b0 = 1 = HD; cleared on bus RESET so the
-    boot ROM falls back to the latch. The instrumented track-write ring
-    proved this BIOS declares before **every** operation, always correctly —
-    including deliberately declaring **DD for the 16×256 boot track (cyl 0 /
-    head 1) of an HD disk**, so the DD-only boot ROM can still boot it: HD
-    data tracks, DD boot track, one disk, by design. Two generations of
-    census-outranks-declaration logic each broke a track before that was
-    understood (the collection tail is host memory junk that can carry
-    phantom IDAMs and inflate the census past the HD threshold — we clock in
-    more bytes than a real WD, whose DRQ stops at the index). A host WRITE
-    TRACK therefore uses the image's **sector census** (declared sectors ×
-    size codes, ~5.3k for 9×512 DD vs ~10.4k for 18×512 HD; never the image
-    length) only when **no** declaration exists — Disk BASIC-era software.
-    Writes never auto-detect (the splice uses the effective density).
-    A status-only verify read (host drains nothing — FORMAT4's idiom, legal on
-    a real WD) completes after 15 ms instead of the 250 ms LOST-DATA budget,
-    which is what made an HD format ~11 min. The **Type I STATUS Index bit (b1) is live from `~INDEX`
-    only while the host has declared HD** (`idxbit 0|1|2`): FORMAT4's HD
-    path times the spindle by polling it and froze forever against the old
-    hardwired 0, but an earlier always-live experiment regressed the boot
-    ROM's RESTORE check, so the DD/boot world keeps the hardwired 0. DENSEL is
-    driven best-effort (3.5" drives sense HD from the media hole). Buffers are
-    HD-sized (track image 13000 bytes, format flux budget 96k; the 150 KB
-    capture buffer already fit a full HD revolution). Verify bench-first:
-    `enctest 18 2 1` (no disk), then `density hd; fmtverify` on a scratch HD
-    disk. See [docs/wd-fidelity.md](docs/wd-fidelity.md). **HD: read, format, data-disk use and single-drive host
-    writes are hardware-verified** (CP/M `SAVE` to B: 143/143, RNF 0). Two
-    real bugs were found and fixed on the way, and both had been masquerading
-    as "corrupted RDATA" for a long time -- the signal was clean throughout,
-    proven by a PIO pulse-width monitor (`pwmon`):
-    1. **The splice decoded HD flux at DD thresholds** intermittently
-       (`fdc_bit_us()` reads the host's 0xDE declaration, which a cross-core
-       read can lag): every interval classified as 2T, so the 0xA1 sync (3T/
-       4T) could never form -- `syncs=0` for 2 revolutions of a perfect
-       signal. Fixed: a hunt that sees flux but zero syncs bails in ~24 ms
-       and retries at the other density, adopting whichever works.
-    2. **SEEK folded `Data - Track` into head_target.** That reaches Data only
-       while the host's Track register equals our position, and by design
-       they are free to disagree. Fixed: SEEK folds the absolute cylinder.
-    Also added: every multi-step seek (and the select catch-up seek) is
-    verified by reading an ID before the Type II guard opens
-    (`fdc_verify_arrival`, counted in `firstfail`).
-    **Open item -- two-drive A->B copy under CP/M.** ~7 of ~540 writes fail
-    wrong-cylinder: CP/M returns to the directory (track 2) with a STEP-OUT/
-    FORCE-INT burst and the head physically stops short (disk says 4..15,
-    head_target correctly 2). Everything firmware-side is excluded: core1
-    folds every STEP (head_target is right), the firmware resync is innocent
-    (`posfix 0` gives identical failures), the verified seek paths never fire,
-    and the identical A/B alternation with seeks to 0 is clean on the bench
-    (`fdcseek`, core1 idle). The remaining difference is core1 bus activity
-    during the move. **Next measurement is a scope on STEP (GPIO14) and DIR
-    (GPIO15) during `PIP B:=A:*.*`** -- pulses present while the head stays
-    put means the drive/cable, pulses absent or DIR glitching means the
-    board. The ID track compare makes this fail safe: no wrong-cylinder write
-    has ever reached the media. Two-drive HD copies therefore end with a
-    "Verify" error on some directory updates; single-drive HD use is fine.
+    clock halves. Density (`mzp_probe.py density dd|hd|auto|detect`, default
+    auto): a valid host `0xDE` declaration decides (polarity observed from
+    CP/M 4.1: `0x00` all through DD, `0x81` entering an HD format, so b0=1=HD;
+    cleared on bus RESET), else a per-drive latch (default DD); `detect` adds
+    media probing for `0xDE`-less hosts. Capture windows are **byte-sized**
+    (45700 DD / 91400 HD, ~1.05 rev — rotation-relative, so a slow spindle
+    cannot truncate them). The Type I Index bit (b1) is live from `~INDEX`
+    only while HD is declared (`idxbit`); FORMAT4's HD path times the spindle
+    with it, the DD boot ROM must not see it. A host WRITE TRACK trusts the
+    declaration outright and falls back to the image's sector census only
+    when none exists. DENSEL is driven best-effort (the ALPS DF354H090F and
+    Mitsumi D359M3 both sense HD from the media hole and ignore pin 2, which
+    is also why a DD boot track on HD media is marginal on these drives: HD
+    disks are data disks here, not boot disks). Buffers are HD-sized.
+    **Verified on hardware:** HD `FORMAT4` (all 160 tracks), HD reads (CP/M
+    runs from B:), HD single-drive host writes (`SAVE` to B: 143/143), bench
+    `wrsoak`/`wrverify` byte-exact at HD.
+    **Two real bugs were found and fixed on the way** — both had presented as
+    "blind" write hunts (zero sync marks for two revolutions) and were chased
+    for a long time as an RDATA signal problem before a PIO pulse-width
+    monitor proved the signal clean:
+    1. **The splice decoded HD flux at DD thresholds** intermittently.
+       `fdc_bit_us()` reads the host's `0xDE` declaration, which a cross-core
+       read can lag; at DD thresholds every HD interval classifies as 2T, so
+       the `0xA1` sync (3T/4T) can never form. Proven by a symbol histogram
+       (100 % 2T while the raw deltas held 3T/4T). Fix: a hunt that sees flux
+       but no 3T/4T in ~12k symbols bails, and the write retries once at the
+       other density, adopting whichever works (mirrors the read path).
+    2. **SEEK folded `Data − Track` into head_target.** That reaches `Data`
+       only while the host's Track register equals our position, and by this
+       design they are free to disagree (CP/M rewrites the Track register on
+       a drive switch). Fix: SEEK folds the absolute cylinder.
+    **Open item — HD two-drive copies (A: DD → B: HD) under CP/M are not
+    reliable, and this is where work stopped.** Two symptoms, both
+    characterised, neither root-caused:
+    - ~1.5 % of positioning bursts to the directory track leave the head
+      physically short (host wants track 2, disk says 4..15) — identical rate
+      on two unrelated drives (ALPS DF354H090F, Mitsumi D359M3), so not the
+      drive; every STEP is folded (`head_target` is right); the firmware
+      resync is innocent (`posfix 0` gives identical failures); the bench
+      reproduction of the same A/B alternation with seeks to 0 is clean with
+      core1 idle. The ID track compare makes it fail safe (no wrong-cylinder
+      write has ever reached the media); the host sees a Verify error.
+    - Files copied to B: in bulk sometimes hold another sector's content
+      (CRC-valid, right cylinder and sector), and the directory can be wrong
+      too. Reads deliver the requested cylinder, the bus is clean (0 missed
+      or corrupt host writes on Track/Sector/Data ports over ~280k writes),
+      bench writes are byte-exact. Unchecked at the time: the ID **head**
+      byte (side) — an attempt to enforce it broke booting because MZ media
+      does not guarantee head byte == physical side — and LOST-DATA sectors,
+      which CP/M's status mask ignores.
+    **Where to resume.** (a) A `SAVE`→run test on B: alone splits "B:'s own
+    write/read corrupts" from "the A→B interplay corrupts"; a single-file
+    `PIP` removes WRITE-MULTIPLE/directory interleave. (b) A scope on STEP
+    (GPIO14) and DIR (GPIO15) during `PIP B:=A:*.*` splits "pulses present,
+    head does not move" (drive/cable) from "pulses absent or DIR glitching"
+    (board/timing). (c) Measure, never enforce, the ID head byte per physical
+    side. The diagnostics built for this hunt were removed in the
+    consolidation (they were speculative or cost the timed paths): a raw-flux
+    recorder in the live hunt, a PIO pulse-width monitor, sync-search
+    forensics, per-seek ID verification, in-operation wrong-cylinder retry,
+    per-port bus-lateness counters, a drive-tagged command history. They are
+    recoverable from this repository's pre-consolidation history if needed;
+    what each one *measured* is recorded in docs/hardware-notes.md §2b.
+    **Do not host-write HD disks you care about** until this is resolved; a
+    corrupted CP/M image during this bring-up masqueraded as a firmware
+    regression until the image was rewritten (media, not code).
 - **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
   testing (the `wrsoak` run so far is minutes, not hours, and has met only one
   spindle), catching the rare boot `FD:Loading error` with `firstfail`.

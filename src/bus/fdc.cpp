@@ -281,14 +281,6 @@ struct FdcState {
   // was under the head, recaptured and decoded at both clocks. Whatever it
   // turns out to be -- the DD boot track, the other drive's disk, the wrong
   // side -- is the answer to 'what was the splice actually looking at'.
-  volatile uint8_t wrf_pm_cyl[8] = {0};  // first ID's cylinder; 0xFF = nothing
-  volatile uint8_t wrf_pm_info[8] = {0}; // b0 head, b1 decoded at HD, b7 valid
-  // The hunt's own view: sync marks it found, ID candidates that failed CRC,
-  // and whether the DMA ring overran. Zero syncs = the symbol stream was
-  // garbage the whole time; syncs with all-bad IDs = a marginal read.
-  volatile uint8_t wrf_syncs[8] = {0};
-  volatile uint8_t wrf_badid[8] = {0};
-  volatile uint8_t wrf_ovr[8] = {0};
   volatile uint8_t wrf_pos = 0;
   volatile uint32_t wrf_n = 0; // total failed host writes (ring wraps)
   // Ring of the last 8 host WRITE TRACKs. A format is positionally BLIND --
@@ -2311,11 +2303,6 @@ void fdc_debug_snapshot(FdcDebug *o) {
       o->wrf_flags[k] = S.wrf_flags[idx];
       o->wrf_ctx[k] = S.wrf_ctx[idx];
       o->wrf_phys[k] = S.wrf_phys[idx];
-      o->wrf_pm_cyl[k] = S.wrf_pm_cyl[idx];
-      o->wrf_pm_info[k] = S.wrf_pm_info[idx];
-      o->wrf_syncs[k] = S.wrf_syncs[idx];
-      o->wrf_badid[k] = S.wrf_badid[idx];
-      o->wrf_ovr[k] = S.wrf_ovr[idx];
     }
   }
   // Track-write ring, same ordering.
@@ -3433,31 +3420,6 @@ void fdc_disk_task(void) {
         {
           int pt = DRV ? DRV->track() : -1;
           S.wrf_phys[p] = (pt < 0) ? 0xFE : (uint8_t)pt;
-        }
-        // Post-mortem for a blind hunt: what WAS under the head? One capture,
-        // decoded at both clocks, first ID wins. ~240 ms on a command that
-        // has already failed and that the host is still waiting on.
-        S.wrf_pm_cyl[p] = 0xFF;
-        S.wrf_pm_info[p] = 0;
-        S.wrf_syncs[p] = (uint8_t)((sr.syncs > 255) ? 255 : sr.syncs);
-        S.wrf_badid[p] = (uint8_t)((sr.bad_idam > 255) ? 255 : sr.bad_idam);
-        S.wrf_ovr[p] = (uint8_t)((sr.overrun ? 1 : 0) |
-                                 (sr.pio_overflow ? 2 : 0));
-        if (sr.ids_seen == 0 && !sr.no_flux) {
-          size_t cap = 0;
-          uint8_t *flux = mzp_flux_buffer(&cap);
-          fdc_capture_window(fdc_read_capture_bytes());
-          uint8_t id[6];
-          if (g_flux_n > 0) {
-            if (mfm_read_address(flux, g_flux_n, FDC_HD_BIT_US, id)) {
-              S.wrf_pm_cyl[p] = id[0];
-              S.wrf_pm_info[p] = (uint8_t)(0x80 | 0x02 | (id[1] & 1));
-            } else if (mfm_read_address(flux, g_flux_n, FDC_DD_BIT_US, id)) {
-              S.wrf_pm_cyl[p] = id[0];
-              S.wrf_pm_info[p] = (uint8_t)(0x80 | (id[1] & 1));
-            }
-          }
-          g_flux_n = 0;
         }
         S.wrf_pos = (uint8_t)((p + 1) & 7);
         S.wrf_n++;

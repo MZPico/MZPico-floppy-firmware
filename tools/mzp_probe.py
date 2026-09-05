@@ -25,7 +25,6 @@ Usage:
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
     python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
     python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive]  # !! splices; read rdtrack (from rddrive) before each = CP/M A->B
-    python mzp_probe.py PORT huntflux [ok]                # raw deltas of the last blind hunt (or `ok` = first good hunt, for A/B)
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
     python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
@@ -93,7 +92,6 @@ MZP_CMD_DENSITY = 0x9E
 MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_FWVER = 0xA0
 MZP_CMD_DENSEL = 0xA1
-MZP_CMD_HUNTFLUX = 0xA3
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -922,51 +920,22 @@ def do_wrdiag(s):
         for e in range(shown):  # snapshot emits oldest -> newest in slots 0..n-1
             off = 80 + e * 10
             trk, sec, side, ids = r[off], r[off + 1], r[off + 2], r[off + 3]
-            fl, ctx, syncs = r[off + 4], r[off + 5], r[off + 6]
-            phys, pm_cyl, pm_info = r[off + 7], r[off + 8], r[off + 9]
-            badid, ovr = (pm_info >> 3) & 0x7, bool(pm_info & 4)
-            pio_ovf = bool(pm_info & 0x40)
+            fl, ctx, t10 = r[off + 4], r[off + 5], r[off + 6]
+            phys = r[off + 7]
             decl = ("decl=" + ("HD" if fl & 0x80 else "DD")) if fl & 0x40 \
                 else "decl=none"
             core0 = (ctx >> 4) & 3
             print(f"    trk={trk:3d} side={side} sec={sec:2d}  "
-                  f"ids_seen={ids:2d}  syncs={syncs:3d}  bad-ID={badid}"
-                  f"{'+' if badid == 15 else ''}  "
+                  f"ids_seen={ids:2d}  hunted {t10 * 10} ms  "
                   f"clk={'HD' if fl & 0x20 else 'DD'} {decl}  "
                   f"motor={'on' if ctx & 2 else 'OFF!'}"
-                  f"{'  RING OVERRUN' if ovr else ''}"
-                  f"{'  PIO FIFO OVERFLOW' if pio_ovf else ''}"
                   f"{'  NO FLUX' if fl & 0x10 else ''}"
                   f"{'  late' if fl & 8 else ''}")
-            if ids == 0 and syncs == 0 and not (fl & 0x10):
-                if pio_ovf:
-                    print("        ^ NO syncs AND the PIO FIFO overflowed: the "
-                          "capture pipeline was STARVED -- samples lost at the "
-                          "source, not a corrupted signal")
-                else:
-                    print("        ^ NO syncs, PIO FIFO did NOT overflow: the "
-                          "PIO captured every sample and the deltas were still "
-                          "garbage -> the RDATA signal itself was corrupted")
-            elif ids == 0 and syncs:
-                print("        ^ syncs found but every ID failed: marginal "
-                      "read (or the stream corrupts right after each sync)")
             print(f"        host drv={(ctx >> 2) & 3}  core0 drv="
                   f"{'none' if core0 == 3 else core0}  "
-                  f"~DS0={'asserted' if not (ctx & 0x40) else 'released'} "
-                  f"~DS1={'asserted' if not (ctx & 0x80) else 'released'}  "
+                  f"~DS0={'released' if ctx & 0x40 else 'asserted'} "
+                  f"~DS1={'released' if ctx & 0x80 else 'asserted'}  "
                   f"belief={'?' if phys == 0xFE else phys}")
-            if pm_info & 0x80:
-                print(f"        under the head: cyl {pm_cyl} head "
-                      f"{pm_info & 1}, decoded at "
-                      f"{'HD' if pm_info & 2 else 'DD'} clock")
-            elif ids == 0 and not (fl & 0x10):
-                print("        under the head: NOTHING decodable at either "
-                      "clock (flux present)")
-        blind = all((r[80 + e * 10 + 3] == 0) and not (r[80 + e * 10 + 4] & 0x10)
-                    for e in range(shown))
-        if blind and shown:
-            print("    ^ every hunt was blind -- read the 'under the head' "
-                  "lines: that is what the splice was actually looking at")
     # Track-write ring: every host WRITE TRACK, with the position belief and
     # the density decision it was made under. A format writes BLIND at the
     # believed position, so 'phys=?' here is a mislabeled track on the media.
@@ -1708,51 +1677,6 @@ def main():
                 print("firmware build: %s" % v.decode("ascii", "replace"))
             else:
                 print("firmware predates the fwver command (pre-101d57f+)")
-        elif cmd == "huntflux":
-            # Dump the raw deltas (24 MHz ticks, /2, byte-clamped) the last
-            # BLIND write hunt saw -- the actual garbage stream, to look at.
-            which = 1 if (len(sys.argv) > 3 and sys.argv[3] == "ok") else 0
-            s.write(bytes([MZP_CMD_HUNTFLUX, 3, which]))
-            s.flush()
-            hdr = read_exact(s, 5)  # cmd, ack, valid, n_lo, n_hi
-            if len(hdr) < 5 or hdr[1] != 0:
-                print(f"bad reply: {hdr.hex()}")
-                sys.exit(0)
-            valid = hdr[2]
-            n = hdr[3] | (hdr[4] << 8)
-            data = read_exact(s, n) if n else b""
-            label = "successful" if which else "blind"
-            if not valid:
-                print(f"no {label} hunt recorded since power-up "
-                      f"(nothing to show)")
-            else:
-                import statistics
-                d = list(data)
-                print(f"last {label} hunt: {n} raw deltas (24MHz ticks, /2, "
-                      f"clamped 255). HD 1T~=12, 2T~=24, 3T~=36 ticks.")
-                # histogram summary
-                zeros = d.count(0)
-                sat = d.count(255)
-                nz = [x for x in d if x]
-                if nz:
-                    print(f"  zeros={zeros}  saturated(255)={sat}  "
-                          f"min={min(nz)} max={max(d)} mean={sum(d)/len(d):.1f} "
-                          f"median={statistics.median(d):.0f}")
-                # crude class counts around HD nominals
-                def near(v, c, w=4): return abs(v - c) <= w
-                c1 = sum(1 for x in d if near(x, 12))
-                c2 = sum(1 for x in d if near(x, 24))
-                c3 = sum(1 for x in d if near(x, 36))
-                other = n - c1 - c2 - c3 - zeros - sat
-                print(f"  near-1T(12)={c1} near-2T(24)={c2} near-3T(36)={c3} "
-                      f"other={other}")
-                # also show as DD nominals in case it's the wrong clock
-                d1 = sum(1 for x in d if near(x, 24))
-                d2 = sum(1 for x in d if near(x, 48, 6))
-                print(f"  (if DD-rate: near-1T(24)={d1} near-2T(48)={d2})")
-                print("  first 64 deltas:")
-                for r in range(0, min(n, 64), 16):
-                    print("   " + " ".join(f"{x:3d}" for x in d[r:r+16]))
         elif cmd == "densel":
             # DENSEL pin override: 0/1 = force that level, auto = follow the
             # effective density (default); no arg = query.
