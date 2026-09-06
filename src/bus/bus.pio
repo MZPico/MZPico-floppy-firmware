@@ -1,48 +1,100 @@
 ; MZ-800 expansion-bus servicing for the MZPico-800-Floppy-Board.
-; SAFE data-buffer scheme: the PIO side-set drives ONLY the address buffer (EN0).
-; The data '245 (U2) is enabled by core1 and ONLY for the FDC ports we own, so we
-; never drive/load the MZ-800 data bus during other devices' I/O cycles. core1
-; sets EN1 (data-buffer OE) and RD1 (direction) directly for the data phase.
-;   side-set (1 bit) = EN0 (GPIO26, address-buffer /OE, active low)
-;     side 0 -> EN0 low : address buffer ON  (C0..C7 carry the port address)
-;     side 1 -> EN0 high: address buffer OFF (freed so core1 can drive data on U2)
-; C0..C7 = GPIO0-7 (in base 0). Control: IORQ=8, RD=9, WR=10.
+;
+; Gate ownership: the PIO side-set drives ALL THREE gate lines (3 bits, base
+; GPIO26):
+;   bit0 = ~EN0 (GPIO26) address buffer U1 /OE, active low
+;   bit1 = ~EN1 (GPIO27) data buffer U2 /OE, active low
+;   bit2 = ~RD1 (GPIO28) U2 direction: 1 = bus D -> Pico C, 0 = Pico C -> bus D
+; core1 owns only C0..C7 (GPIO0-7), which it drives during the read-data phase.
+;
+; The rule "never drive the MZ-800 data bus for a port we don't own" holds by
+; construction, without core1 ever touching a gate:
+;   READ:  every gate stays OFF after the address capture until core1 queues a
+;          go-word in this SM's TX FIFO -- which it does only after deciding
+;          the port is ours. Only then does U2 turn toward the bus. If /RD rises
+;          first (a port nobody serves), nothing was driven. Driving a stale
+;          byte for unserved reads is what made the reference Deluxe board show
+;          a phantom SRAM card and overdrive a second card on the same bus.
+;   WRITE: U2 turns toward the Pico (input direction, loads the bus with one
+;          LVC input, never drives it) and the PIO captures the data byte as a
+;          second FIFO word ~80 ns into the cycle. The Z80 drives write data
+;          before /WR falls and holds it for the whole cycle, so the sample is
+;          timing-safe and core1 no longer races the end of the cycle to read
+;          C0..C7 (the "late at sample" failure mode is gone).
+;
+; Never assert ~EN0 and ~EN1 together: every switch passes through BLOCK
+; (break-before-make), one PIO cycle apart.
+;
+; A side-set must never sit inside an SM's wait_iorq_low loop: each SM spins in
+; that loop for the whole of the OTHER kind of cycle and would re-assert its
+; idle gates every two cycles over the capturing SM's sequence.
+;
+; GUARD DELAY (~24 cycles = ~133 ns @180 MHz, a counted loop: the 3-bit side-set leaves one delay bit) between "IORQ released" and
+; re-enabling the address buffer: core1 is still driving C0..C7 for a few tens
+; of ns after a read cycle, and U1's 24 mA drivers must not meet the Pico pads.
+; Cheap: the Z80 cannot start another I/O cycle for >= 3 us.
 
-; GUARD DELAY (~23 cycles = ~128 ns @180 MHz) between "IORQ released" and
-; re-enabling the address buffer. Without it the SM re-asserts EN0 the instant
-; IORQ rises, while core1 is still driving C0..C7 (read cycle) or still has the
-; data '245 enabled (write cycle) -- putting U1's 24 mA drivers in contention with
-; the Pico pads / U2 on every single cycle. Cheap: the Z80 cannot start another
-; I/O cycle for >=3 us. Cf. the 8 nops in the reference's bus_write_deluxe.
+.define GATES_ADDR     0b110   ; U1 on (addr -> C), U2 off, dir = read
+.define GATES_BLOCK    0b111   ; all off
+.define GATES_DATA_IN  0b101   ; U2 on, bus D -> Pico C (write capture)
+.define GATES_DATA_OUT 0b001   ; U2 on, Pico C -> bus D (read drive)
 
-; MZ I/O READ cycle: capture the port address, then core1 drives the data byte.
-; jmp_pin = RD.
+; MZ I/O READ cycle. One FIFO word (port address); core1 answers with a go-word
+; in the TX FIFO when it serves the port. jmp_pin = RD.
 .program bus_read
-.side_set 1 opt
+.side_set 3 opt
 .wrap_target
-    wait 1 gpio 8       [7]           ; cycle over -- then guard before EN0 returns
-    nop                 [7]
-    nop                 [6]
-    nop                 side 0        ; address buffer ON
+    ; Idle gates set ONCE, outside the loop. pull noblock also discards a
+    ; go-word left over from a cycle the Z80 finished before core1 answered
+    ; (with the FIFO empty it merely copies X into OSR, which nobody reads).
+    pull noblock        side GATES_ADDR
 wait_iorq_low:
     wait 0 gpio 8
     jmp pin, wait_iorq_low            ; loop while RD high (not a read)
-    in pins, 8          side 1        ; sample port addr; address buffer OFF
+    in pins, 8          side GATES_BLOCK   ; port address pushed; all gates off
+verdict:
+    jmp pin, cycle_end                ; /RD rose: unserved port, nothing driven
+    mov y, status                     ; all-ones while no go-word is queued
+    jmp y--, verdict
+    pull block          side GATES_DATA_OUT ; go: U2 drives the bus with C0..C7
+cycle_end:
+    ; IORQ spike filter (cf. the reference Deluxe read program): the U2 turn-on
+    ; edge can couple a few-ns spike into the IORQ input; the 2-cycle input
+    ; synchroniser can latch it and satisfy a single wait. Outlast it (~90 ns)
+    ; and re-verify before dropping the drive - a real cycle end is hundreds
+    ; of ns high and passes straight through.
+    wait 1 gpio 8
+    set x, 15
+spike_r:
+    jmp x-- spike_r
+    wait 1 gpio 8
+    nop                 side GATES_BLOCK ; drop the drive first...
+    set y, 22                            ; ...then the guard before U1 returns:
+guard_r:                                 ; 1 set + 23 loop cycles (~133 ns).
+    jmp y-- guard_r                      ; (.side_set 3 opt leaves 1 delay bit)
 .wrap
 
-; MZ I/O WRITE cycle: capture the port address, then core1 reads the data byte.
-; jmp_pin = WR.
+; MZ I/O WRITE cycle. Two FIFO words: port address, then the PIO-captured data
+; byte. jmp_pin = WR.
 .program bus_write
-.side_set 1 opt
+.side_set 3 opt
 .wrap_target
-    wait 1 gpio 8       [7]
-    nop                 [7]
-    nop                 [6]
-    nop                 side 0
+    nop                 side GATES_ADDR   ; idle gates set ONCE, outside the loop
 wait_iorq_low:
     wait 0 gpio 8
-    jmp pin, wait_iorq_low            ; loop while WR high
-    in pins, 8          side 1        ; sample port addr; address buffer OFF
+    jmp pin, wait_iorq_low            ; loop while WR high (not a write)
+    in pins, 8          side GATES_BLOCK   ; port address pushed; U1 off
+    nop                 side GATES_DATA_IN ; break-before-make: U2 on, bus -> Pico
+    ; Settle: U2 enable (~5 ns) plus the 2-cycle input synchroniser; a couple
+    ; of nops is NOT enough, and .side_set 3 opt leaves 1 delay bit. 1 set + 8.
+    set x, 7
+settle_w:
+    jmp x-- settle_w
+    in pins, 8          side GATES_BLOCK   ; data byte pushed; all gates off
+    wait 1 gpio 8                     ; cycle over; guard before U1 returns
+    set y, 22
+guard_w:
+    jmp y-- guard_w
 .wrap
 
 % c-sdk {
@@ -53,9 +105,12 @@ static inline void bus_read_init(PIO pio, uint sm, uint offset) {
     sm_config_set_in_pins(&c, 0);          // C0..C7 = GPIO0-7
     sm_config_set_jmp_pin(&c, 9);          // RD
     sm_config_set_in_shift(&c, true, true, 8);
-    sm_config_set_sideset_pins(&c, 26);    // EN0 (address buffer OE)
+    sm_config_set_sideset_pins(&c, 26);    // EN0, EN1, RD1
     sm_config_set_clkdiv(&c, 1.0f);
-    pio_sm_set_consecutive_pindirs(pio, sm, 26, 1, true);
+    // TX FIFO carries core1's go-word, so it cannot be joined into RX: RX keeps
+    // its native 4 words. mov y,status reads all-ones while TX holds < 1 word.
+    sm_config_set_mov_status(&c, STATUS_TX_LESSTHAN, 1);
+    pio_sm_set_consecutive_pindirs(pio, sm, 26, 3, true);
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 }
@@ -67,7 +122,10 @@ static inline void bus_write_init(PIO pio, uint sm, uint offset) {
     sm_config_set_in_shift(&c, true, true, 8);
     sm_config_set_sideset_pins(&c, 26);
     sm_config_set_clkdiv(&c, 1.0f);
-    pio_sm_set_consecutive_pindirs(pio, sm, 26, 1, true);
+    // Two words per write; TX is unused, join it into RX for 8 words (4 writes)
+    // of backlog headroom under a tight OUT loop.
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    pio_sm_set_consecutive_pindirs(pio, sm, 26, 3, true);
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 }

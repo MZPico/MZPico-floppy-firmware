@@ -7,6 +7,7 @@
 //   ~EN1 (27) = data-buffer OE      (U2)
 //   ~RD1 (28) = data-buffer DIR     (U2: 1 = bus D -> Pico C [read],
 //                                        0 = Pico C -> bus D [drive])
+// All three gates are a 3-bit PIO side-set (base EN0_PIN); see bus.pio.
 #pragma once
 #include "hardware/structs/sio.h"
 #include <cstdint>
@@ -75,14 +76,11 @@ ALWAYS_INLINE void release_data_bus(void) {
   sio_hw->gpio_oe_clr = DATA_BUS_MASK;
 }
 
-// Data buffer (U2) gate — driven directly by core1, NOT the PIO, so we only ever
-// enable it (and thus touch the MZ-800 data bus) for ports we own. This avoids
-// contention with the MZ-800's own I/O devices on non-FDC reads. EN1 low = data
-// buffer on; RD1: 1 = bus->Pico (read), 0 = Pico->bus (drive).
-ALWAYS_INLINE void data_dir_read(void) { sio_hw->gpio_set = 1u << RD1_PIN; }
-ALWAYS_INLINE void data_dir_drive(void) { sio_hw->gpio_clr = 1u << RD1_PIN; }
-ALWAYS_INLINE void data_buffer_on(void) { sio_hw->gpio_clr = 1u << EN1_PIN; }
-ALWAYS_INLINE void data_buffer_off(void) { sio_hw->gpio_set = 1u << EN1_PIN; }
+// Buffer gates (U1 address, U2 data + direction) are ALL owned by the bus PIO
+// side-set (see bus.pio): the write SM captures the data byte itself, and the
+// read SM turns U2 toward the bus only after core1 queues a go-word for a port
+// we own. core1 never touches EN0/EN1/RD1 in normal operation; only the bench
+// self-tests take them back as SIO (bus_read_pins / bus_drive_test).
 
 // EXWAIT / INT are driven low (open-drain style: assert = drive low, release =
 // float back to the bus pull-up).

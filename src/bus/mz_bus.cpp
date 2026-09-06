@@ -47,46 +47,60 @@ static void init_bus_gpio(void) {
   gpio_set_dir(INT_PIN, GPIO_IN);
   gpio_set_slew_rate(INT_PIN, GPIO_SLEW_RATE_FAST);
 
-  // Data buffer gate (core1-controlled, NOT the PIO): start OFF (EN1=1),
-  // direction=read (RD1=1) so we never touch the MZ-800 data bus until we
-  // decide to, and only for ports we own.
-  gpio_init(EN1_PIN);
-  gpio_put(EN1_PIN, 1);
-  gpio_set_dir(EN1_PIN, GPIO_OUT);
-  gpio_set_slew_rate(EN1_PIN, GPIO_SLEW_RATE_FAST);
-  gpio_init(RD1_PIN);
-  gpio_put(RD1_PIN, 1);
-  gpio_set_dir(RD1_PIN, GPIO_OUT);
-  gpio_set_slew_rate(RD1_PIN, GPIO_SLEW_RATE_FAST);
-
-  // EN0 (address buffer /OE) is driven by the bus PIO (pio1) side-set. Preset
-  // high (buffer off) before handing it to the PIO.
-  gpio_init(EN0_PIN);
-  gpio_put(EN0_PIN, 1);
-  gpio_set_dir(EN0_PIN, GPIO_OUT);
-  gpio_set_slew_rate(EN0_PIN, GPIO_SLEW_RATE_FAST);
-  gpio_set_function(EN0_PIN, GPIO_FUNC_PIO1);
+  // Buffer gates EN0/EN1/RD1: preset OFF / read direction as plain outputs,
+  // then hand all three to the bus PIO (pio1) side-set. From here on core1
+  // never touches them (bus.pio owns the gate sequencing; only the bench
+  // self-tests take them back).
+  const int gate_pins[] = {EN0_PIN, EN1_PIN, RD1_PIN};
+  for (int p : gate_pins) {
+    gpio_init(p);
+    gpio_put(p, 1); // EN0=1 addr buffer off, EN1=1 data buffer off, RD1=1 read
+    gpio_set_dir(p, GPIO_OUT);
+    gpio_set_slew_rate(p, GPIO_SLEW_RATE_FAST);
+    gpio_set_function(p, GPIO_FUNC_PIO1);
+  }
 }
 
+static uint g_off_read, g_off_write;
+
 static void setup_bus_pio(void) {
-  uint off_read = pio_add_program(BUS_PIO, &bus_read_program);
-  uint off_write = pio_add_program(BUS_PIO, &bus_write_program);
-  bus_read_init(BUS_PIO, SM_READ, off_read);
-  bus_write_init(BUS_PIO, SM_WRITE, off_write);
+  g_off_read = pio_add_program(BUS_PIO, &bus_read_program);
+  g_off_write = pio_add_program(BUS_PIO, &bus_write_program);
+  bus_read_init(BUS_PIO, SM_READ, g_off_read);
+  bus_write_init(BUS_PIO, SM_WRITE, g_off_write);
+}
+
+// Flush stale captures and restart both bus SMs from their entry points. The
+// write SM pushes two words per cycle, so a half-captured transaction left
+// behind by a bench test that halted the SMs would desync the pop pairing for
+// good; clearing the FIFOs and restarting puts both sides back in step.
+static void restart_bus_sms(void) {
+  pio_sm_set_enabled(BUS_PIO, SM_READ, false);
+  pio_sm_set_enabled(BUS_PIO, SM_WRITE, false);
+  pio_sm_clear_fifos(BUS_PIO, SM_READ);
+  pio_sm_clear_fifos(BUS_PIO, SM_WRITE);
+  pio_sm_restart(BUS_PIO, SM_READ);
+  pio_sm_restart(BUS_PIO, SM_WRITE);
+  pio_sm_exec(BUS_PIO, SM_READ, pio_encode_jmp(g_off_read));
+  pio_sm_exec(BUS_PIO, SM_WRITE, pio_encode_jmp(g_off_write));
+  pio_sm_set_enabled(BUS_PIO, SM_READ, true);
+  pio_sm_set_enabled(BUS_PIO, SM_WRITE, true);
 }
 
 static inline bool port_is_ours(uint8_t addr) {
   return addr >= FDC_PORT_BASE && addr <= FDC_PORT_LAST;
 }
 
-// Listen loop: the PIO side-set only exposes the port address (EN0/address
-// buffer). core1 owns the data buffer (EN1/RD1) and enables it ONLY for ports we
-// own, so we never drive or load the MZ-800 data bus on other devices' I/O.
+// Listen loop. The bus PIO owns every gate: the write SM delivers the port
+// address AND the PIO-captured data byte (two FIFO words), the read SM delivers
+// the address and waits for a go-word before it turns the data buffer toward
+// the bus. core1 therefore never samples C0..C7 against the end of a cycle and
+// never drives the MZ-800 data bus for a port it does not own.
 //
-// Hard real-time: from the PIO push we have the rest of the Z80 I/O cycle
-// (~560 ns @3.55 MHz) to switch buffers and sample/drive. Everything that is not
-// strictly needed to hit that window -- bit-activity accumulators, per-port
-// counters -- runs AFTER the bus access, never before it.
+// Hard real-time on reads only: from the PIO push, the go-word and EXWAIT must
+// land before the Z80 samples /WAIT. Everything that is not strictly needed to
+// hit that window -- bit-activity accumulators, per-port counters -- runs AFTER
+// the bus access, never before it.
 RAM_FUNC static void listen_loop(void) {
   while (true) {
     // Drain BOTH FIFOs each pass. Under a tight OUT/IN loop, handling only one
@@ -95,33 +109,23 @@ RAM_FUNC static void listen_loop(void) {
     bool first = true;
     while (!pio_sm_is_rx_fifo_empty(BUS_PIO, SM_WRITE)) {
       uint8_t addr = pio_sm_get(BUS_PIO, SM_WRITE) >> 24;
+      // Second word: the data byte, sampled by the PIO ~80 ns into the cycle.
+      // Valid whether or not core1 is late -- no cycle-end race any more.
+      uint8_t raw = pio_sm_get_blocking(BUS_PIO, SM_WRITE) >> 24;
       if (!first)
         g_bus_diag.wr_backlog++;
       first = false;
       if (port_is_ours(addr)) {
         uint8_t idx = addr - FDC_PORT_BASE;
+        // Stretch the cycle so the register write has landed before the ROM's
+        // next access (a STATUS poll typically follows a command within a few
+        // T-states). If the cycle is already over this is a no-op; the byte is
+        // ours regardless - count it as telemetry only.
         set_exwait();
-        // Only put the data '245 on C0..C7 while the cycle is actually live.
-        // Once IORQ rises the write SM re-arms the address buffer, and enabling
-        // U2 then would drive U1's address onto C0..C7 at the same time -- we
-        // would sample a fight, not the Z80's data. Count it instead.
-        if (iorq_is_high()) {
-          release_exwait();
+        if (iorq_is_high())
           g_bus_diag.wr_late_at_pop++;
-          g_bus_hello.addr_low |= (uint8_t)~addr;
-          g_bus_hello.addr_high |= addr;
-          continue;
-        }
-        data_dir_read();
-        data_buffer_on();
-        bus_settle();
-        uint8_t raw = read_data_bus();
-        bool late = iorq_is_high(); // cycle ended under us mid-sample?
-        data_buffer_off();
-        release_exwait();
-        if (late)
-          g_bus_diag.wr_late_at_sample++;
         fdc_reg_write(addr, raw); // FDC applies per-port inversion + decode
+        release_exwait();
         // --- off the critical path from here ---
         g_bus_hello.dat_low |= (uint8_t)~raw; // write-data bit activity
         g_bus_hello.dat_high |= raw;
@@ -141,9 +145,9 @@ RAM_FUNC static void listen_loop(void) {
       if (port_is_ours(addr)) {
         uint8_t idx = addr - FDC_PORT_BASE;
         set_exwait();
-        // Same guard as the write path: if the cycle is already over, driving
-        // the data '245 would push a byte onto the MZ-800 data bus outside any
-        // I/O cycle. Never do that.
+        // If the cycle is already over the read SM has left its verdict loop:
+        // a go-word now would only sit in the FIFO (the SM discards it at its
+        // next wrap, but there is nothing to serve). Count it and move on.
         if (iorq_is_high()) {
           release_exwait();
           g_bus_diag.rd_late_at_pop++;
@@ -151,20 +155,18 @@ RAM_FUNC static void listen_loop(void) {
           g_bus_hello.addr_high |= addr;
           continue;
         }
+        // Go-word: the read SM turns U2 toward the bus (Pico C -> bus D).
+        pio_sm_put(BUS_PIO, SM_READ, 1);
         uint8_t bus_byte = fdc_reg_read(addr); // inversion handled by the FDC
         write_data_bus(bus_byte);
         acquire_data_bus_for_writing();
-        data_dir_drive();
-        data_buffer_on();
-        bus_settle();
+        bus_settle();     // U2 propagation before we free the Z80
         release_exwait(); // data is valid on the bus before we free the Z80
         while (!iorq_is_high()) { /* hold until the Z80 finishes the cycle */
         }
-        // Drop our drive before the read SM's guard delay expires and it turns
-        // the address buffer back on (see bus.pio).
-        data_buffer_off();
+        // The SM blocks U2 on IORQ high and holds the address buffer off for
+        // the guard delay; drop our own drive inside that window (see bus.pio).
         release_data_bus();
-        data_dir_read();
         // --- off the critical path from here ---
         g_bus_hello.reg[idx] = bus_byte;
         g_bus_hello.rd[idx]++;
@@ -172,7 +174,6 @@ RAM_FUNC static void listen_loop(void) {
       g_bus_hello.addr_low |= (uint8_t)~addr; // bit-activity over ALL reads
       g_bus_hello.addr_high |= addr;
     }
-
   }
 }
 
@@ -188,7 +189,7 @@ void bus_diag_reset(void) {
   g_bus_hello.dat_low = 0;
   g_bus_hello.dat_high = 0;
   g_bus_diag.wr_late_at_pop = 0;
-  g_bus_diag.wr_late_at_sample = 0;
+  g_bus_diag.wr_late_at_sample = 0; // no longer incremented: the PIO samples
   g_bus_diag.rd_late_at_pop = 0;
   g_bus_diag.wr_backlog = 0;
   g_bus_diag.rd_backlog = 0;
@@ -261,14 +262,14 @@ void bus_drive_test(uint8_t value, uint8_t mode) {
 
   if (mode == 0) { // release: restore normal bus operation
     release_data_bus();
-    // EN1/RD1 are core1/SIO-owned: leave them as outputs, data buffer OFF.
-    gpio_put(EN1_PIN, 1);
-    gpio_put(RD1_PIN, 1);
-    // EN0 goes back to the bus PIO side-set.
-    gpio_put(EN0_PIN, 1);
-    gpio_set_function(EN0_PIN, GPIO_FUNC_PIO1);
-    pio_sm_set_enabled(BUS_PIO, SM_READ, true);
-    pio_sm_set_enabled(BUS_PIO, SM_WRITE, true);
+    // All three gates go back to the bus PIO side-set (parked off / read dir),
+    // and the SMs restart from a clean slate: a halted write SM may have left
+    // half a transaction in its FIFO.
+    for (int p : gate_pins) {
+      gpio_put(p, 1);
+      gpio_set_function(p, GPIO_FUNC_PIO1);
+    }
+    restart_bus_sms();
     return;
   }
 

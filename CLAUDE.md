@@ -68,9 +68,24 @@ flash** (`Pico_Purple_16MB`), which exposes the extra GPIOs — the firmware
 **Shared 8-bit bus:** the MZ-800 address and data are time-multiplexed onto
 `C0..C7` (GPIO0–7) via two `SN74LVC245` buffers. Assert `~EN0` to read the I/O
 **address**; switch to `~EN1` (+ set `~RD1` direction) for the **data** phase.
-Never assert both `~EN0` and `~EN1` at once. This is the reference DELUXE-board
-scheme (`DATA_BUS_BASE=0`, EN pins) on different GPIOs — adapt `bus.hpp`
-accordingly rather than reusing FRUGAL's separate 16-pin addr+data layout.
+Never assert both `~EN0` and `~EN1` at once — every switch goes through BLOCK
+(break-before-make). **All three gates are a 3-bit PIO side-set** (`bus.pio`,
+since 2026-09; before that core1 drove EN1/RD1 as SIO): the write SM captures
+the data byte itself as a second FIFO word ~80 ns into the cycle (the Z80 holds
+write data for the whole cycle, so core1 no longer races the cycle end sampling
+C0..C7), and the read SM keeps every gate off until core1 queues a **go-word**
+in its TX FIFO for a port we own — only then does U2 turn toward the bus, so a
+port nobody serves is never driven (the reference Deluxe board's unconditional
+reversal produced a phantom SRAM card at boot and overdrove a second card on
+the bus). Rules that must hold in `bus.pio`: a side-set must never sit inside
+an SM's idle `wait 0 gpio 8`/`jmp pin` loop (each SM spins there for the whole
+of the other kind of cycle and would re-assert its idle gates over the capturing
+SM's sequence — this exact fold killed the reference Deluxe on first try); the
+read SM's end-of-cycle IORQ spike filter must run before the drive is dropped;
+the guard delay before `~EN0` returns covers core1's `release_data_bus()`. The
+read SM's TX FIFO is in use (go-word), so it is not joined into RX; the write
+SM's is. Bench tests that halt the SMs must go through `restart_bus_sms()` on
+the way back (two words per write: a half transaction desyncs the pairing).
 
 Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 `~WGATE` (GPIO17), `~INDEX` (GPIO21).

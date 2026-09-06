@@ -31,9 +31,10 @@ extern BusHelloState g_bus_hello;
 // mismatch can be attributed to "arrived too late" rather than guessed at.
 struct BusDiag {
   volatile uint32_t wr_late_at_pop;    // WRITE: IORQ already high when core1 got
-                                       // the address -> capture skipped entirely
-  volatile uint32_t wr_late_at_sample; // WRITE: IORQ rose while we were sampling
-                                       // -> the byte we read may be corrupt
+                                       // the pair. Harmless since the PIO captures
+                                       // the data byte; kept as a latency gauge
+  volatile uint32_t wr_late_at_sample; // WRITE: legacy (core1 no longer samples);
+                                       // always 0 - kept for the dump layout
   volatile uint32_t rd_late_at_pop;    // READ: cycle over before we could drive
   volatile uint32_t wr_backlog;        // WRITE: >1 entry drained in one pass
   volatile uint32_t rd_backlog;        // READ: >1 entry drained in one pass
