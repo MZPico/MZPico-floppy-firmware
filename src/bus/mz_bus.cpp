@@ -93,12 +93,14 @@ static inline bool port_is_ours(uint8_t addr) {
 
 // Listen loop. The bus PIO owns every gate: the write SM delivers the port
 // address AND the PIO-captured data byte (two FIFO words), the read SM delivers
-// the address and waits for a go-word before it turns the data buffer toward
-// the bus. core1 therefore never samples C0..C7 against the end of a cycle and
-// never drives the MZ-800 data bus for a port it does not own.
+// the address and waits for one verdict word (1 = ours, byte already driven;
+// 0 = not ours) before it turns the data buffer toward the bus. core1
+// therefore never samples C0..C7 against the end of a cycle, never drives the
+// MZ-800 data bus for a port it does not own, and never lets U2 put floating
+// pins on the bus.
 //
-// Hard real-time on reads only: from the PIO push, the go-word and EXWAIT must
-// land before the Z80 samples /WAIT. Everything that is not strictly needed to
+// Hard real-time on reads only: from the PIO push, EXWAIT must land before the
+// Z80 samples /WAIT; the verdict word follows once the byte is on the pins. Everything that is not strictly needed to
 // hit that window -- bit-activity accumulators, per-port counters -- runs AFTER
 // the bus access, never before it.
 RAM_FUNC static void listen_loop(void) {
@@ -145,22 +147,24 @@ RAM_FUNC static void listen_loop(void) {
       if (port_is_ours(addr)) {
         uint8_t idx = addr - FDC_PORT_BASE;
         set_exwait();
-        // If the cycle is already over the read SM has left its verdict loop:
-        // a go-word now would only sit in the FIFO (the SM discards it at its
-        // next wrap, but there is nothing to serve). Count it and move on.
+        // If the cycle is already over there is nothing to serve: answer the
+        // SM with 0 (it waits for exactly one word per read), count it, move on.
         if (iorq_is_high()) {
+          pio_sm_put(BUS_PIO, SM_READ, 0);
           release_exwait();
           g_bus_diag.rd_late_at_pop++;
           g_bus_hello.addr_low |= (uint8_t)~addr;
           g_bus_hello.addr_high |= addr;
           continue;
         }
-        // Go-word: the read SM turns U2 toward the bus (Pico C -> bus D).
-        pio_sm_put(BUS_PIO, SM_READ, 1);
         uint8_t bus_byte = fdc_reg_read(addr); // inversion handled by the FDC
         write_data_bus(bus_byte);
         acquire_data_bus_for_writing();
-        bus_settle();     // U2 propagation before we free the Z80
+        // Verdict 1: only now, with the byte driven on C0..C7, does the read SM
+        // turn U2 toward the bus. Never before: U2 would put the floating pins
+        // on the bus (that corrupted ~1 in 10^4 reads on the reference board).
+        pio_sm_put(BUS_PIO, SM_READ, 1);
+        bus_settle();     // U2 turn-on + propagation before we free the Z80
         release_exwait(); // data is valid on the bus before we free the Z80
         while (!iorq_is_high()) { /* hold until the Z80 finishes the cycle */
         }
@@ -170,6 +174,9 @@ RAM_FUNC static void listen_loop(void) {
         // --- off the critical path from here ---
         g_bus_hello.reg[idx] = bus_byte;
         g_bus_hello.rd[idx]++;
+      }
+      else {
+        pio_sm_put(BUS_PIO, SM_READ, 0); // not ours: the SM must never drive
       }
       g_bus_hello.addr_low |= (uint8_t)~addr; // bit-activity over ALL reads
       g_bus_hello.addr_high |= addr;

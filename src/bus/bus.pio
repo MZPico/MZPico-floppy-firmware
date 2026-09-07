@@ -9,12 +9,12 @@
 ;
 ; The rule "never drive the MZ-800 data bus for a port we don't own" holds by
 ; construction, without core1 ever touching a gate:
-;   READ:  every gate stays OFF after the address capture until core1 queues a
-;          go-word in this SM's TX FIFO -- which it does only after deciding
-;          the port is ours. Only then does U2 turn toward the bus. If /RD rises
-;          first (a port nobody serves), nothing was driven. Driving a stale
-;          byte for unserved reads is what made the reference Deluxe board show
-;          a phantom SRAM card and overdrive a second card on the same bus.
+;   READ:  every gate stays OFF after the address capture until core1 queues
+;          its verdict word in this SM's TX FIFO: 1 (ours, byte already on
+;          C0..C7) turns U2 toward the bus, 0 (not ours / too late) leaves it
+;          off. Driving a stale byte for unserved reads is what made the
+;          reference Deluxe board show a phantom SRAM card and overdrive a
+;          second card on the same bus.
 ;   WRITE: U2 turns toward the Pico (input direction, loads the bus with one
 ;          LVC input, never drives it) and the PIO captures the data byte as a
 ;          second FIFO word ~80 ns into the cycle. The Z80 drives write data
@@ -39,24 +39,30 @@
 .define GATES_DATA_IN  0b101   ; U2 on, bus D -> Pico C (write capture)
 .define GATES_DATA_OUT 0b001   ; U2 on, Pico C -> bus D (read drive)
 
-; MZ I/O READ cycle. One FIFO word (port address); core1 answers with a go-word
-; in the TX FIFO when it serves the port. jmp_pin = RD.
+; MZ I/O READ cycle. One RX word (port address); core1 answers with exactly
+; ONE verdict word in the TX FIFO: 1 = ours, the byte is already driven on
+; C0..C7 (sent right before EXWAIT is released), 0 = not ours or too late.
+; The SM waits for that word and nothing else: no bus input is sampled
+; mid-cycle. On the reference Deluxe board (v0.3.1 -> v0.3.2, bisected on two
+; layouts) both alternatives failed: turning U2 before core1 drove the pins
+; put a floating byte on the bus (~1 in 10^4 reads corrupt), and watching
+; /RD to detect "the Z80 gave up" let a coupled glitch abandon reads core1
+; was serving (BASIC froze after loading ~30% of the time). EXWAIT holds the
+; Z80 for served ports, and the not-ours answer comes within ~150 ns, so the
+; pull never outlives a cycle by more than that; one word per read keeps the
+; FIFO balanced (restart_bus_sms clears it). jmp_pin = RD.
 .program bus_read
 .side_set 3 opt
 .wrap_target
-    ; Idle gates set ONCE, outside the loop. pull noblock also discards a
-    ; go-word left over from a cycle the Z80 finished before core1 answered
-    ; (with the FIFO empty it merely copies X into OSR, which nobody reads).
-    pull noblock        side GATES_ADDR
+    nop                 side GATES_ADDR   ; idle gates set ONCE, outside the loop
 wait_iorq_low:
     wait 0 gpio 8
     jmp pin, wait_iorq_low            ; loop while RD high (not a read)
     in pins, 8          side GATES_BLOCK   ; port address pushed; all gates off
-verdict:
-    jmp pin, cycle_end                ; /RD rose: unserved port, nothing driven
-    mov y, status                     ; all-ones while no go-word is queued
-    jmp y--, verdict
-    pull block          side GATES_DATA_OUT ; go: U2 drives the bus with C0..C7
+    pull block                        ; core1's verdict
+    out x, 32
+    jmp !x, cycle_end                 ; 0: nothing driven
+    nop                 side GATES_DATA_OUT ; 1: U2 drives the bus with C0..C7
 cycle_end:
     ; IORQ spike filter (cf. the reference Deluxe read program): the U2 turn-on
     ; edge can couple a few-ns spike into the IORQ input; the 2-cycle input
@@ -107,9 +113,8 @@ static inline void bus_read_init(PIO pio, uint sm, uint offset) {
     sm_config_set_in_shift(&c, true, true, 8);
     sm_config_set_sideset_pins(&c, 26);    // EN0, EN1, RD1
     sm_config_set_clkdiv(&c, 1.0f);
-    // TX FIFO carries core1's go-word, so it cannot be joined into RX: RX keeps
-    // its native 4 words. mov y,status reads all-ones while TX holds < 1 word.
-    sm_config_set_mov_status(&c, STATUS_TX_LESSTHAN, 1);
+    // TX FIFO carries core1's verdict word, so it cannot be joined into RX: RX
+    // keeps its native 4 words.
     pio_sm_set_consecutive_pindirs(pio, sm, 26, 3, true);
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
