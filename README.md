@@ -76,6 +76,7 @@ gw write --device COM5 game.dsk
 See [docs/hardware-notes.md](docs/hardware-notes.md).
 
 ## License
-Ported flux/drive/protocol code derives from Adafruit_Floppy (MIT); see file
-headers. The MZ-800 FDC code added later derives from a GPL v2+ source — that
-license will apply to those components.
+Apache License 2.0 ([LICENSE](LICENSE)). The flux, drive and greaseweazle
+protocol code is ported from Adafruit_Floppy and keeps its MIT license; the
+test harness vendors a MIT Z80 core. Attributions and license texts:
+[NOTICE](NOTICE), [LICENSES/](LICENSES/).

@@ -23,7 +23,7 @@
  * Output and input use only the MZ-700/800 monitor entry points PRNT (0012h)
  * and GETL (0003h); it returns to the monitor (00ADh) when done.
  *
- * Copyright (c) 2026 the MZPico floppy firmware authors. GPL-2.0-or-later.
+ * Copyright 2026 The MZPico floppy firmware authors. SPDX-License-Identifier: Apache-2.0
  */
 #include <stdint.h>
 

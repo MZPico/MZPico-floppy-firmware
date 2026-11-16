@@ -1,3 +1,6 @@
+// Derived from Adafruit_Floppy (https://github.com/adafruit/Adafruit_Floppy),
+// MIT License, Copyright (c) 2021 Limor Fried for Adafruit Industries.
+// See LICENSES/MIT-Adafruit_Floppy.txt. Changes: Apache-2.0, see LICENSE.
 // greaseweazle command loop — ported from Adafruit_Floppy's greaseweazle.ino.
 // Serial (USB CDC) -> TinyUSB tud_cdc_*; Serial1 debug -> DBG() no-op;
 // millis()/yield() -> Pico-SDK time / tud_task(); floppy-> -> FloppyDrive.

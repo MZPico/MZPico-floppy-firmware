@@ -1,3 +1,6 @@
+// Derived from Adafruit_Floppy (https://github.com/adafruit/Adafruit_Floppy),
+// MIT License, Copyright (c) 2021 Limor Fried for Adafruit Industries.
+// See LICENSES/MIT-Adafruit_Floppy.txt. Changes: Apache-2.0, see LICENSE.
 // greaseweazle USB command protocol, Pico-SDK/TinyUSB port of the Adafruit
 // greaseweazle.ino command loop (MIT). Speaks the flux-level GW protocol over
 // USB CDC so the mature `gw`/fluxengine host tools drive this firmware.

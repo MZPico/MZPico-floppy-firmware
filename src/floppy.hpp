@@ -1,3 +1,6 @@
+// Derived from Adafruit_Floppy (https://github.com/adafruit/Adafruit_Floppy),
+// MIT License, Copyright (c) 2021 Limor Fried for Adafruit Industries.
+// See LICENSES/MIT-Adafruit_Floppy.txt. Changes: Apache-2.0, see LICENSE.
 // FloppyDrive — PC/Shugart drive control, Pico-SDK port of Adafruit_Floppy's
 // Adafruit_Floppy class (MIT). Logic/polarities preserved exactly; Arduino
 // GPIO/delay calls replaced with Pico-SDK equivalents. Flux capture/write
