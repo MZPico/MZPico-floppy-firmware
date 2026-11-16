@@ -132,7 +132,9 @@ noise. A scope confirmed a sharp falling edge with a slow (~1 µs RC) rise, and
 that the drive mutes RDATA while WGATE is asserted. A 4k7→1 kΩ RDATA pull-up
 swap changed nothing. A min-low-duration deglitch in the capture program
 changed nothing. Both the deglitch and the pull-up theory are retired; the
-original Adafruit capture program is back. (Items 1 and 3 below remain good
+original Adafruit capture program is back. (This retires the earlier advice to
+fit 1 kΩ / 680 Ω on `~RDATA` as the HD fix; the board runs with the 4k7
+bodge, see [PHASE0.md](PHASE0.md) item 6.) (Items 1 and 3 below remain good
 hygiene for the next revision — buffered Schmitt inputs, 33 Ω on the bus,
 proper grounds — but they are not the fix for anything observed.)
 

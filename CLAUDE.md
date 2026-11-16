@@ -73,9 +73,10 @@ Never assert both `~EN0` and `~EN1` at once — every switch goes through BLOCK
 since 2026-09; before that core1 drove EN1/RD1 as SIO): the write SM captures
 the data byte itself as a second FIFO word ~80 ns into the cycle (the Z80 holds
 write data for the whole cycle, so core1 no longer races the cycle end sampling
-C0..C7), and the read SM keeps every gate off until core1 queues a **go-word**
-in its TX FIFO for a port we own — only then does U2 turn toward the bus, so a
-port nobody serves is never driven (the reference Deluxe board's unconditional
+C0..C7), and the read SM keeps every gate off until core1 queues its
+**verdict word**: exactly one per read, for every read on the machine (1 = the
+port is ours and the byte is already on C0..C7, 0 = not ours or too late).
+Only a 1 turns U2 toward the bus, so a port nobody serves is never driven (the reference Deluxe board's unconditional
 reversal produced a phantom SRAM card at boot and overdrove a second card on
 the bus). Rules that must hold in `bus.pio`: a side-set must never sit inside
 an SM's idle `wait 0 gpio 8`/`jmp pin` loop (each SM spins there for the whole
@@ -83,7 +84,7 @@ of the other kind of cycle and would re-assert its idle gates over the capturing
 SM's sequence — this exact fold killed the reference Deluxe on first try); the
 read SM's end-of-cycle IORQ spike filter must run before the drive is dropped;
 the guard delay before `~EN0` returns covers core1's `release_data_bus()`. The
-read SM's TX FIFO is in use (go-word), so it is not joined into RX; the write
+read SM's TX FIFO is in use (verdict word), so it is not joined into RX; the write
 SM's is. Bench tests that halt the SMs must go through `restart_bus_sms()` on
 the way back (two words per write: a half transaction desyncs the pairing).
 
@@ -94,7 +95,8 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 
 > Full FDC spec: **[docs/wd-fidelity.md](docs/wd-fidelity.md)** (register map,
 > inverted bus, the ROM's polled-DRQ handshake, commands, architecture). The
-> MZ-800 side is derived from the Disk BASIC ROM `MZ2Z046.ASM` (in repo root).
+> MZ-800 side is derived from the Disk BASIC ROM listing `MZ2Z046.ASM` (a local,
+> copyrighted file in the working tree; git-ignored, not in the repository).
 > Boot-ROM (9Z-504M) floppy port map and call flow:
 > [docs/9Z_504M_floppy_routines.md](docs/9Z_504M_floppy_routines.md).
 > ([docs/rom-first-validation.md](docs/rom-first-validation.md) +
@@ -126,10 +128,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   feature — see the spec.)
 - **Data pacing = software DRQ polling:** ✅ the ROM driver polls STATUS and
   transfers a byte only when **DRQ** is set (it does *not* use wait-states for
-  data). So we maintain accurate **BUSY/DRQ/RNF/CRC/NOT-READY** status; the CPU
-  self-paces, and real-time decode makes DRQ toggle at the disk byte rate →
-  authentic timing for free. `~EXWAIT` is used **only** for register bus-timing
-  (µs), never the whole latency (no Z80/DRAM stall).
+  data). So we maintain accurate **BUSY/DRQ/RNF/CRC/NOT-READY** status and the
+  CPU self-paces. The time to the first DRQ is real (the sector is answered as
+  soon as it has passed the head, #35). The bytes within a sector are NOT
+  disk-rate paced: the sector is decoded whole and then handed over at the
+  host's pace, and a host that stalls is tolerated far longer than a WD would.
+  `~EXWAIT` is used **only** for register bus-timing (µs), never the whole
+  latency (no Z80/DRAM stall).
 - **Inverted data bus:** ✅ the ROM `CPL`s every FDC byte — emulated registers
   must present/accept **bit-complemented** values on `0xD8`–`0xDB`.
 - **Multi-sector + Force Interrupt:** ✅ the ROM uses Read/Write **Multiple**
@@ -234,7 +239,8 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Bisect before theorising.** When a known-good build exists and a new one
   fails, build the midpoint and flash it. Reasoning from indirect evidence lost
   most of a session here, through four wrong hypotheses, while two flashes
-  settled it. `build/known-good/` holds the uf2s from that bisect.
+  settled it. The bisect baseline is the GitHub releases (`fw-*` tags, each
+  hardware-validated, uf2 attached); the old `build/known-good/` was local only.
 - **Run `mzp_probe.py PORT health` first, every session.** It verifies which
   firmware build is actually running (`fwver` — a whole test cycle was once
   spent against the wrong uf2) and screens the passive counters for the
@@ -280,7 +286,8 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 
 ## Conventions (inherited from the reference firmware)
 
-- Pico-SDK, CMake, C11 / C++17. RP2040 (consider RP2350). Overclock (~180 MHz).
+- Pico-SDK, CMake, C11 / C++17. RP2040 (consider RP2350). Overclock: 200 MHz
+  (`main.cpp`), so one PIO cycle is 5 ns.
 - Direct SIO register access + PIO for bus and flux timing; `RAM_FUNC` /
   `ALWAYS_INLINE` for hot paths (see `bus.hpp`, `common.hpp` in the reference).
 - **License: Apache-2.0** (LICENSE, NOTICE). `src/bus/fdc.*` is original
@@ -295,7 +302,9 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Phase 0 (hardware bring-up): DONE** — the board reads *and* writes real
   floppies over USB via the Adafruit greaseweazle Arduino sketch. See
   [docs/PHASE0.md](docs/PHASE0.md) and [docs/hardware-notes.md](docs/hardware-notes.md).
-  One bodge in place: **4k7** pull-up on `~RDATA` (GPIO20) to 3.3 V (too weak for HD — a 1 kΩ / 680 Ω swap is the first HD write-splice fix to try; see docs/hardware-notes.md RDATA crosstalk item).
+  One bodge in place: **4k7** pull-up on `~RDATA` (GPIO20) to 3.3 V. A 1 kΩ
+  swap was tried during the HD hunt and changed nothing: the signal was proven
+  clean (docs/hardware-notes.md §2b), so it is not an HD fix.
 - **Phase 1 (Pico-SDK greaseweazle firmware): DONE** — a bare Pico-SDK +
   TinyUSB firmware that speaks the greaseweazle protocol, ported from
   Adafruit_Floppy. Builds to `mzpico_floppy.uf2`. See [README.md](README.md).

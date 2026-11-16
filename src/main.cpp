@@ -1,6 +1,9 @@
-// MZPico Floppy firmware — Phase 1: greaseweazle-compatible flux reader/writer
-// on bare Pico-SDK + TinyUSB. Drives the physical floppy on the
-// MZPico-800-Floppy-Board; the MZ-800 bus/FDC emulation comes in a later phase.
+// MZPico Floppy firmware -- WD179x FDC emulation for the Sharp MZ-800, backed
+// in real time by a physical floppy drive on the MZPico-800-Floppy-Board. core1
+// services the MZ-800 bus (bus/mz_bus, bus/fdc register side); core0 runs the
+// disk side (fdc_disk_task) plus the USB link: a greaseweazle-compatible flux
+// interface and the mzp_probe.py bench commands (gw_protocol). Bare Pico-SDK +
+// TinyUSB.
 #include "board_config.h"
 #include "gw_protocol.hpp"
 #include "bus/mz_bus.hpp"
@@ -23,12 +26,13 @@ int main() {
 
   tusb_init();
   gw_init();
-  bus_init(); // Milestone 3.0: launch the MZ-800 bus listener on core1
+  bus_init(); // launch the MZ-800 bus listener on core1
 
   while (true) {
-    // Prioritize disk-side FDC work first: the MZ-800 ROM's READ timeout window
-    // is only a few milliseconds, so reducing core0 scheduling latency here is
-    // more important than USB/probe responsiveness.
+    // Prioritize disk-side FDC work first: the host is polling STATUS against
+    // its own timeouts (the boot ROM's READ patience was measured at >= 285 ms,
+    // CP/M's READ ADDRESS ~52 ms), so core0 scheduling latency here matters
+    // more than USB/probe responsiveness.
     fdc_disk_task();
     tud_task();       // service USB (core0)
     gw_task();        // process one greaseweazle / MZP command if pending

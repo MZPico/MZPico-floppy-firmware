@@ -124,15 +124,15 @@ static inline bool port_is_ours(uint8_t addr) {
 
 // Listen loop. The bus PIO owns every gate: the write SM delivers the port
 // address AND the PIO-captured data byte (two FIFO words), the read SM delivers
-// the address and waits for one verdict word (1 = ours, byte already driven;
-// 0 = not ours) before it turns the data buffer toward the bus. core1
+// the address and waits for one verdict word on EVERY read (1 = ours, byte
+// already driven; 0 = not ours or too late) before it turns the data buffer toward the bus. core1
 // therefore never samples C0..C7 against the end of a cycle, never drives the
 // MZ-800 data bus for a port it does not own, and never lets U2 put floating
 // pins on the bus.
 //
 // Hard real-time on reads only: from the PIO push, EXWAIT must land before the
-// Z80 samples /WAIT; the verdict word follows once the byte is on the pins. Everything that is not strictly needed to
-// hit that window -- bit-activity accumulators, per-port counters -- runs AFTER
+// Z80 samples /WAIT; the verdict word follows once the byte is on the pins.
+// Everything that is not strictly needed to hit that window -- bit-activity accumulators, per-port counters -- runs AFTER
 // the bus access, never before it.
 RAM_FUNC static void listen_loop(void) {
   while (true) {
@@ -243,8 +243,10 @@ void bus_diag_reset(void) {
 
 static void core1_entry(void) {
   // Arm the bus-RESET interrupt from CORE1, so it is delivered here rather than
-  // on core0 -- core0 spends up to ~250 ms at a time inside a flux capture with
-  // interrupts disabled and would service it far too late.
+  // on core0 -- core0 runs with interrupts disabled for whole operations (a
+  // write splice's hunt, up to ~0.5 s; a track write, one revolution; the
+  // bench batch capture) and would service it far too late. (The live READ
+  // capture only masks them per drain.)
   //
   // An interrupt, not a poll. Polling this line from the listen loop cost bus
   // cycles: the loop has ~560 ns to answer a Z80 I/O cycle, and measured on

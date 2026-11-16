@@ -31,15 +31,16 @@ static constexpr int FDC_MAX_CYLINDER = 79;
 
 // Per-cylinder sector size, learned from the ID fields we decode while reading.
 //
-// WRITE SECTOR needs the sector's size BEFORE the host has sent a single byte:
-// the WD raises DRQ the moment the command is written and the host then shifts
-// in exactly one sector's worth. A real WD gets away with not knowing either --
-// it streams bytes and stops when the ID field it eventually finds says to --
-// but we buffer the whole sector before going anywhere near the disk, so the
-// length has to be decided up front. Every cylinder a host writes to it has
-// first read from, so the ID fields have already told us; this remembers what
-// they said. A wrong guess is caught (not acted on) at splice time by the size
-// compare in mfm_write_sector().
+// For WRITE SECTOR this is only the most bytes core1 collects before arming
+// the splice, NOT the authority on the length. The host ends the sector: a gap
+// of FDC_TRACK_IDLE_US in its byte stream arms the write with whatever it sent
+// (the disk task's wr_short_armed path), and the ID field's own size code
+// decides at splice time -- a mismatch is refused with RNF and nothing is
+// written (mfm_write_sector). The cache only saves the gap wait when the size
+// is known. The one case it still limits: on a never-read cylinder the default
+// (512) caps collection, so a 1024-byte sector there is cut short and refused.
+// (This used to read "the length has to be decided up front"; a disk nobody
+// had read then silently wrote nothing on its 16x256 boot track.)
 static constexpr int FDC_SIZE_CACHE_N = FDC_MAX_CYLINDER + 1;
 // Drives the board can select: one per ~DSn line (GPIO24/25). Port 0xDC's
 // drive field is 2 bits wide, so the host can ask for units 2 and 3 that this
@@ -131,10 +132,10 @@ struct FdcState {
   // relies on those two being independent. Deriving the target from S.track
   // instead made a single STEP OUT slam the head across the disk.
   //
-  // Why a target and not a step count: core0 blocks for ~235 ms in
-  // fdc_capture_window() on every fresh read, and CP/M 4.1 positions the head
-  // with rapid STEP/Force-Interrupt bursts, so many Type I commands land while
-  // core0 is unavailable. Whatever holds them must lose none of them AND must
+  // Why a target and not a step count: core0 blocks for up to a read window
+  // (~235 ms) in the read capture (fdc_read_capture_until) on a fresh read,
+  // and CP/M 4.1 positions the head with rapid STEP/Force-Interrupt bursts,
+  // so many Type I commands land while core0 is unavailable. Whatever holds them must lose none of them AND must
   // absorb surplus pulses at the end stops exactly as the drive does.
   // core1 folds each step into a CLAMPED ABSOLUTE target cylinder; core0 just
   // drives the head there. Single writer (core1), so no shared read-modify-write
@@ -401,7 +402,7 @@ struct FdcState {
 
   // Head-position resyncs: times an ID field proved the head was not where we
   // believed, and we adopted the disk's answer (see fdc_resync_head).
-  // Bus RESET (GPIO29). Sampled by core1 -- see fdc_bus_reset_poll().
+  // Bus RESET (GPIO29). An edge interrupt on core1 -- see fdc_bus_reset_isr().
   volatile uint32_t reset_events = 0;
   volatile uint32_t reset_at_ms = 0;
   volatile bool reset_active = false;
@@ -694,11 +695,12 @@ volatile bool g_invert_side = true;
 // bringing up a new host, or for touching a disk you cannot replace.
 volatile bool g_write_enable = true;
 
-// Runtime kill switch for the bus-RESET poller (`mzp_probe.py resetpoll 0`).
-// This one runs inside core1's hard real-time loop, so if it is ever suspected
-// of costing bus cycles it has to be possible to take it out of the picture
-// without a reflash -- reflashing to bisect a timing regression means changing
-// two things at once.
+// Runtime kill switch for bus-RESET handling (`mzp_probe.py resetpoll 0`; the
+// name predates the edge interrupt). The ISR runs on core1, next to its hard
+// real-time loop, so if it is ever suspected of costing bus cycles it has to be
+// possible to take it out of the picture without a reflash -- reflashing to
+// bisect a timing regression means changing two things at once. When off, the
+// ISR still releases the pads but counts and acts on nothing.
 volatile bool g_reset_poll_enabled = true;
 
 // Host-initiated WRITE TRACK. DEFAULT ON.
@@ -972,8 +974,10 @@ bool g_ready[FDC_DRIVE_MAX] = {true, true};
 bool g_drive_lock = false;
 
 // Record a WRITE SECTOR that is ending before its buffer filled. Call BEFORE
-// clearing S.writing, at every path that abandons a write: Force Interrupt, a
-// new command landing on top, bus RESET. `want` vs `got` is the diagnosis in
+// clearing S.writing, at every core1 command path that abandons a write: Force
+// Interrupt, a new command landing on top. The bus RESET ISR clears S.writing
+// without calling this, so a write cut short by a reset is not counted here.
+// `want` vs `got` is the diagnosis in
 // two numbers -- a host feeding 256 bytes into a 512-byte expectation says the
 // sector size we assumed for that cylinder AND SIDE is wrong, which is exactly
 // how an MZ-800 master disk's 16x256 boot track on cyl 0 / side 1 presents.
@@ -1134,11 +1138,13 @@ static constexpr float FDC_HD_BIT_US = 1.0f;
 //     failure handling for a case this machine does not have.
 // The latch is per drive for the same reason the size cache is: two drives can
 // hold different media. Default DD -- the machine's native format, and what
-// every boot must assume. Writes never auto-detect: a splice rides the disk
-// live, so it uses the latched density, which any host will have established
-// by reading (or READ ADDRESS) before it writes. Formatting a blank disk
-// cannot auto-detect from media; the format IMAGE length decides instead (see
-// FDC_TRACK_IMAGE_HD_MIN).
+// every boot must assume. A splice rides the disk live, so it starts at the
+// effective density (declaration, else latch); a hunt that sees flux but no
+// sync mark retries once at the other density and adopts whichever works (see
+// the WRITE SECTOR path). Formatting a blank disk cannot auto-detect from
+// media: a host WRITE TRACK trusts the 0xDE declaration, and only when there
+// is none does the format image's sector census set the latch (see
+// FDC_TRACK_CONTENT_HD_MIN).
 volatile uint8_t g_density_mode = 2;
 volatile bool g_drive_hd[FDC_DRIVE_MAX] = {false, false};
 volatile uint32_t g_dens_flips = 0;
@@ -1149,7 +1155,7 @@ ALWAYS_INLINE bool fdc_is_hd(void) {
   if (g_density_mode == 1)
     return true;
   // Auto: the host's own 0xDE declaration wins once it has made one (CP/M 4.1
-  // writes the port routinely -- 0 for DD, 1 for HD); the per-drive detected
+  // writes the port routinely -- observed 0x00 for DD, 0x81 for HD; b0 = HD); the per-drive detected
   // latch covers hosts that never do (the boot ROM).
   if (S.density_host_valid)
     return S.density_host_hd;
@@ -1468,9 +1474,10 @@ static constexpr uint32_t FDC_READADDR_DRQ_WINDOW_US = 2000;
 // has a matching ID field recorded on it. Uses the same fast incremental
 // capture as the Type II read path, but as a single bounded blocking pass --
 // Verify doesn't need per-byte DRQ pacing, just a pass/fail before BUSY clears.
-// Bounded to one buffer's worth of flux (well over one revolution) as a safety
-// net; real WD hardware retries for up to ~5 revolutions if a slower drive or
-// unlucky rotational timing ever needs more headroom than that here.
+// Bounded in TIME to one read window (one revolution + one sector span, see
+// fdc_read_window_us), or the flux buffer filling, whichever comes first; real
+// WD hardware retries for up to ~5 revolutions if a slower drive or unlucky
+// rotational timing ever needs more headroom than that here.
 static void fdc_resync_head(uint8_t seen_cyl);
 static bool fdc_verify_track(uint8_t track) {
   size_t cap = 0;
@@ -1488,17 +1495,20 @@ static bool fdc_verify_track(uint8_t track) {
     S.verify_n = 0;
     return false;
   }
-  // Capture a bounded window with NOTHING between drains, then decode once.
+  // Capture a bounded window, then decode once.
   //
   // This loop used to call mfm_verify_track() after every drain, i.e. it
-  // decoded *while* capturing -- the exact anti-pattern fdc_capture_window()
-  // exists to prevent. The PIO FIFO holds ~24 us of flux and has no DMA, so any
-  // decode between drains drops transitions, MFM sync never re-locks, and the
-  // rest of the window is unusable. It was also O(n^2): every drain re-decoded
-  // the whole buffer from the start, so the passes got longer as the buffer
-  // grew and the flux loss got worse the longer it ran.
+  // decoded *while* capturing. At the time the CPU drained the PIO FIFO
+  // itself (~24 us of flux, no DMA), so any decode between drains dropped
+  // transitions, MFM sync never re-locked, and the rest of the window was
+  // unusable. It was also O(n^2): every drain re-decoded the whole buffer from
+  // the start, so the passes got longer as the buffer grew. The capture now
+  // feeds a 16 KB DMA ring, which would tolerate short decodes between drains
+  // (the READ SECTOR path does exactly that), but whole-buffer re-decodes are
+  // still far too slow, and Verify needs no early answer -- so it stays
+  // capture-then-decode.
   //
-  // That made Verify a coin flip -- it only succeeded when a matching ID landed
+  // The old loop made Verify a coin flip -- it only succeeded when a matching ID landed
   // in the first drain or two, before the decode passes got long enough to
   // corrupt the stream. Failing Verify sets SEEK ERROR, and the boot ROM stops
   // there and reports a loading error without ever issuing a READ.
@@ -1554,15 +1564,19 @@ static constexpr size_t FDC_READADDR_CHUNK_BYTES = 5000;
 static constexpr size_t FDC_READADDR_MAX_BYTES = 12000;
 static constexpr uint32_t FDC_READADDR_TIMEOUT_US = 40000;
 
-// Capture a bounded flux window with NOTHING between drains, then stop.
+// Capture a bounded flux window, then stop; the caller decodes afterwards.
+// Used by the paths that want the whole window before deciding (READ TRACK,
+// the bench commands); READ SECTOR decodes while capturing instead (see
+// fdc_read_capture_until / fdc_read_capture_pump).
 //
-// This must not be interleaved with decoding. The capture has no DMA: the PIO
-// RX FIFO is 4 words deep and each word carries 2 half-samples, so it buffers
-// 8 transitions -- about 24 us at DD rates. Any work between drains longer
-// than that silently drops flux, MFM sync never holds, and no sector is ever
-// found. That is exactly what the previous decode-while-capturing loop did,
-// which is why `scan`/`streamscan`/`fdcread` (all capture-then-decode) worked
-// while the live read path returned RNF on a perfectly good disk.
+// History: before the capture fed a DMA ring, the CPU drained the PIO RX FIFO
+// itself -- about 24 us of flux at DD -- so any work between drains longer
+// than that silently dropped flux, MFM sync never held, and no sector was ever
+// found. That is why an early decode-while-capturing read loop returned RNF on
+// a perfectly good disk while `scan`/`streamscan`/`fdcread` (capture-then-
+// decode) worked. With the 16 KB ring, work between drains is safe as long as
+// each piece is short relative to the ring (tens of ms of flux at DD, ~20 ms
+// at HD); an overrun is flagged (rp2040_flux_capture_overrun).
 static void fdc_capture_window(uint32_t window_us) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
@@ -1742,9 +1756,10 @@ static void fdc_read_capture_until(uint8_t want) {
 }
 
 // READ ADDRESS: capture and search in chunks, returning as soon as any ID field
-// turns up. Flux arriving during a decode pass is lost (no DMA -- see
-// fdc_capture_window), but unlike READ SECTOR that is harmless here: a gap
-// costs at most one ID field and we simply match the next one. Bounded by both
+// turns up. Flux arriving during a decode pass is buffered by the capture's
+// DMA ring, and a decode of one chunk is short relative to the ring; even if
+// the ring did overrun, a gap would cost at most one ID field and we would
+// simply match the next one. Bounded by both
 // a byte limit and a 40 ms deadline so we always answer inside the host's
 // ~52 ms patience.
 static bool fdc_read_address_search(uint8_t *id_out) {
@@ -1885,8 +1900,9 @@ inline uint8_t compose_status() {
   uint8_t st = 0;
   if (S.busy)
     st |= 0x01; // BUSY (b0) — same bit in both layouts
-  // Ready once the ROM has commanded the motor on (real READY line on PC drives
-  // is unreliable; refine in 3.4). NotReady = bit7 in both layouts.
+  // Ready once the host has commanded the motor on (the READY line on PC
+  // drives is unreliable, so it is not used); refined below by the drive-unit
+  // range and the index sighting. NotReady = bit7 in both layouts.
   if (!S.motor_on)
     st |= 0x80; // NOT READY
   // Port 0xDC's drive field is 2 bits, so a host can select unit 2 or 3; this
@@ -1920,7 +1936,9 @@ inline uint8_t compose_status() {
       st |= 0x20;
     if (S.err_write_protect)
       st |= 0x40; // WRITE PROTECT (b6 in the Type II layout, write commands
-                  // only). Set only by the WRITE SECTOR stub -- see 3.3.
+                  // only): set when WRITE SECTOR / WRITE TRACK is refused
+                  // (~WPT, `wren`, `fmten`) or a track write fails on a
+                  // protected disk.
   } else {
     // Type I layout: b1 Index, b2 Track00, b6 WriteProtect.
     // Index is the LIVE ~INDEX sense (active low -> bit set during the pulse,
@@ -1968,11 +1986,13 @@ void fdc_init(FloppyDrive *const *drives, int n) {
         g_size_code[d][h][i] = FDC_SIZE_CODE_DEFAULT;
 }
 
-// RAM_FUNC is not optional here. listen_loop() is RAM_FUNC because it has ~560
-// ns to answer a Z80 I/O cycle, and calling out to a flash-resident function on
-// every pass puts an XIP cache miss in that path. Doing exactly that made the
-// machine report "no floppy driver detected" -- core1 was arriving late for bus
-// cycles, which looks nothing like a reset bug and everything like a dead card.
+// Arms the bus RESET edge interrupt (call on core1, so the IRQ lands there).
+// This runs once and may live in flash; the handler, fdc_bus_reset_isr, is
+// RAM_FUNC. RESET is an interrupt rather than a check in listen_loop() because
+// listen_loop() has ~560 ns to answer a Z80 I/O cycle: polling the line there
+// (a flash-resident call, an XIP cache miss) made the machine report "no
+// floppy driver detected" -- core1 was arriving late for bus cycles, which
+// looks nothing like a reset bug and everything like a dead card.
 void fdc_bus_reset_irq_init(void) {
   gpio_set_irq_enabled(RESET_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
   irq_set_exclusive_handler(IO_IRQ_BANK0, fdc_bus_reset_isr);
@@ -4094,9 +4114,11 @@ void fdc_disk_task(void) {
     return;
   }
 
-  // ---- Type II read: capture a window, then decode -------------------------
-  // Capture and decode are strictly sequential -- see fdc_capture_window() for
-  // why interleaving them cannot work without DMA.
+  // ---- Type II read: capture a window, decoding as the flux arrives --------
+  // The capture feeds a DMA ring, so decoding between drains is safe as long
+  // as each decode is short relative to the ring -- see fdc_read_capture_until
+  // / fdc_read_capture_pump. READ ADDRESS searches in chunks
+  // (fdc_read_address_search).
   if (S.reading) {
     if (S.pending_force_int &&
         fdc_since(S.last_data_read_us) > FDC_FORCE_INT_DEFER_IDLE_US) {

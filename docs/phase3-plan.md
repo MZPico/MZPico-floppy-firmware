@@ -1,5 +1,14 @@
 # Phase 3 plan — real-time WD FDC bridge to the MZ-800
 
+> **Historical document.** This is the Phase 3 plan and milestone log as it was
+> written while the work happened. It is kept for the reasoning and the
+> measurements, not as a description of the current firmware: several designs
+> below were later replaced, and those places carry a **Superseded** note. The
+> current design and status are in [../CLAUDE.md](../CLAUDE.md) and the living
+> FDC spec [wd-fidelity.md](wd-fidelity.md); the code (`src/bus/`, `src/mfm_*`,
+> `src/flux/`) is the final authority. Do not edit `bus.pio` or the read/write
+> paths from the text here.
+
 Goal: the MZ-800 ROM talks to ports 0xD8–0xDE and sees a faithful **WD179x /
 MB8877** floppy controller; the Pico backs it with the **physical drive in real
 time** (no cache). Spec: [wd-fidelity.md](wd-fidelity.md). This is the phase that
@@ -19,6 +28,12 @@ puts the board between a real MZ-800 and a real drive.
   (BUSY/DRQ/INTRQ/errors) between cores. core0's IRQ-disable during flux does not
   stall core1.
 
+> **Superseded:** there is no streaming byte FIFO between the cores. core0
+> captures flux into a DMA ring, decodes the requested sector into a one-sector
+> buffer (answering as soon as it is whole with a good CRC), and hands that
+> buffer to core1 through DRQ; the host then drains it at its own pace. See
+> wd-fidelity.md, "READ SECTOR / READ MULTIPLE" and "Architecture".
+
 PIO/SM budget: bus servicing (a few SMs) on one PIO block, the flux read/write SM
 on the other; both RP2040 PIO blocks used.
 
@@ -34,6 +49,11 @@ on the other; both RP2040 PIO blocks used.
 
 Note: adapting `fdc.cpp` (GPL v2+) and the reference bus code makes those
 components GPL — the firmware's licensing must reflect that.
+
+> **Superseded:** the WD emulation in `src/bus/fdc.*` was written fresh for this
+> project and contains no code from the GPL `fdc.cpp`; the reference bus code is
+> Apache-2.0. The repository is licensed Apache-2.0 — see `NOTICE` and
+> `LICENSES/`.
 
 ## Board-specific bus handshake (the critical path)
 
@@ -55,6 +75,14 @@ Never assert `~EN0` and `~EN1` together. `~EXWAIT` is µs-scale (register timing
 only) — never held across seek/rotational latency (that would stall Z80 refresh;
 BUSY-polling covers latency instead, per the ROM driver).
 
+> **Superseded (gate ownership):** core1 does not switch any buffer gate. All
+> three '245 gates (`~EN0`, `~EN1`, `~RD1`) are a 3-bit PIO side-set in
+> `src/bus/bus.pio`. The write SM captures the data byte itself as a second FIFO
+> word. The read SM keeps every gate off after the address capture until core1
+> queues its verdict word: only "ours, byte already on C0..C7" turns U2 toward
+> the bus, so a port nobody serves is never driven. See the gate rules in
+> ../CLAUDE.md and the header of `bus.pio` before touching either.
+
 ## Milestones (each independently testable on a real MZ-800)
 
 - **3.0 — Bus bring-up ("hello MZ-800"). ✅ DONE (hardware-verified).** The board
@@ -62,10 +90,17 @@ BUSY-polling covers latency instead, per the ROM driver).
   `OUT`/`INP` from the MZ-800 round-trip bit-for-bit (with the ROM's data-bus
   inversion), even and odd ports both register, and the `busdump` bit-activity
   monitor shows all 8 C-lines toggling. *Validated the entire bus handshake — the
-  riskiest bit.* Design: PIO (pio1) side-sets ONLY the address buffer (EN0);
-  **core1 drives the data buffer (EN1/RD1) directly and only for our ports**, so
-  non-FDC I/O by other MZ-800 devices is never touched. `~EXWAIT` times the
-  register access only. A hardware bug found during bring-up: a solder bridge
+  riskiest bit.* Design *at the time*: PIO (pio1) side-sets ONLY the address
+  buffer (EN0); core1 drives the data buffer (EN1/RD1) directly and only for our
+  ports, so non-FDC I/O by other MZ-800 devices is never touched. `~EXWAIT` times
+  the register access only.
+  > **Superseded (2026-09 bus rework):** all three gates EN0/EN1/RD1 are now a
+  > PIO side-set; core1 owns only C0..C7. The read SM turns U2 toward the bus
+  > only after core1's verdict word, the write SM captures the data byte. Editing
+  > `bus.pio` from the description above would reintroduce the hazards CLAUDE.md
+  > warns about (a side-set inside an idle `wait`/`jmp pin` loop; driving the bus
+  > for a port nobody serves).
+ A hardware bug found during bring-up: a solder bridge
   between U2 pin 18 (C0) and pin 19 (~EN1) corrupted both bit0 and the data-buffer
   enable — cleared on the board. Bench isolation tools added to `mzp_probe.py`
   (`gpioread`, `pintest`) but note the shared C-net means true pad-isolation needs
@@ -76,7 +111,8 @@ BUSY-polling covers latency instead, per the ROM driver).
   and advances to sector reads. Async model: core1 decodes commands + serves the
   WD register file (with per-port inversion: 0xD8–0xDB CPL'd, 0xDC–0xDE not);
   core0 runs motor/select/side/seek in the background while the CPU polls BUSY
-  (no wait-state stall). Control ports decoded from `MZ2Z046.ASM`: 0xDC b7=motor
+  (no wait-state stall). Control ports decoded from `MZ2Z046.ASM` (local,
+  copyrighted, not distributed): 0xDC b7=motor
   b1..0=drive, 0xDD b0=side, 0xDE b0=density. **Drive gotchas found:** this drive
   needs the spindle actually spinning before it will step to TRK00 (spin_motor
   with a 300 ms pre-sleep), and a motor-off delay keeps it spinning between the
@@ -94,6 +130,13 @@ BUSY-polling covers latency instead, per the ROM driver).
   serves DATA reads from that buffer, auto-advancing the Sector register in
   multi-record mode; Force Interrupt (0xD0/0xD8) terminates. Multi-record reuses
   the captured window, so sectors 2..N cost only a decode (~2 ms).
+  > **Superseded (#35, 2026-11):** the capture now fills a DMA ring and is
+  > decoded *while* it runs; a READ is answered as soon as its sector is whole
+  > with a good CRC, the capture keeps running for READ MULTIPLE, and a missing
+  > sector is searched for over 4 windows before RNF. The two bullets below
+  > ("strictly sequential", "~1.05-revolution window") describe the pre-DMA
+  > design. The window is now one revolution + one sector span in time, with the
+  > revolution measured per drive from `~INDEX`. See wd-fidelity.md.
   - **Capture and decode must be strictly sequential.** The flux capture has no
     DMA — the PIO RX FIFO holds 4 words × 2 half-samples = 8 transitions, about
     **24 µs** at DD rates. Any work between drains longer than that silently
@@ -133,7 +176,9 @@ BUSY-polling covers latency instead, per the ROM driver).
     on a plain flag is a read-modify-write race whose bad direction is `~INT`
     stuck low with nothing pending = hard machine hang.
   - **Bus RESET** (GPIO29, active **high**, idles low — the one active-high
-    control line) must disarm EINT. ✅ **Live**, polled on **core1**.
+    control line) must disarm EINT. ✅ **Live**, taken as an **edge interrupt
+    on core1** (it was first written as a poll; see below for why that broke
+    the machine).
     - **The polarity is established, not assumed.** The reference firmware's
       `bus_reset` PIO program on this same bus does `wait 1 gpio 19` and then
       requires the line to stay high for 31 more samples before rebooting. A
@@ -173,9 +218,7 @@ BUSY-polling covers latency instead, per the ROM driver).
       loads 01 into the Sector register per WD Master Reset. It deliberately
       does **not** perform the RESTORE a real WD would — that would drive the
       head on a signal the host never asked us to act on, and every host we
-      know of issues its own RESTORE at startup. It is a latch in our state; a resetting host cannot clear
-    it, so a reset mid-interrupt otherwise brought the machine back up into a
-    permanent one.
+      know of issues its own RESTORE at startup.
 - **3.3 — WRITE SECTOR (in-place splice). ✅ DONE (hardware-verified) — CP/M 4.1
   on the MZ-800 writes files to a physical disk and reads them back correct.** Locate the sector by ID with a *live* MFM decoder, then
   WGATE + write the MFM-encoded data field into the ~22-byte Gap 2 window
@@ -209,6 +252,11 @@ BUSY-polling covers latency instead, per the ROM driver).
     arrives, which is what the per-cylinder size cache (`FDC_SIZE_CACHE_N`,
     filled from the ID fields every read decodes) is for. A wrong guess is
     caught, not acted on, by the size compare at splice time.
+    > **Superseded:** the length is no longer needed in advance. The size cache
+    > (now per drive, side and cylinder) only bounds collection; a gap in the
+    > host's byte stream ends the sector, and the ID field's size code is the
+    > authority at splice time. See the multi-drive end-to-end result below
+    > (bug 3) and wd-fidelity.md.
   - **Three refusals, all before flux.** Physical `~WPT`, the firmware master
     switch (`mzp_probe.py wren 0`), and the WD ID **track compare** — which
     matters far more here than on a read: a read from the wrong cylinder returns
@@ -227,6 +275,8 @@ BUSY-polling covers latency instead, per the ROM driver).
     damaged *adjacent* sector, not a bad written one). NB: a scan captures ~1.05
     revolutions, so its last row is a wrapped partial re-read of the first
     sector and its "BAD" data CRC is a window artefact, not damage.
+    (That ~1.05-revolution figure is the transition-count window of the time;
+    the live read window is now one revolution + one sector span in time.)
   - **Measured, MZ-800 under CP/M 4.1:** files written to two physical disks and
     read back correct; `wrdiag` after each session reported 13/13 and 3/3 writes
     completed with **zero** RNF, wrong-cylinder, wrong-size, too-late or LOST
@@ -245,7 +295,11 @@ BUSY-polling covers latency instead, per the ROM driver).
     Sector register (WD quirk; the CP/M BIOS reads head position from there).
     This is what stopped the BIOS stepping blindly and giving up.
   - **WRITE TRACK (0xFX) — format. ✅ Bench path hardware-verified; host command
-    path wired (untested from the MZ-800, and gated OFF by default).** Formatting
+    path wired (untested from the MZ-800, and gated OFF by default).**
+    > **Superseded:** host formatting now defaults **ON**, and the host path is
+    > verified from the MZ-800 (CP/M 4.1 `FORMAT4`, see the multi-drive
+    > end-to-end result below).
+ Formatting
     track 70 as 9x512 interleave 2 and scanning it back returns all nine
     sectors, in the interleaved physical order 1,6,2,7,3,8,4,9,5, every one
     with a valid ID **and** data CRC — which is the proof that the missing-clock
@@ -271,8 +325,8 @@ BUSY-polling covers latency instead, per the ROM driver).
       images are padded with gap bytes so a track can never end up half one
       format and half the previous one, with the seam wherever the host
       stopped.
-    - Gated exactly like WRITE SECTOR: physical `~WPT` and the `wren` switch,
-      both checked before anything is destroyed. Test with
+    - Gated exactly like WRITE SECTOR: physical `~WPT` and the `wren` switch
+      (plus `fmten`, default on), all checked before anything is destroyed. Test with
       `mzp_probe.py PORT fmtverify <track>` (format, then read the sectors
       back) on a scratch disk.
   - **READ TRACK (0xEX). Phase-locked and decoding correctly on hardware; a
@@ -309,11 +363,17 @@ BUSY-polling covers latency instead, per the ROM driver).
     bit's polarity from and the two documented readings disagree; driving
     DENSEL on a guess risks a machine that currently boots, for media this
     platform does not have. See wd-fidelity.md.
+    > **Superseded:** CP/M 4.1 writes `0xDE` (`0x00` DD, `0x81` HD), which settled
+    > the polarity (b0 = 1 = HD). With HD support, DENSEL is now driven
+    > best-effort from the effective density; the target drives ignore it and
+    > sense HD from the media hole.
   - **Host command path for 0xEX/0xFX: wired.** A host READ TRACK captures a
     revolution and streams the decoded bytes over DRQ; a host WRITE TRACK
     collects the format image and lays the track down. Not yet exercised from
     the MZ-800 — no software is known to format through us — so treat it as
     implemented-but-unproven.
+    > **Superseded:** verified under CP/M 4.1 (`FORMAT4 B: /720`, and HD
+    > `FORMAT4` over all 160 tracks).
     - **Host formatting defaults ON** (`g_format_enable`, `mzp_probe.py
       fmten 0` to disable). It was originally gated off because the command
       register is bus-inverted, so a raw 0x00 on port 0xD8 decodes to 0xFF =
@@ -328,8 +388,13 @@ BUSY-polling covers latency instead, per the ROM driver).
       the write-channel commands for a sync mark and an ID address mark; a
       stream without them cannot be a format, and writing it would destroy the
       track just as thoroughly as a real one would.
+      > **Superseded:** that check was too weak (arbitrary 512-byte data
+      > contains each byte ~86 % of the time). The image must now contain a real
+      > IDAM preamble — ≥ 2 × `0xF5` immediately followed by `0xFE`. See
+      > "Host formatting defaults ON" below.
   - **Multi-drive via `~DS0`/`~DS1`. ✅ Implemented; UNTESTED against a second
-    drive.** Two `FloppyDrive` instances share every pin but `~DSn`, so the
+    drive.** *(Superseded: verified on two physical drives and end-to-end under
+    CP/M 4.1 — see the two-drive results below.)* Two `FloppyDrive` instances share every pin but `~DSn`, so the
     per-drive state the class already holds — the head position and the TRK00
     cross-check built on it — becomes per drive for free. Port 0xDC's drive
     field picks between them; units 2/3, which this board has no select line
@@ -351,8 +416,9 @@ BUSY-polling covers latency instead, per the ROM driver).
       drive's head would never move while the Track register reported success.
       A select therefore catches the incoming head up to its own target, for
       any drive whose position is already known.
-    - **The size cache is per drive**, because its whole job is to know a
-      sector's length before the host's first byte arrives, and two drives can
+    - **The size cache is per drive** (and, since, per side), because its whole
+      job was to know a sector's length before the host's first byte arrives
+      *(superseded: it now only bounds collection — see bug 3 below)*, and two drives can
       hold different formats at the same cylinder number (a 16×256 boot track
       against a 9×512 data track). One shared table would carry drive 0's
       geometry onto drive 1 and the splice-time size compare would refuse every
@@ -477,7 +543,9 @@ BUSY-polling covers latency instead, per the ROM driver).
    the MZ-800's interrupt scheme; likely benign but confirm. **Still open.**
 3. ~~**Streaming decode keeping bit-sync in real time** (M3.2)~~ — ✅ **moot.**
    Decode does not run concurrently with capture (see 3.2 above); it runs once,
-   afterwards, over a complete window.
+   afterwards, over a complete window. *(Superseded: since the DMA-fed capture
+   ring, the READ path does decode while capturing — safely, because the ring
+   absorbs the decode time — and answers early; see 3.2.)*
 4. ~~**`~EXWAIT` budget**~~ — ✅ **resolved,** and it turned out not to be the
    binding constraint: core1 comfortably services a register access inside the
    ~560 ns Z80 I/O window without needing wait states.
@@ -489,11 +557,15 @@ BUSY-polling covers latency instead, per the ROM driver).
    `fdclog` at the error prompt (names the opcode) plus `rddiag`; if the 16-deep
    ring has already wrapped, a sticky first-failure latch is the next tool to
    add. **Open — this is the blocker for a clean boot.**
+   *(Resolved: CP/M 4.1 boots and runs, reads and writes — see 3.2, Interrupts
+   and 3.3.)*
 7. **Read latency headroom.** Capture (~215 ms) consumes most of the host's
    ~285 ms patience. Comfortable margin needs DMA'd flux capture so decode can
    run concurrently and a sector is found as soon as its ID passes the head
    (~100 ms average). Not required today; required if WRITE SECTOR or a slower
    host path proves tighter. **Open.**
+   *(Resolved: the capture is DMA-fed and a READ is answered as soon as its
+   sector is whole, #35.)*
 
 ## Machine quirks that cost real time (read this before debugging)
 
@@ -504,7 +576,9 @@ BUSY-polling covers latency instead, per the ROM driver).
   raw mapping for A/B testing. Without the inversion the machine cannot boot.
   This is why every MZ-800 CP/M image has its 16×256 IPL track at cyl0/**side1**
   as a PC reads it, while the boot ROM reads logical track 0 = cyl0/side0.
-- **The boot ROM's disk geometry** (from `9Z_504M.dis.asm`): logical track =
+- **The boot ROM's disk geometry** (from `9Z_504M.dis.asm`, a local disassembly
+  of the copyrighted boot ROM — git-ignored, not distributed with this
+  repository): logical track =
   `cylinder*2 + side` (`FD_PREPARE_TRACK_AND_SIDE`, E61B); block → track/sector
   is `track = block/16`, `sector = block%16 + 1` (E696), i.e. **16 sectors of
   256 bytes** per track, numbered 1..16 (`CP $11` wrap). The read loop is
@@ -534,7 +608,9 @@ into the code as "workarounds":
    design decision derived from it — index sync, pre-arm, "batch capture can
    never work" — was unnecessary, and all of it has been removed.
 3. **Reads returned RNF because decode ran between flux drains.** See 3.2 above.
-   The bench paths passed because none of them interleave.
+   The bench paths passed because none of them interleave. (True of the
+   FIFO-only capture of the time; the later DMA ring is what made decoding
+   between drains safe.)
 
 Method note: the bus-test counters were `uint16_t` and wrapped every 0.5 s under
 a tight `OUT` loop, fabricating a rate-dependent error curve that looked exactly

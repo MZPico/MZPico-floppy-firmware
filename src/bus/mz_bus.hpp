@@ -1,15 +1,18 @@
-// Milestone 3.0 "hello MZ-800" bus interface: answer I/O reads/writes on the FDC
-// ports (0xD8-0xDE) so we can prove the shared-bus handshake before building the
-// real WD FDC. Runs a tight listen loop on core1; core0 keeps the USB link for
-// observing the shadow registers. See docs/phase3-plan.md.
+// MZ-800 bus interface: answers I/O reads/writes on the FDC port window
+// (0xD8-0xDF) and hands them to the WD bridge (fdc.cpp). Grew out of the
+// milestone 3.0 "hello MZ-800" shared-bus bring-up, whose shadow registers and
+// counters survive as diagnostics. Runs a tight listen loop on core1; core0
+// keeps the USB link for observing them. See docs/phase3-plan.md.
 #pragma once
 #include <cstdint>
 
-// Shadow of the 8 FDC-window registers (0xD8..0xDF), plus access counters, for
-// the hello test. Values are stored as the *true* (un-inverted) byte; the bus
-// layer handles the ROM's data-bus inversion. Shared core1 -> core0 (USB dump).
+// Shadow of the 8 FDC-window registers (0xD8..0xDF), plus access counters
+// (diagnostics, from the hello test). reg[] holds the exact byte last driven on
+// a read -- i.e. still inverted for 0xD8..0xDB, where the FDC applies the ROM's
+// data-bus inversion; last_raw[] the raw byte last written. Shared core1 ->
+// core0 (USB dump).
 struct BusHelloState {
-  volatile uint8_t reg[8];      // stored inverted value (what a read drives back)
+  volatile uint8_t reg[8];      // byte last driven on a read (bus form, inverted for 0xD8..0xDB)
   volatile uint8_t last_raw[8]; // last RAW (un-inverted) byte the MZ wrote, per port
   volatile uint32_t wr[8];      // per-port write count (32-bit: a uint16 wraps
   volatile uint32_t rd[8];      // in 0.5 s under a tight OUT loop)

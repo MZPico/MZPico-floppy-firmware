@@ -7,12 +7,14 @@
 // field, which means the ID has to be recognised WHILE it passes the head.
 //
 // So the search here is a live MFM decoder: it pulls one flux transition at a
-// time straight out of the capture FIFO, tracks the MFM sync/parity state, and
+// time straight out of the capture (DMA ring), tracks the MFM sync/parity state, and
 // decodes each ID field as it arrives. Per transition the work is a subtract, a
 // compare and a shift -- roughly 0.2 us against a ~4 us DD transition interval
 // -- so unlike the batch decoder it can keep up with the disk indefinitely.
-// (See fdc_capture_window() for why the *buffered* decoder must never be
-// interleaved with capture: it is O(n^2) and rescans from the start.)
+// (The *buffered* decoder rescans from the start of what it is given, so it
+// cannot keep pace transition by transition; the READ path interleaves it with
+// capture only in short decodes over the newest flux, which the DMA ring's
+// tens of ms of cushion absorbs.)
 //
 // What gets written is only the data field: 12 bytes of zeros, the 3-byte 0xA1
 // sync, the data address mark, the data, its CRC and a couple of gap bytes to

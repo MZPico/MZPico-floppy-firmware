@@ -67,7 +67,7 @@
 #define MZP_CMD_BUSTEST 0x8C // port-0xDF loopback + cycle-timing diagnostics
 #define MZP_CMD_RDDIAG 0x8D  // why the last Type II read succeeded / RNF'd
 #define MZP_CMD_SIDESWAP 0x8E // invert ROM side-select -> physical head
-#define MZP_CMD_INTMODE 0x8F  // how ~INT is driven: 0=off 1=INTRQ 2=INTRQ|DRQ
+#define MZP_CMD_INTMODE 0x8F  // ~INT: 0=off 1=DRQ, EINT-gated 2=DRQ, ignore EINT
 #define MZP_CMD_IOTRACE 0x90  // ordered register-access trace (reads + writes)
 #define MZP_CMD_FDCWRITE 0x91 // bench: WRITE SECTOR via the FDC (splice)
 #define MZP_CMD_WRDIAG 0x92   // why the last WRITE SECTOR wrote / refused
@@ -76,7 +76,7 @@
 #define MZP_CMD_FDCFORMAT 0x95 // bench: WRITE TRACK (format) one track
 #define MZP_CMD_READTRACK 0x96 // bench: READ TRACK -- raw decoded byte stream
 #define MZP_CMD_RESETDIAG 0x97 // raw bus-RESET line telemetry (no assumptions)
-#define MZP_CMD_RESETPOLL 0x98 // enable/disable the core1 bus-RESET poller
+#define MZP_CMD_RESETPOLL 0x98 // enable/disable core1's bus-RESET IRQ handling
 #define MZP_CMD_POSFIX 0x99    // enable/disable head-position self-correction
 #define MZP_CMD_FMTEN 0x9A     // enable/disable host-initiated WRITE TRACK
 #define MZP_CMD_DRVSEL 0x9B    // bench: which unit (~DS0/~DS1) the FDC drives
@@ -406,7 +406,7 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
   }
 
   else if (cmd == GW_CMD_SETPARAMS) {
-    // accept and ack (delays kept at defaults for Phase 1)
+    // accept and ack (parameters are not applied; delays stay at defaults)
     reply_buffer[i++] = GW_ACK_OK;
     cdc_write_all(reply_buffer, 2);
   }
@@ -1337,9 +1337,10 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
   }
 
   else if (cmd == MZP_CMD_RESETPOLL) {
-    // cmd_buffer[2]: 0 = off, 1 = on, 2 = query. The poller lives in core1's
-    // hard real-time loop, so this exists to take it out of the picture while
-    // diagnosing a bus-timing problem, without a reflash changing two things.
+    // cmd_buffer[2]: 0 = off, 1 = on, 2 = query. Bus RESET is an edge
+    // interrupt on core1 (not a poll, despite the name); this exists to take
+    // its handling out of the picture while diagnosing a bus-timing problem,
+    // without a reflash changing two things.
     if (cmd_buffer[2] < 2)
       fdc_set_reset_poll(cmd_buffer[2] != 0);
     reply_buffer[i++] = GW_ACK_OK;
