@@ -1621,25 +1621,29 @@ static bool fdc_read_capture_pump(void) {
     fdc_read_capture_end(false); // nobody wants the rest
     return false;
   }
-  if (now - g_rc.t0 >= g_rc.window_us || g_flux_n >= cap) {
-    // Take what the DMA ring collected since the last pass before stopping,
-    // or a sector ending in that stretch would be cut short.
-    if (g_flux_n < cap)
-      g_flux_n = rp2040_flux_capture_drain(flux, cap, g_flux_n, false);
-    fdc_read_capture_end(true);
-    return false;
-  }
-  fdc_index_sample(); // measure the spindle as we go
-  g_flux_n = rp2040_flux_capture_drain(flux, cap, g_flux_n, false);
+  bool at_end = now - g_rc.t0 >= g_rc.window_us || g_flux_n >= cap;
+  if (!at_end)
+    fdc_index_sample(); // measure the spindle as we go
+  // At the end too: take what the DMA ring collected since the last pass
+  // before stopping, or a sector ending in that stretch would be cut short.
+  if (g_flux_n < cap)
+    g_flux_n = rp2040_flux_capture_drain(flux, cap, g_flux_n, false);
+  // Checked after EVERY drain, the final one included, and before the capture
+  // can be marked complete.
   if (rp2040_flux_capture_overrun()) {
     // The DMA ring was lapped: the consumer jumped ahead and the buffer now
     // has a silent hole -- a place where an ID can pair with a later
     // sector's data (issue #5). Throw the capture away and start over; it
-    // does not count as a search attempt.
+    // does not count as a search attempt. The pending sector stays pending:
+    // the decode block waits for the new capture (see g_rc_active there).
     S.cap_overruns++;
     uint32_t w = g_rc.window_us, gen = g_rc.gen;
     fdc_read_capture_start(w, gen);
     return g_rc_active;
+  }
+  if (at_end) {
+    fdc_read_capture_end(true);
+    return false;
   }
   return true;
 }
@@ -4140,7 +4144,10 @@ void fdc_disk_task(void) {
           // those two disagree.
           fdc_note_size_code(g_readaddr_id[0], g_readaddr_id[3]);
         }
-      } else if (g_flux_n > 0) {
+      } else if (g_flux_n > 0 || g_rc_active) {
+        // (A running capture with an empty buffer -- just restarted after a
+        // ring overrun -- is pumped by the not-captured-yet path below, not
+        // reported as RNF.)
         // WD ID track compare against the Track register -- see MFM_ANY_CYL.
         sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                              g_secbuf, sizeof(g_secbuf));

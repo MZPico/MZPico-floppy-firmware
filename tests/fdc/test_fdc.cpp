@@ -1222,3 +1222,25 @@ TEST(missing_sector_searched_about_four_revolutions_before_rnf) {
     CHECK(now() - t1 < ms(20));
   });
 }
+
+// #5 during a READ MULTIPLE: an overrun restarts the running capture (and
+// empties the buffer) while a sector is pending. That sector must wait for
+// the new capture, not be reported RNF from the empty buffer.
+TEST(overrun_during_read_multiple_keeps_the_pending_sector) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    for (int at : {20000, 60000, 110000}) {
+      arm_capture_overrun((uint64_t)at, 30000);
+      wd::Xfer x = wd::read_sector(6, 1, 9 * 512, /*multi=*/true, 5000);
+      CHECK_EQ(x.data.size(), 9u * 512u);
+      CHECK_EQ(error_bits(x.status), 0);
+      for (int r = 1; r <= 9 && x.data.size() == 9 * 512; ++r)
+        CHECK(matches_pattern(std::vector<uint8_t>(x.data.begin() + (r - 1) * 512,
+                                                   x.data.begin() + r * 512), 6, 0, r));
+    }
+  }, ms(60000));
+}

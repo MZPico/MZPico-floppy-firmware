@@ -202,19 +202,29 @@ size_t rp2040_flux_capture_drain(volatile uint8_t *dest, size_t dest_cap,
   if (!g_cap_active)
     return n;
   uint64_t lim = now();
-  if (g_ovr_armed && lim >= g_cap_start + sim::us(g_ovr_at + g_ovr_hole)) {
-    // Lapped: everything between `at` and `at + hole` is lost, and the
-    // consumer resumes there.
-    uint64_t skip_to = g_cap_start + sim::us(g_ovr_at + g_ovr_hole);
-    if (g_cap_last < skip_to)
-      g_cap_last = skip_to;
-    g_ovr_armed = false;
-    g_ovr_flag = true;
-  }
   while (n < dest_cap) {
     uint64_t t = cable().next_transition(g_cap_last);
     if (t > lim)
       break;
+    if (g_ovr_armed) {
+      // Lapped: nothing between `at` and `at + hole` is ever delivered, the
+      // consumer resumes after it, and the flag is up from then on. (Withheld
+      // per transition, so frequent drains cannot have delivered it first.)
+      uint64_t hs = g_cap_start + sim::us(g_ovr_at);
+      uint64_t he = hs + sim::us(g_ovr_hole);
+      if (t >= hs) {
+        if (lim < he)
+          break; // still inside the hole: deliver nothing yet
+        if (t < he) {
+          g_cap_last = he;
+          g_ovr_armed = false;
+          g_ovr_flag = true;
+          continue;
+        }
+        g_ovr_armed = false;
+        g_ovr_flag = true;
+      }
+    }
     uint64_t d = t - g_cap_last;
     dest[n++] = (uint8_t)(d > 255 ? 255 : d);
     g_cap_last = t;
