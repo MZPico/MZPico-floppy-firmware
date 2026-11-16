@@ -35,7 +35,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
       - name: core1 bus path stays in RAM (issue #12)
-        run: tools/ci/check_core1_ram.sh build/mzpico_floppy.elf
+        run: tools/ci/check_core1_ram.py build/mzpico_floppy.elf
       - name: report
         run: |
           {

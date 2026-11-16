@@ -228,7 +228,7 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   `%` by a non-power-of-two compiles to a libgcc call in flash, and a `switch`
   to a jump table in flash `.rodata` (both found in the register handlers,
   #12; fdc.cpp now builds with `-fno-jump-tables`). CI runs
-  `tools/ci/check_core1_ram.sh` on the built firmware: it fails if the listen
+  `tools/ci/check_core1_ram.py` on the built firmware: it fails if the listen
   loop or the register handlers call into flash (veneers included) or load a
   flash literal.
 - **Bisect before theorising.** When a known-good build exists and a new one

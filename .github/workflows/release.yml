@@ -57,7 +57,7 @@ jobs:
           got="$(sed -n 's/.*"\(.*\)".*/\1/p' build/generated/gitver.h)"
           echo "build id: $got (tag commit $want)"
           test "$got" = "$want"
-          tools/ci/check_core1_ram.sh build/mzpico_floppy.elf
+          tools/ci/check_core1_ram.py build/mzpico_floppy.elf
 
       - name: assets
         run: |
