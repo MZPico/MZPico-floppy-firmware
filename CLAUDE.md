@@ -193,7 +193,11 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   successful retry can no longer erase the evidence. Still to do: catch one.
   `at_ms` is the discriminator — under ~3 s points at a capture taken before the
   spindle was stable rather than at the decode path; the suspects otherwise are
-  the 5 ms `settle_delay_ms` right after a seek.
+  the 5 ms `settle_delay_ms` right after a seek. **Prime suspect since
+  2026-11: the read-window bug fixed below** (the old window was shorter than
+  one revolution on any dense directory track, and the boot reads exactly
+  that track) — re-measure the boot error rate on the fixed build before
+  chasing anything else.
 - ~~**`goto_track()` assumes the head arrived**~~ — ✅ addressed, two ways.
   `goto_track()` now cross-checks its belief against the TRK00 sense on every
   call and forces a recalibrate when they disagree (the belief is derived from
@@ -292,6 +296,20 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     enforces the WD ID **track compare**. `mzp_probe.py rddiag` now reports the
     whole position chain (Track reg → head_target → drive belief → disk cyl)
     plus cumulative `sec_ok`/`sec_crc_err`/`sec_rnf`/`sec_cyl_mismatch`.
+  - **The read window is one revolution + one sector span, in TIME (fixed
+    2026-11).** It used to stop at a fixed count of flux transitions (45700
+    DD), assumed to be ~1.05 rev. A transition count is data-dependent: ~38k
+    per rev for ordinary data but ~46–47k on a directory track of empty
+    (`0x00`, stored `0xFF`) entries, so the window was <1 rev exactly there
+    and a game's directory read failed with CRC ERROR (no recapture) at some
+    rotational phases while its data tracks read clean. And even a full rev
+    is not enough: the sector under the head when the window opens must be
+    caught whole on its next pass, so the margin is a whole sector span
+    (rev + 12 ms still failed 3 % offline). The period is measured per drive
+    from `~INDEX` during captures (`rddiag` shows it), default 220 ms. Bench
+    A/B on the real disk (`mzp_probe.py rdsoak T S side N legacy`, read-only,
+    random phases through the live window): old window 7/200 failures, new
+    200/200. A count-based window must never come back.
   - **3.3 WRITE SECTOR: DONE (hardware-verified) -- CP/M 4.1 on the MZ-800
     writes files to a physical disk and reads them back correct.** Measured over
     two disks (13 and 3 host writes): every write completed, and `wrdiag`
@@ -377,9 +395,10 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     auto): a valid host `0xDE` declaration decides (polarity observed from
     CP/M 4.1: `0x00` all through DD, `0x81` entering an HD format, so b0=1=HD;
     cleared on bus RESET), else a per-drive latch (default DD); `detect` adds
-    media probing for `0xDE`-less hosts. Capture windows are **byte-sized**
-    (45700 DD / 91400 HD, ~1.05 rev — rotation-relative, so a slow spindle
-    cannot truncate them). The Type I Index bit (b1) is live from `~INDEX`
+    media probing for `0xDE`-less hosts. Capture windows are rev + sector span
+    in time, with the revolution measured per drive (they were briefly a
+    fixed transition count, which turned out to be data-dependent — see the
+    read-window bullet above). The Type I Index bit (b1) is live from `~INDEX`
     only while HD is declared (`idxbit`); FORMAT4's HD path times the spindle
     with it, the DD boot ROM must not see it. A host WRITE TRACK trusts the
     declaration outright and falls back to the image's sector census only

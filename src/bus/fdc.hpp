@@ -267,6 +267,8 @@ struct FdcDebug {
   uint8_t last_trk_reg;      // Track register when last_id_cyl was sampled
   uint8_t last_head_target;  // our model of the head position at that read
   uint8_t last_phys_track;   // FloppyDrive's _track belief (0xFE = unknown)
+  uint32_t rev_us;           // measured revolution period, current drive (0 = not yet)
+  uint32_t window_us;        // read window that period gives on the current track
   uint8_t last_want_side;    // physical head selected at that moment
   // Bus test on port 0xDF: write incrementing bytes, read transformed echo.
   uint8_t bt_active;
@@ -424,6 +426,22 @@ void fdc_bench_seek(uint8_t target, uint16_t param, uint8_t mode, FdcDebug *out)
 uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
                                uint8_t density, uint8_t *out, uint16_t out_size,
                                uint8_t *flags);
+
+// Bench-only: ONE read of `sector` through the LIVE Type II read window (not
+// the index-aligned bench capture above), after waiting `delay_us` so the
+// window starts at a rotational phase the caller chooses -- the probe's
+// `rdsoak` randomises it. `legacy` = 1 uses the pre-fix fixed transition count
+// (45700 DD / 91400 HD) instead of the timed rev + sector-span window, so one
+// build can A/B the two on the same disk. Density is the FDC's current one.
+// *flags: b0 found b1 has_data b2 data_crc_ok b3 deleted.
+struct FdcRdWin {
+  uint8_t flags;
+  uint32_t flux_n;     // transitions captured
+  uint32_t capture_us; // window length actually captured
+  uint32_t rev_us;     // measured revolution period (0 = not yet)
+};
+bool fdc_bench_read_window(uint8_t track, uint8_t sector, uint8_t side,
+                           uint8_t legacy, uint32_t delay_us, FdcRdWin *o);
 
 // Bench-only SYNCHRONOUS write of one sector (no MZ-800): select+spin, seek to
 // `track`, select `side`, then locate sector `sector` on the spinning disk and

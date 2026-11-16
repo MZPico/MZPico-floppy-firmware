@@ -83,6 +83,7 @@
 #define MZP_CMD_IDXBIT 0x9F    // Type I STATUS Index bit on/off (default on)
 #define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
 #define MZP_CMD_DENSEL 0xA1    // DENSEL pin override: 0/1 force, 2 auto, 3 query
+#define MZP_CMD_RDWIN 0xA2     // bench: one read through the LIVE read window
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -943,7 +944,8 @@ void gw_task() {
     //  write_attempts(4), verify_start_ok, verify_n(4), seek_error,
     //  verify_attempts(4), sec_ok(4), sec_crc_err(4), sec_rnf(4),
     //  last_id_cyl, last_id_head, sec_cyl_mismatch(4), last_trk_reg,
-    //  last_want_side, last_head_target, last_phys_track] -- 92 bytes.
+    //  last_want_side, last_head_target, last_phys_track,
+    //  rev_us(4), window_us(4)] -- 104 bytes.
     FdcDebug d;
     fdc_debug_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -997,6 +999,11 @@ void gw_task() {
     reply_buffer[i++] = d.last_want_side;
     reply_buffer[i++] = d.last_head_target;
     reply_buffer[i++] = d.last_phys_track;
+    const uint32_t w32[] = {d.rev_us, d.window_us};
+    for (uint32_t v : w32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
     cdc_write_all(reply_buffer, i);
   }
 
@@ -1096,6 +1103,27 @@ void gw_task() {
     for (int j = 0; j < 8; j++)
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (b.rd_bit_high[j] >> (8 * k)) & 0xFF;
+    cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_RDWIN) {
+    // [cmd, len, track, sector, side, legacy, delay_us(4)] ->
+    // [cmd, ACK, flags, flux_n(4), capture_us(4), rev_us(4)]
+    uint32_t delay = (uint32_t)cmd_buffer[6] | ((uint32_t)cmd_buffer[7] << 8) |
+                     ((uint32_t)cmd_buffer[8] << 16) |
+                     ((uint32_t)cmd_buffer[9] << 24);
+    if (delay > 1000000)
+      delay = 1000000;
+    FdcRdWin w;
+    bool ok = fdc_bench_read_window(cmd_buffer[2], cmd_buffer[3], cmd_buffer[4],
+                                    cmd_buffer[5], delay, &w);
+    reply_buffer[i++] = ok ? GW_ACK_OK : GW_ACK_NOUNIT;
+    reply_buffer[i++] = w.flags;
+    const uint32_t v32[] = {w.flux_n, w.capture_us, w.rev_us};
+    for (uint32_t v : v32) {
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    }
     cdc_write_all(reply_buffer, i);
   }
 

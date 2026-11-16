@@ -12,6 +12,7 @@ Usage:
     python mzp_probe.py PORT fdclog                      # recent WD command opcodes
     python mzp_probe.py PORT fdcseek [track] [param_ms] [mode]  # bench seek; mode 1=spin_motor 0=raw
     python mzp_probe.py PORT fdcread <track> <sector> [side] [dens]  # bench READ SECTOR via the FDC
+    python mzp_probe.py PORT rdsoak <track> <sector> [side] [n] [legacy]  # n reads via the LIVE window at random phases; legacy=1 = old 45700-transition window
     python mzp_probe.py PORT streamscan <track> <side> [dens] [capture_ms]  # A/B: streaming vs batch capture
     python mzp_probe.py PORT bustestreset                 # reset controller-side 0xDF bus-test counters
     python mzp_probe.py PORT bustest                      # 0xDF loopback + I/O-cycle timing diagnostics
@@ -92,6 +93,7 @@ MZP_CMD_DENSITY = 0x9E
 MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_FWVER = 0xA0
 MZP_CMD_DENSEL = 0xA1
+MZP_CMD_RDWIN = 0xA2
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -452,8 +454,8 @@ def fdc_line(r):
 def do_rddiag(s):
     s.write(bytes([MZP_CMD_RDDIAG, 2]))
     s.flush()
-    r = read_exact(s, 96)
-    if len(r) < 96 or r[1] != 0:
+    r = read_exact(s, 104)
+    if len(r) < 104 or r[1] != 0:
         print(f"bad/short reply: {r.hex()}")
         return
 
@@ -477,6 +479,7 @@ def do_rddiag(s):
     sec_cyl_mismatch = u32(88)
     last_trk_reg, last_want_side = r[92], r[93]
     last_head_target, last_phys_track = r[94], r[95]
+    rev_us, window_us = u32(96), u32(100)
 
     found = bool(result & 1)
     is_readaddr = bool(result & 0x10)
@@ -493,8 +496,12 @@ def do_rddiag(s):
     else:
         print(f"last Type II read: sector {want}  -> "
               f"{'OK' if found else 'RNF'}  [{flags}]")
+    rev_txt = (f"{rev_us / 1000:.1f} ms measured" if rev_us
+               else "not measured yet, 220.0 ms assumed")
+    rev_for_ratio = rev_us or 220000
     print(f"  capture : started={capture_ok}  {flux_n} flux bytes in "
-          f"{capture_us / 1000:.1f} ms  (~{flux_n / 43500:.2f} revolutions)")
+          f"{capture_us / 1000:.1f} ms  (~{capture_us / rev_for_ratio:.2f} "
+          f"revolutions; window {window_us / 1000:.1f} ms; rev {rev_txt})")
     print(f"  decode  : {search_us / 1000:.1f} ms")
     if not found and not is_readaddr:
         if ids_seen:
@@ -764,6 +771,56 @@ def do_fdcread(s, track, sector, side, dens):
     if data:
         preview = " ".join(f"{b:02X}" for b in data[:32])
         print(f"  first bytes: {preview}{' ...' if size > 32 else ''}")
+
+
+def do_rdsoak(s, track, sector, side, n, legacy):
+    """Read one sector n times through the firmware's LIVE Type II read window,
+    each starting at a random rotational phase -- the way a host READ lands.
+    legacy=1 reproduces the pre-fix fixed-transition-count window for A/B.
+    A sector whose data field the window cuts off shows up as CRC errors (and
+    some RNF); a correct window gives none on readable media."""
+    import random
+    ok = crc = rnf = nodata = 0
+    caps, fluxes, rev = [], [], 0
+    for k in range(n):
+        delay = random.randrange(0, 220000)
+        s.write(bytes([MZP_CMD_RDWIN, 10, track, sector, side, legacy & 1])
+                + delay.to_bytes(4, "little"))
+        s.flush()
+        r = read_exact(s, 15)
+        if len(r) < 15 or r[1] != 0:
+            print(f"bad/short reply: {r.hex()}")
+            return
+        flags = r[2]
+        flux_n = int.from_bytes(r[3:7], "little")
+        cap_us = int.from_bytes(r[7:11], "little")
+        rev = int.from_bytes(r[11:15], "little") or rev
+        caps.append(cap_us)
+        fluxes.append(flux_n)
+        if not flags & 1:
+            rnf += 1
+        elif not flags & 2:
+            nodata += 1
+        elif not flags & 4:
+            crc += 1
+        else:
+            ok += 1
+        if (k + 1) % 20 == 0 or k + 1 == n:
+            print(f"  {k + 1:4d}/{n}: ok {ok}  CRC {crc}  RNF {rnf}  "
+                  f"no-data {nodata}", flush=True)
+    cap_avg = sum(caps) / len(caps)
+    flux_avg = sum(fluxes) / len(fluxes)
+    print(f"track {track} side {side} sector {sector}, "
+          f"{'LEGACY 45700-transition' if legacy else 'timed'} window:")
+    print(f"  window  : {cap_avg / 1000:.1f} ms avg "
+          f"({min(caps) / 1000:.1f}..{max(caps) / 1000:.1f}), "
+          f"{flux_avg:.0f} transitions avg")
+    if rev:
+        print(f"  spindle : {rev / 1000:.1f} ms/rev measured -> window = "
+              f"{cap_avg / rev:.3f} rev, track holds ~"
+              f"{flux_avg * rev / cap_avg:.0f} transitions/rev")
+    print(f"  result  : {ok}/{n} ok, {crc} CRC ERROR, {rnf} RNF, "
+          f"{nodata} ID-without-data")
 
 
 def gen_pattern(mode, seed, n):
@@ -1496,6 +1553,13 @@ def main():
                          2: "FORCE on, ignoring EINT (diagnostic; hangs a host "
                             "with no floppy ISR)"}
                 print("~INT mode: " + names.get(r[2], f"? ({r[2]})"))
+        elif cmd == "rdsoak":
+            track = int(sys.argv[3])
+            sector = int(sys.argv[4])
+            side = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+            n = int(sys.argv[6]) if len(sys.argv) > 6 else 100
+            legacy = int(sys.argv[7]) if len(sys.argv) > 7 else 0
+            do_rdsoak(s, track, sector, side, n, legacy)
         elif cmd == "fdcread":
             track = int(sys.argv[3])
             sector = int(sys.argv[4])

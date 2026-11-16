@@ -74,12 +74,14 @@ static constexpr uint32_t FDC_TRACK_IDLE_US = 4000;
 // bytes and even a minimal one-sector format runs far longer; this bound exists
 // to reject glitches, not to validate geometry.
 static constexpr uint16_t FDC_TRACK_IMAGE_MIN = 256;
-// Flux budget for one formatted track. A DD revolution is ~43.5k transitions
-// (measured) and an HD one about double; the margin leaves the write with flux
-// still queued when the terminating index pulse arrives, which is what stops
-// it running out early.
-static constexpr size_t FDC_TRACK_FLUX_MAX_DD = 48000;
-static constexpr size_t FDC_TRACK_FLUX_MAX_HD = 96000;
+// Flux budget for one formatted track. Must exceed one revolution of the
+// DENSEST possible image, not a typical one: a revolution holds ~38k DD
+// transitions of ordinary data but up to one per bit cell (50k at 300 rpm,
+// ~54.7k on the 218.7 ms spindle) when the fill stores as 0x00/0xFF. The
+// margin leaves the write with flux still queued when the terminating index
+// pulse arrives, which is what stops it running out early. HD is double.
+static constexpr size_t FDC_TRACK_FLUX_MAX_DD = 56000;
+static constexpr size_t FDC_TRACK_FLUX_MAX_HD = 112000;
 
 // Size code N means 128 << N bytes, so 512 is 2. MZ-800 CP/M data tracks are
 // 9x512 (N=2); the boot track is 16x256 (N=1).
@@ -1150,7 +1152,8 @@ static bool fdc_try_other_density(const uint8_t *flux, size_t n_flux) {
 
 // Index is active-low. Waiting for a falling edge aligns capture close to the
 // start of a revolution (sector 1 conventionally follows index).
-static bool wait_for_index_falling_edge_ms(uint32_t timeout_ms) {
+static bool wait_for_index_falling_edge_ms(uint32_t timeout_ms,
+                                           uint32_t *edge_us = nullptr) {
   uint32_t t0 = to_ms_since_boot(get_absolute_time());
   // If we're currently inside the low pulse, wait for it to end first.
   while (!gpio_get(PIN_INDEX)) {
@@ -1162,39 +1165,101 @@ static bool wait_for_index_falling_edge_ms(uint32_t timeout_ms) {
     if ((to_ms_since_boot(get_absolute_time()) - t0) > timeout_ms)
       return false;
   }
+  if (edge_us)
+    *edge_us = time_us_32();
   return true;
 }
 
-// The capture window is sized in BYTES -- ~1.05 revolutions at the effective
-// density -- and NOT in time. Byte-sizing is rotation-relative: flux bytes
-// arrive exactly as fast as disk content passes the head, so a byte target
-// spans the same fraction of a revolution on any spindle. A time window does
-// not: HD support briefly used 210 ms here (nominal 1.05 rev at 300.0 rpm),
-// and on a real drive turning slightly slow it captured 0.96 of a revolution
-// -- measured: 41765 bytes against the ~43.5k of one turn -- so any sector
-// straddling the window boundary decoded truncated, throwing spurious CRC
-// errors and RNFs whose victims moved with rotational phase. FORMAT4's
-// verify pass failed on half its tracks that way while bench scans (whose
-// window is longer) showed a perfectly formatted disk.
+// The read window is ONE REVOLUTION PLUS ONE SECTOR SPAN, in TIME, with the
+// revolution period MEASURED from ~INDEX. Both halves of that are load-bearing:
 //
-// A DD revolution is ~43.5k transitions (measured with `scan`); HD is about
-// double. The host's measured patience after a READ is ~285 ms (25k STATUS
-// polls, see `rddiag`), so the window must stay near 1.05 revolutions -- 1.25
-// left only ~7 ms of decode headroom. Used by the Type II read window and the
-// Type I Verify pass.
+// * A sector is only readable from a window that holds it whole. The window
+//   starts at whatever rotational phase the command arrives at, so the sector
+//   passing the head at that instant is lost at the front and must be caught
+//   on its next pass -- which starts up to one revolution later and needs a
+//   full sector span (ID + Gap 2 + data + CRC, ~18 ms for 512 B at DD) to
+//   finish. Anything shorter than rev + span reads a truncated data field
+//   from SOME phase, and that surfaces as a CRC ERROR (which, unlike RNF, gets
+//   no second capture). Offline, with the firmware's own encode/decode at
+//   every phase: rev + 12 ms gives 3% CRC errors, rev + 20.5 ms gives none.
 //
-// Auto-detect note: a DD-sized capture of an HD disk holds ~half an HD
-// revolution -- plenty for the cheap first-ID probe that flips the latch; the
-// first re-decode may then miss its sector, and the host's retry recaptures
-// at the flipped density's full size.
-static constexpr size_t FDC_READ_CAPTURE_BYTES_DD = 45700;
-static constexpr size_t FDC_READ_CAPTURE_BYTES_HD = 91400;
-// Safety bound on any capture window (a revolution is ~200 ms); the byte
-// target is what normally ends it.
+// * The window used to be a fixed count of flux TRANSITIONS (45700 DD / 91400
+//   HD), on the belief that a count is rotation-relative. It is, but it is
+//   also DATA-relative: one revolution holds ~38k transitions of ordinary data
+//   but ~47k when the sectors are runs of 0x00/0xFF -- an empty Disk BASIC
+//   directory, as stored through the inverted bus. 45700 is then 0.97 rev,
+//   and a game's directory read failed with CRC ERROR on 9% of rotational
+//   phases (plus 3% RNF) while its compressed data tracks read clean.
+//
+// * A fixed TIME is not the answer either: HD support briefly used 210 ms and
+//   a drive turning at 218.7 ms per revolution captured 0.96 rev (FORMAT4's
+//   verify then failed on half its tracks). So the period is measured per
+//   drive, from index edges seen during any capture (every Verify sees two;
+//   ~1 read in 10 does), and a conservative default covers the reads before
+//   the first measurement.
+//
+// The host's measured patience after a READ is ~285 ms, so the window must not
+// grow freely: rev + span is ~220 ms on a nominal spindle, ~240 ms on the slow
+// one -- no longer than the old count window was on ordinary data.
+static constexpr uint32_t FDC_REV_US_DEFAULT = 220000; // > slowest drive seen
+static constexpr uint32_t FDC_REV_US_MIN = 150000;     // plausibility band for
+static constexpr uint32_t FDC_REV_US_MAX = 260000;     // a measured period
+// Hard bound on any capture window, whatever the estimate says.
 static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
 
-ALWAYS_INLINE size_t fdc_read_capture_bytes(void) {
-  return fdc_is_hd() ? FDC_READ_CAPTURE_BYTES_HD : FDC_READ_CAPTURE_BYTES_DD;
+// Measured revolution period per drive, us; 0 = not measured yet. core0 only.
+static uint32_t g_rev_us[FDC_DRIVE_MAX];
+
+static void fdc_note_rev_period(uint32_t period_us) {
+  if (period_us < FDC_REV_US_MIN || period_us > FDC_REV_US_MAX)
+    return; // a missed edge (2 revs) or a glitch -- not a period
+  uint32_t &r = g_rev_us[fdc_cur_idx()];
+  r = r ? (r * 3 + period_us) / 4 : period_us;
+}
+
+// One sector span plus slack, at the current density: the presync the decoder
+// locks on, the ID field, Gap 2 and the data field with its CRC. Floored at a
+// 512-byte sector so an unread cylinder (size cache at its default) is covered
+// for every MZ-800 geometry; a cached 1024-byte size widens it.
+static uint32_t fdc_sector_span_us(uint8_t trk) {
+  uint32_t sz = fdc_sector_size_for(trk);
+  if (sz < 512)
+    sz = 512;
+  return (uint32_t)((float)(sz + 128) * 16.0f * fdc_bit_us());
+}
+
+static uint32_t fdc_read_window_us(uint8_t trk) {
+  uint32_t rev = g_rev_us[fdc_cur_idx()];
+  uint32_t w = (rev ? rev : FDC_REV_US_DEFAULT) + fdc_sector_span_us(trk);
+  return (w < FDC_READ_CAPTURE_TIMEOUT_US) ? w : FDC_READ_CAPTURE_TIMEOUT_US;
+}
+
+// Drain an already-started capture for `window_us`, with NOTHING between
+// drains but a GPIO read: watching ~INDEX here is how the revolution period
+// gets measured at no extra latency. `index_t0` (if non-zero) is the index
+// edge the capture was started from, so a Verify measures on every pass.
+static size_t fdc_drain_window(uint8_t *flux, size_t cap, uint32_t window_us,
+                               uint32_t index_t0) {
+  size_t n = 0;
+  uint32_t t0 = time_us_32();
+  uint32_t e_prev = index_t0;
+  bool have_prev = index_t0 != 0;
+  bool last_idx = gpio_get(PIN_INDEX);
+  while (n < cap) {
+    uint32_t now = time_us_32();
+    if (now - t0 >= window_us)
+      break;
+    bool idx = gpio_get(PIN_INDEX);
+    if (!idx && last_idx) { // falling edge (active low)
+      if (have_prev)
+        fdc_note_rev_period(now - e_prev);
+      e_prev = now;
+      have_prev = true;
+    }
+    last_idx = idx;
+    n = rp2040_flux_capture_drain(flux, cap, n, /*store_greaseweazle=*/false);
+  }
+  return n;
 }
 
 static constexpr uint32_t FDC_VERIFY_INDEX_SYNC_BUDGET_MS = 260;
@@ -1264,7 +1329,8 @@ static bool fdc_verify_track(uint8_t track) {
 
   // Start verify capture at an index edge when possible, to reduce rotational
   // alignment misses on media where the expected IDs are index-relative.
-  (void)wait_for_index_falling_edge_ms(FDC_VERIFY_INDEX_SYNC_BUDGET_MS);
+  uint32_t idx_t0 = 0;
+  (void)wait_for_index_falling_edge_ms(FDC_VERIFY_INDEX_SYNC_BUDGET_MS, &idx_t0);
 
   bool start_ok = rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA);
   S.verify_start_ok = start_ok;
@@ -1290,11 +1356,7 @@ static bool fdc_verify_track(uint8_t track) {
   // The old loop also had no timeout: its only exit was `n < cap`, so a drive
   // producing no transitions at all (motor not up to speed, no disk) left it
   // spinning forever with BUSY held.
-  size_t want = (cap < fdc_read_capture_bytes()) ? cap : fdc_read_capture_bytes();
-  size_t n = 0;
-  uint32_t t0 = time_us_32();
-  while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US)
-    n = rp2040_flux_capture_drain(flux, want, n, /*store_greaseweazle=*/false);
+  size_t n = fdc_drain_window(flux, cap, fdc_read_window_us(track), idx_t0);
   rp2040_flux_capture_stop();
 
   S.verify_n = (uint32_t)n;
@@ -1353,21 +1415,16 @@ static constexpr uint32_t FDC_READADDR_TIMEOUT_US = 40000;
 // found. That is exactly what the previous decode-while-capturing loop did,
 // which is why `scan`/`streamscan`/`fdcread` (all capture-then-decode) worked
 // while the live read path returned RNF on a perfectly good disk.
-static void fdc_capture_window(size_t want_bytes) {
+static void fdc_capture_window(uint32_t window_us) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
-  size_t want = (cap < want_bytes) ? cap : want_bytes;
 
   g_flux_n = 0;
   uint32_t t0 = time_us_32();
   g_stream_active = rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA);
   S.rd_capture_ok = g_stream_active;
   if (g_stream_active) {
-    while (g_flux_n < want &&
-           (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US) {
-      g_flux_n = rp2040_flux_capture_drain(flux, want, g_flux_n,
-                                           /*store_greaseweazle=*/false);
-    }
+    g_flux_n = fdc_drain_window(flux, cap, window_us, 0);
     rp2040_flux_capture_stop();
     g_stream_active = false;
   }
@@ -2335,6 +2392,8 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->last_trk_reg = S.last_trk_reg;
   o->last_head_target = S.last_head_target;
   o->last_phys_track = S.last_phys_track;
+  o->rev_us = g_rev_us[fdc_cur_idx()];
+  o->window_us = fdc_read_window_us(S.track);
   o->last_want_side = S.last_want_side;
   o->bt_active = S.bt_active ? 1 : 0;
   o->bt_last_rx = S.bt_last_rx;
@@ -2555,6 +2614,56 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
     memcpy(out, g_secbuf, n);
   }
   return n;
+}
+
+bool fdc_bench_read_window(uint8_t track, uint8_t sector, uint8_t side,
+                           uint8_t legacy, uint32_t delay_us, FdcRdWin *o) {
+  memset(o, 0, sizeof(*o));
+  fdc_apply_drive_select();
+  if (!DRV)
+    return false;
+
+  DRV->step_delay_us = 2000;
+  DRV->settle_delay_ms = 5;
+  DRV->motor_delay_ms = 300;
+  DRV->select(true);
+  g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+  DRV->side(side ? 1 : 0);
+  fdc_apply_densel();
+  DRV->goto_track(track);
+  if (delay_us)
+    sleep_us(delay_us);
+
+  size_t cap = 0;
+  uint8_t *flux = mzp_flux_buffer(&cap);
+  uint32_t t0 = time_us_32();
+  size_t n = 0;
+  if (legacy) {
+    // The pre-fix window, verbatim: stop at a fixed transition count.
+    size_t want = fdc_is_hd() ? 91400 : 45700;
+    if (want > cap)
+      want = cap;
+    if (rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA)) {
+      while (n < want && (time_us_32() - t0) < FDC_READ_CAPTURE_TIMEOUT_US)
+        n = rp2040_flux_capture_drain(flux, want, n, false);
+      rp2040_flux_capture_stop();
+    }
+  } else {
+    fdc_capture_window(fdc_read_window_us(track));
+    n = g_flux_n;
+    g_flux_n = 0; // the disk task must not mistake this for its own window
+  }
+  o->capture_us = time_us_32() - t0;
+  o->flux_n = (uint32_t)n;
+  o->rev_us = g_rev_us[fdc_cur_idx()];
+  if (!n)
+    return true;
+
+  SectorRead sd = mfm_read_sector(flux, n, fdc_bit_us(), sector, MFM_ANY_CYL,
+                                  g_secbuf, sizeof(g_secbuf));
+  o->flags = (uint8_t)((sd.found ? 0x01 : 0) | (sd.has_data ? 0x02 : 0) |
+                       (sd.data_crc_ok ? 0x04 : 0) | (sd.deleted ? 0x08 : 0));
+  return true;
 }
 
 bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
@@ -3023,7 +3132,7 @@ void fdc_disk_task(void) {
         size_t cap = 0;
         uint8_t *flux = mzp_flux_buffer(&cap);
         uint32_t t0 = time_us_32();
-        fdc_capture_window(fdc_read_capture_bytes());
+        fdc_capture_window(fdc_read_window_us(S.track));
         if (!S.trk_op) // aborted while we were blocked capturing
           return;
         size_t n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
@@ -3552,12 +3661,12 @@ void fdc_disk_task(void) {
         return;
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
-      // sync -- a 1.25-revolution window contains every sector regardless of
-      // where it starts, so waiting for index only adds latency.
+      // sync -- a rev + sector-span window contains every sector whole
+      // regardless of where it starts, so waiting for index only adds latency.
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);
       else
-        fdc_capture_window(fdc_read_capture_bytes());
+        fdc_capture_window(fdc_read_window_us(S.track));
       S.rd_fresh = false;
       // core1 can have aborted us while we were blocked capturing.
       if (!S.reading)
@@ -3617,9 +3726,10 @@ void fdc_disk_task(void) {
         // Still not found: grant ONE more revolution before reporting RNF. A
         // real WD1793 is more patient than a single window -- it keeps
         // matching ID fields until the FOURTH index pulse. Our single
-        // 1.05-rev capture missed its sector ~0.5% of the time at HD
-        // (measured: 2 RNFs in ~630 format-verify reads, the wanted sector
-        // sitting in the window's wrap region both times), and FORMAT4
+        // capture -- then a fixed transition count, see fdc_read_window_us --
+        // missed its sector ~0.5% of the time at HD (measured: 2 RNFs in ~630
+        // format-verify reads, the wanted sector sitting in the window's wrap
+        // region both times), and FORMAT4
         // aborts the whole format after two closely-spaced misses. A fresh
         // capture starts at a different rotational phase, so a double miss
         // is ~0.003%. Costs nothing on the success path; skipped when the
@@ -3627,7 +3737,7 @@ void fdc_disk_task(void) {
         // and on a wrong-cylinder result (another revolution cannot move
         // the head -- the resync below is the fix for that).
         if (!sd.found && !sd.cyl_mismatch && S.reading) {
-          fdc_capture_window(fdc_read_capture_bytes());
+          fdc_capture_window(fdc_read_window_us(S.track));
           if (S.reading && g_flux_n > 0)
             sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                                  g_secbuf, sizeof(g_secbuf));
