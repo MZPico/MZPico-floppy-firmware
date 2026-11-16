@@ -165,7 +165,7 @@ TEST(verify_track_checks_cylinder) {
 // between an ID and an orphan data field must not shrink below the DAM
 // window in the sum. A saturated interval inside the window rejects the pair.
 TEST(flux_dropout_between_id_and_orphan_data_does_not_pair_them) {
-  XFAIL("dropout under-count: the 8-bit capture clamps gaps to 255 and a splice junction makes that clamp legal; see mfm_decode.cpp find_data_sync");
+  XFAIL("#45: a flux dropout is under-counted by the 8-bit capture clamp");
   TrackSpec spec = uniform(1, 0, 4, 2, false);
   spec.sectors[0].no_data = true;
   spec.sectors[1].no_id = true;

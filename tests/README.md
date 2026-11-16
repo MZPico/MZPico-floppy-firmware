@@ -78,9 +78,8 @@ A test for an open bug is marked `XFAIL("#N: ...")`. It passes the suite
 while it fails, and it **fails the suite once it passes** (XPASS), so the fix
 that closes the issue also has to remove the marker. Open ones:
 
-One: `flux_dropout_between_id_and_orphan_data_does_not_pair_them` (a flux
-dropout under-counted by the 8-bit capture clamp; see the note in
-`find_data_sync`). #2, #4, #8 and #20 started as XFAIL tests and are fixed.
+One: `flux_dropout_between_id_and_orphan_data_does_not_pair_them` (#45: a
+flux dropout under-counted by the 8-bit capture clamp). #2, #4, #8 and #20 started as XFAIL tests and are fixed.
 Every fixed review bug keeps a test that fails on the old firmware:
 
 | Issue | Test |

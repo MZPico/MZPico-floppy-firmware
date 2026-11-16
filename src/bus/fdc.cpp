@@ -350,6 +350,7 @@ struct FdcState {
   volatile bool rd_capture_ok = false;  // did the capture window start?
   volatile uint32_t rd_flux_n = 0;      // flux bytes captured for the last read
   volatile uint32_t rd_capture_us = 0;  // wall time spent in the capture window
+  volatile uint32_t rd_early = 0;       // reads answered before the window ended (#35)
   volatile uint32_t rd_search_us = 0;   // wall time spent decoding
   volatile uint8_t rd_ids_seen = 0;     // ID fields decoded in that flux
   volatile uint8_t rd_ids[FDC_IDS_N] = {0}; // sector numbers actually found
@@ -961,6 +962,11 @@ uint8_t g_secbuf[FDC_SECTOR_MAX];
 uint8_t g_readaddr_id[6];     // last ID field found by READ ADDRESS
 bool g_readaddr_found = false;
 size_t g_flux_n = 0;         // bytes drained into the shared flux buffer so far
+// True when g_flux_n covers a full read window. A capture that stopped early
+// because its sector had arrived (fdc_read_capture_until) holds only part of the
+// track: a later sector missing from it, or cut off at its end, has not been
+// captured yet -- which is not RNF and not a CRC error.
+bool g_flux_complete = false;
 bool g_stream_active = false; // an incremental capture is currently running
 
 // Point DRV at the drive port 0xDC has selected. Returns false if the host
@@ -1466,8 +1472,163 @@ static void fdc_capture_window(uint32_t window_us) {
     rp2040_flux_capture_stop();
     g_stream_active = false;
   }
+  g_flux_complete = true;
   S.rd_capture_us = time_us_32() - t0;
   S.rd_flux_n = g_flux_n;
+}
+
+// READ SECTOR's capture (issue #35): the flux is decoded as it arrives, and a
+// sector is answered the moment it is in the buffer whole with a good data
+// CRC -- half a revolution on average, as on a real WD, instead of a fixed
+// ~225 ms window every time.
+//
+// The capture is NOT stopped when a sector is found. It keeps running across
+// disk-task passes for the rest of its window (fdc_read_capture_pump drains
+// the DMA ring on every pass, including while the host is taking the bytes),
+// so the next sector of a READ MULTIPLE is normally already in the buffer
+// when the host asks for it. Stopping at the first sector made every
+// following one wait a whole revolution: at HD a sector passes in ~11 ms,
+// about what a Z80 needs to take 512 bytes.
+//
+// Decoding between drains is safe now: the capture fills a DMA ring (tens of
+// ms of flux at DD, ~20 ms at HD), and each decode covers only the newest
+// flux plus one sector span of overlap -- the overlap is what catches a
+// sector straddling two decode points, decoded whole on the first pass after
+// its data field ends.
+//
+// Failure handling is unchanged: no good copy -> the full window is captured
+// and decoded exactly as before (density probe, second chance, RNF). The
+// capture ends at once when the command is aborted or superseded (Force
+// Interrupt, any new command): a READ MULTIPLE's look-ahead past its last
+// sector used to cost a full window after the host had already said stop
+// (#23).
+static constexpr size_t FDC_EARLY_DECODE_BYTES = 1500; // ~8 ms of DD flux
+struct FdcReadCapture {
+  uint32_t t0, window_us, gen;
+  size_t decoded;
+  bool early_ok;
+  bool last_idx, have_prev;
+  uint32_t e_prev;
+};
+static FdcReadCapture g_rc;
+bool g_rc_active = false; // a READ capture is running (g_stream_active too)
+// The command generation the flux in the buffer was captured for. A sector is
+// only ever decoded out of a buffer captured for the live command: a new READ
+// landing between the fresh-capture check and the decode must not be served
+// from the previous command's flux (another drive, side or cylinder).
+uint32_t g_flux_gen = 0;
+
+static void fdc_read_capture_end(bool complete) {
+  if (g_stream_active) {
+    rp2040_flux_capture_stop();
+    g_stream_active = false;
+  }
+  g_rc_active = false;
+  g_flux_complete = complete;
+  S.rd_capture_us = time_us_32() - g_rc.t0;
+  S.rd_flux_n = g_flux_n;
+}
+
+// Drain once. Returns false when the capture has ended (window over, buffer
+// full, or the command it serves is gone).
+static bool fdc_read_capture_pump(void) {
+  if (!g_rc_active)
+    return false;
+  if (!g_stream_active) { // stopped by another path (select, write, ...)
+    g_rc_active = false;
+    g_flux_complete = false;
+    return false;
+  }
+  size_t cap = 0;
+  uint8_t *flux = mzp_flux_buffer(&cap);
+  uint32_t now = time_us_32();
+  if (!S.reading || S.cmd_gen != g_rc.gen) {
+    fdc_read_capture_end(false); // nobody wants the rest
+    return false;
+  }
+  if (now - g_rc.t0 >= g_rc.window_us || g_flux_n >= cap) {
+    // Take what the DMA ring collected since the last pass before stopping,
+    // or a sector ending in that stretch would be cut short.
+    if (g_flux_n < cap)
+      g_flux_n = rp2040_flux_capture_drain(flux, cap, g_flux_n, false);
+    fdc_read_capture_end(true);
+    return false;
+  }
+  bool idx = gpio_get(PIN_INDEX);
+  if (!idx && g_rc.last_idx) { // falling edge: measure the spindle as we go
+    if (g_rc.have_prev)
+      fdc_note_rev_period(now - g_rc.e_prev);
+    g_rc.e_prev = now;
+    g_rc.have_prev = true;
+  }
+  g_rc.last_idx = idx;
+  g_flux_n = rp2040_flux_capture_drain(flux, cap, g_flux_n, false);
+  return true;
+}
+
+static void fdc_read_capture_start(uint32_t window_us, uint32_t gen) {
+  if (g_stream_active) { // whatever was running belongs to something else
+    rp2040_flux_capture_stop();
+    g_stream_active = false;
+  }
+  g_rc_active = false;
+  g_flux_n = 0;
+  g_flux_complete = false;
+  g_rc.t0 = time_us_32();
+  g_rc.window_us = window_us;
+  g_rc.gen = gen;
+  g_flux_gen = gen;
+  g_rc.decoded = 0;
+  // Until this drive's revolution has been measured, run the full window: an
+  // early answer rarely leaves time for two index pulses, and the window size
+  // (fdc_read_window_us) depends on that measurement. One full read per drive
+  // per power-up, then every read can be answered early.
+  g_rc.early_ok = g_rev_us[fdc_cur_idx()] != 0;
+  g_rc.last_idx = gpio_get(PIN_INDEX);
+  g_rc.have_prev = false;
+  g_stream_active = rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA);
+  S.rd_capture_ok = g_stream_active;
+  g_rc_active = g_stream_active;
+  if (!g_rc_active)
+    fdc_read_capture_end(false);
+}
+
+// Pump the running capture until sector `want` is in the buffer whole and
+// good, or the capture ends. Returns with the capture still running if it was
+// found early.
+static void fdc_read_capture_until(uint8_t want) {
+  size_t cap = 0;
+  uint8_t *flux = mzp_flux_buffer(&cap);
+  uint16_t sz = fdc_sector_size_for(S.track);
+  // One sector span of overlap, in flux bytes (~8 transitions per byte of
+  // ordinary MFM data, over the data field plus its ID and gaps).
+  size_t back = ((size_t)(sz < 512 ? 512 : sz) + 160) * 8;
+  float bit = fdc_bit_us();
+  // Look at what is already in the buffer first: for the next sector of a
+  // READ MULTIPLE it usually is.
+  if (g_rc.decoded > g_flux_n) // the buffer was reset under us
+    g_rc.decoded = 0;
+  g_rc.decoded = g_rc.decoded > back ? g_rc.decoded - back : 0;
+  bool first = true;
+  while (true) {
+    if (!first && !fdc_read_capture_pump())
+      return;
+    first = false;
+    if (!g_rc.early_ok ||
+        (g_flux_n - g_rc.decoded < FDC_EARLY_DECODE_BYTES && g_rc_active &&
+         g_rc.decoded != 0))
+      continue;
+    size_t from = g_rc.decoded > back ? g_rc.decoded - back : 0;
+    SectorRead sd = mfm_read_sector(flux + from, g_flux_n - from, bit, want,
+                                    S.track, g_secbuf, sizeof(g_secbuf));
+    g_rc.decoded = g_flux_n;
+    if (sd.found && sd.has_data && sd.data_crc_ok) {
+      S.rd_early++;
+      S.rd_capture_us = time_us_32() - g_rc.t0;
+      S.rd_flux_n = g_flux_n;
+      return; // found: the capture keeps running for the next sector
+    }
+  }
 }
 
 // READ ADDRESS: capture and search in chunks, returning as soon as any ID field
@@ -3027,7 +3188,10 @@ static void fdc_apply_side(void) {
     return;
   DRV->side(want);
   g_applied_side = want;
+  if (g_rc_active)
+    fdc_read_capture_end(false); // it was capturing the other head
   g_flux_n = 0; // any captured flux belongs to the other head
+  g_flux_complete = false;
 }
 
 // The host has selected a unit that does not exist while work is still queued
@@ -3836,19 +4000,42 @@ void fdc_disk_task(void) {
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);
       else
-        fdc_capture_window(fdc_read_window_us(S.track));
+      {
+        fdc_read_capture_start(fdc_read_window_us(S.track), gen);
+        fdc_read_capture_until(S.rd_sector);
+      }
       if (!S.reading || S.cmd_gen != gen) {
         // Aborted or superseded while we were blocked capturing. The window
         // belongs to the old command; the new one (if any) recaptures.
+        if (g_rc_active)
+          fdc_read_capture_end(false);
         g_flux_n = 0;
         g_readaddr_found = false;
         return;
       }
     }
 
+    // Keep the read capture draining while the host takes the bytes of the
+    // sector just published: the next one of a READ MULTIPLE is passing the
+    // head meanwhile (see fdc_read_capture_until).
+    if (g_rc_active)
+      fdc_read_capture_pump();
+
     if (S.rd_done != S.rd_seq && !S.drq) {
       uint32_t seq = S.rd_seq; // snapshot
       uint32_t gen = S.cmd_gen;
+      // The buffer belongs to an older command generation: never decode it
+      // for this one. A new READ has rd_fresh set already; any other command
+      // that left this read live (a Type I does not end a read) gets a fresh
+      // capture for the live state -- after its move, since the capture waits
+      // for op_done -- instead of a decode of stale flux, or a wedge.
+      if (!S.read_addr && g_flux_gen != gen) {
+        if (g_rc_active)
+          fdc_read_capture_end(false);
+        g_flux_n = 0;
+        S.rd_fresh = true;
+        return;
+      }
       uint8_t want = S.rd_sector;
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
@@ -3878,6 +4065,22 @@ void fdc_disk_task(void) {
         // WD ID track compare against the Track register -- see MFM_ANY_CYL.
         sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                              g_secbuf, sizeof(g_secbuf));
+        // A buffer that stopped early (fdc_read_capture_until) holds the track only
+        // up to the previous sector. Not finding this one there -- or finding
+        // it cut off at the buffer's end -- means "not captured yet": capture
+        // for it now. This is the normal path for every sector of a READ
+        // MULTIPLE after the first, and it does not count as an attempt.
+        if (!(sd.found && sd.has_data && sd.data_crc_ok) && !g_flux_complete &&
+            S.reading && S.cmd_gen == gen) {
+          if (!g_rc_active || g_rc.gen != gen) { // stopped short: start again
+            fdc_apply_side();
+            fdc_read_capture_start(fdc_read_window_us(S.track), gen);
+          }
+          fdc_read_capture_until(want);
+          if (S.reading && S.cmd_gen == gen && g_flux_n > 0)
+            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
+                                 g_secbuf, sizeof(g_secbuf));
+        }
         // Nothing AT ALL at the latched density -- not even a wrong-cylinder
         // ID, which would prove the clock is right and the problem positional.
         // Re-decode the same window at the other bit clock before reporting
@@ -3909,7 +4112,10 @@ void fdc_disk_task(void) {
         // the head -- the resync below is the fix for that).
         if (!sd.found && !sd.cyl_mismatch && S.reading && S.cmd_gen == gen) {
           fdc_apply_side();
-          fdc_capture_window(fdc_read_window_us(S.track));
+          fdc_read_capture_start(fdc_read_window_us(S.track), gen);
+          fdc_read_capture_until(want);
+          if (g_rc_active) // found early: no need to hold the rest
+            fdc_read_capture_end(false);
           if (S.reading && S.cmd_gen == gen && g_flux_n > 0)
             sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                                  g_secbuf, sizeof(g_secbuf));
@@ -4052,5 +4258,6 @@ void fdc_disk_task(void) {
     // Nothing should hold the capture peripheral outside a read.
     rp2040_flux_capture_stop();
     g_stream_active = false;
+    g_rc_active = false;
   }
 }

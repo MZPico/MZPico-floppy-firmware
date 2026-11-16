@@ -4,6 +4,7 @@
 //
 // Conventions: wd::side() takes the ROM's side number; the MZ-800 card drives
 // ~HDSEL inverted, so ROM side 1 = physical head 0 and ROM side 0 = head 1.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -1029,4 +1030,98 @@ TEST(write_track_works_after_disk_inserted_into_empty_drive) {
     CHECK_EQ(error_bits(f2.status), 0);
   });
   CHECK_EQ(count_valid_sectors(g_disk[0].at(0, 0), false), 9);
+}
+
+// #35: a READ is answered as soon as its sector has passed the head, not after
+// a fixed full window. Over random rotational phases the average wait from
+// the command to the first DRQ is about half a revolution (+ a sector), as on
+// a real WD; it used to be the whole ~225 ms window every time.
+TEST(read_latency_is_rotational_not_a_full_window) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512); // first read on the drive: measures the spindle
+    srand(11);
+    uint64_t sum = 0, worst = 0;
+    const int N = 40;
+    for (int i = 0; i < N; ++i) {
+      wait_us((uint64_t)(rand() % 200000));
+      out(0xD9, 0);
+      out(0xDA, (uint8_t)(1 + i % 9));
+      uint64_t t0 = now();
+      out(0xD8, 0x80);
+      uint64_t first = 0;
+      size_t got = 0;
+      for (uint64_t end = now() + ms(2000); now() < end;) {
+        uint8_t s = wd::status();
+        if (s & wd::DRQ) {
+          if (!first)
+            first = now() - t0;
+          in(0xDB);
+          ++got;
+        } else if (!(s & wd::BUSY))
+          break;
+      }
+      CHECK_EQ(got, 512u);
+      sum += first;
+      worst = std::max(worst, first);
+    }
+    double avg_ms = (double)sum / N / ms(1);
+    double worst_ms = (double)worst / ms(1);
+    std::printf("  READ -> first DRQ: avg %.0f ms, worst %.0f ms\n", avg_ms, worst_ms);
+    CHECK(avg_ms < 150);
+    // The worst case is inherent: a READ arriving just as its sector starts
+    // to pass waits a revolution + a sector, i.e. the window itself.
+    CHECK(worst_ms < 250);
+  }, ms(60000));
+}
+
+// READ MULTIPLE over a whole track: each sector is captured as it arrives, so
+// the track takes about one revolution, not a window per sector.
+TEST(read_multiple_whole_track_takes_about_one_revolution) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(4);
+    wd::side(1);
+    wd::read_sector(4, 1, 512); // measure the spindle
+    uint64_t t0 = now();
+    wd::Xfer x = wd::read_sector(4, 1, 9 * 512, /*multi=*/true, 5000);
+    double t_ms = (double)(now() - t0) / ms(1);
+    std::printf("  READ MULTIPLE 9 x 512: %.0f ms\n", t_ms);
+    CHECK_EQ(x.data.size(), 9u * 512u);
+    CHECK_EQ(error_bits(x.status), 0);
+    for (int r = 1; r <= 9 && x.data.size() == 9 * 512; ++r)
+      CHECK(matches_pattern(std::vector<uint8_t>(x.data.begin() + (r - 1) * 512,
+                                                 x.data.begin() + r * 512), 4, 0, r));
+    CHECK(t_ms < 450);
+  });
+}
+
+// A Type I issued while a READ is still capturing (no Force Interrupt first)
+// does not end the read on this controller. The read must still complete --
+// never wedge with BUSY up -- once it notices its flux is from before the
+// move.
+TEST(type1_during_a_read_does_not_wedge_it) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 3);
+    out(0xD8, 0x80); // READ sector 3 on cylinder 0...
+    wait_ms(40);
+    out(0xDB, 5);
+    out(0xD8, 0x10); // ...and a SEEK 5 on top of it, no Force Interrupt
+    uint8_t st = wd::wait_ready(3000);
+    CHECK(st != 0xFF); // BUSY dropped
+    // ...and the controller is usable afterwards.
+    wd::Xfer x = wd::read_sector(5, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 5, 0, 2));
+  });
 }
