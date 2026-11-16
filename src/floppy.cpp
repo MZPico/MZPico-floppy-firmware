@@ -135,11 +135,13 @@ uint32_t FloppyDrive::s_motor_on_us = 0;
 
 bool FloppyDrive::head_ready(uint32_t settle_us, uint32_t spinup_us) {
   uint32_t now = time_us_32();
-  if (_settle_pending && now - _last_step_us >= settle_us)
+  // settle_us == 0 means "don't care about settling for this call" -- it must
+  // not clear the pending settle a later read or write still has to wait for.
+  if (settle_us && _settle_pending && now - _last_step_us >= settle_us)
     _settle_pending = false;
   if (s_spinup_pending && now - s_motor_on_us >= spinup_us)
     s_spinup_pending = false;
-  return !_settle_pending && !s_spinup_pending;
+  return (!settle_us || !_settle_pending) && !s_spinup_pending;
 }
 
 bool FloppyDrive::spin_motor(bool motor_on) {

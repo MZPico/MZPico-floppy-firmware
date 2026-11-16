@@ -3620,7 +3620,13 @@ void fdc_disk_task(void) {
     // to the read at that point, not to us -- and likewise to ANY command that
     // arrived after this seek (a WRITE SECTOR still being collected sets
     // neither op_seq nor `reading`), which cmd_gen catches.
-    if (S.op_seq == seq && S.cmd_gen == gen && !S.reading) {
+    // ...and not while a data command is pending either: a host can send
+    // STEP, Force Interrupt and WRITE back to back, so the seek and the write
+    // both predate this pass's snapshot. Clearing BUSY here told the host the
+    // write was done before it reached the disk; the host moved on and the
+    // splice then ran for a command nobody was waiting for.
+    if (S.op_seq == seq && S.cmd_gen == gen && !S.reading && !S.writing &&
+        !S.trk_op) {
       S.busy = false;
       S.last_ready_us = time_us_32(); // diagnostic: gap until the next command
       fdc_refresh_int_line();              // Type I complete
@@ -3871,7 +3877,10 @@ void fdc_disk_task(void) {
         // there is no timing window to hit, which is why formatting is the
         // safer of the two write paths despite being the more destructive.
         fdc_wait_head_ready(true);
-        ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
+        // The wait can last 500 ms: a reset or a new command meanwhile means
+        // nobody wants this track written any more.
+        if (S.cmd_gen == gen)
+          ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
                               /*use_index=*/true);
       }
     }
@@ -4024,6 +4033,10 @@ void fdc_disk_task(void) {
 
     float bit = fdc_bit_us();
     fdc_wait_head_ready(true); // the splice hunts IDs by reading
+    if (S.cmd_gen != gen) { // superseded during the wait: write nothing
+      S.wr_done = seq;
+      return;
+    }
     SpliceResult sr =
         mfm_write_sector(want, (int)S.track, g_secbuf, n, S.wr_deleted,
                          bit, FDC_WRITE_SEARCH_TIMEOUT_US);

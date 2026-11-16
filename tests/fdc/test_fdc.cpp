@@ -1427,3 +1427,27 @@ TEST(first_read_after_a_cold_spin_up_is_clean) {
     CHECK_EQ(bad, 0);
   }, ms(120000));
 }
+
+// A WRITE right behind a STEP + FORCE INTERRUPT (CP/M style, no BUSY waits):
+// the seek's completion must not clear the write's BUSY. When BUSY drops the
+// sector must already be on the media -- the host takes BUSY low as "written"
+// and moves on. (Found while adding the #32 gates: the seek completion
+// cleared BUSY for any pending command but a read.)
+TEST(write_behind_a_step_keeps_busy_until_on_media) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    for (int k = 0; k < 4; ++k) {
+      size_t before = cable().drive[0].writes.size();
+      out(0xD8, 0x50); // STEP IN...
+      wd::force_interrupt();
+      std::vector<uint8_t> v(512, (uint8_t)(0x40 + k));
+      wd::Xfer w = wd::write_sector((uint8_t)(k + 1), 2, v); // ...and WRITE at once
+      CHECK_EQ(error_bits(w.status), 0);
+      CHECK(cable().drive[0].writes.size() > before); // on the media at BUSY low
+      CHECK(wd::read_sector((uint8_t)(k + 1), 2, 512).data == v);
+    }
+  });
+}
