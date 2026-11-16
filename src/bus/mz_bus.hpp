@@ -36,6 +36,10 @@ struct BusDiag {
   volatile uint32_t wr_late_at_sample; // WRITE: legacy (core1 no longer samples);
                                        // always 0 - kept for the dump layout
   volatile uint32_t rd_late_at_pop;    // READ: cycle over before we could drive
+  // READ: served, but IORQ was already high on the first poll after the drive:
+  // EXWAIT never held the Z80, which sampled before the byte was on the pins.
+  // One wrong byte for the host, invisible otherwise (#13).
+  volatile uint32_t rd_late_at_drive;
   volatile uint32_t wr_backlog;        // WRITE: >1 entry drained in one pass
   volatile uint32_t rd_backlog;        // READ: >1 entry drained in one pass
 };
@@ -77,3 +81,6 @@ void bus_pin_selftest(uint8_t *pu, uint8_t *pd);
 //           the MZ-800), measures the connector D-pins
 // NB: only meaningful with the board out of the MZ-800 (no bus cycles firing).
 void bus_drive_test(uint8_t value, uint8_t mode);
+// Undo what a bench pin test did: C0..C7 back to inputs with their default
+// pulls, gates back to the PIO, SMs restarted (= bus_drive_test(0, 0)).
+inline void bus_bench_restore(void) { bus_drive_test(0, 0); }

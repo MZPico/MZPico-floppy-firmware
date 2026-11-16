@@ -91,6 +91,10 @@ void bus_park_gates(void) {
 static uint g_off_read, g_off_write;
 
 static void setup_bus_pio(void) {
+  // Claim the bus SMs: the flux allocator (arch_rp2) claims "any unused SM" on
+  // pio0 then pio1, and could otherwise be handed a live bus SM (#25).
+  pio_sm_claim(BUS_PIO, SM_READ);
+  pio_sm_claim(BUS_PIO, SM_WRITE);
   g_off_read = pio_add_program(BUS_PIO, &bus_read_program);
   g_off_write = pio_add_program(BUS_PIO, &bus_write_program);
   bus_read_init(BUS_PIO, SM_READ, g_off_read);
@@ -193,12 +197,19 @@ RAM_FUNC static void listen_loop(void) {
         pio_sm_put(BUS_PIO, SM_READ, 1);
         bus_settle();     // U2 turn-on + propagation before we free the Z80
         release_exwait(); // data is valid on the bus before we free the Z80
-        while (!iorq_is_high()) { /* hold until the Z80 finishes the cycle */
-        }
+        // The wait loop's first poll, taken out of the loop: IORQ already high
+        // here means the cycle ended before the byte was driven (#13). No
+        // extra work on the path -- the loop would read it anyway.
+        bool late = iorq_is_high();
+        if (!late)
+          while (!iorq_is_high()) { /* hold until the Z80 finishes the cycle */
+          }
         // The SM blocks U2 on IORQ high and holds the address buffer off for
         // the guard delay; drop our own drive inside that window (see bus.pio).
         release_data_bus();
         // --- off the critical path from here ---
+        if (late)
+          g_bus_diag.rd_late_at_drive++;
         g_bus_hello.reg[idx] = bus_byte;
         g_bus_hello.rd[idx]++;
       }
@@ -225,6 +236,7 @@ void bus_diag_reset(void) {
   g_bus_diag.wr_late_at_pop = 0;
   g_bus_diag.wr_late_at_sample = 0; // no longer incremented: the PIO samples
   g_bus_diag.rd_late_at_pop = 0;
+  g_bus_diag.rd_late_at_drive = 0;
   g_bus_diag.wr_backlog = 0;
   g_bus_diag.rd_backlog = 0;
 }
@@ -296,9 +308,20 @@ void bus_drive_test(uint8_t value, uint8_t mode) {
 
   if (mode == 0) { // release: restore normal bus operation
     release_data_bus();
+    // C0..C7 back to how init_bus_gpio() leaves them: SIO inputs with the
+    // pads' default pull-down (gpioread/pintest remove the pulls, #17).
+    for (int i = 0; i < DATA_BUS_COUNT; ++i) {
+      gpio_set_function(DATA_BUS_BASE + i, GPIO_FUNC_SIO);
+      gpio_set_dir(DATA_BUS_BASE + i, GPIO_IN);
+      gpio_pull_down(DATA_BUS_BASE + i);
+    }
     // All three gates go back to the bus PIO side-set (parked off / read dir),
-    // and the SMs restart from a clean slate: a halted write SM may have left
-    // half a transaction in its FIFO.
+    // through the same glitch-free handover as init (#10), and the SMs restart
+    // from a clean slate: a halted write SM may have left half a transaction
+    // in its FIFO.
+    const uint32_t gate_mask = 7u << EN0_PIN;
+    pio_sm_set_pins_with_mask(BUS_PIO, SM_READ, gate_mask, gate_mask);
+    pio_sm_set_pindirs_with_mask(BUS_PIO, SM_READ, gate_mask, gate_mask);
     for (int p : gate_pins) {
       gpio_put(p, 1);
       gpio_set_function(p, GPIO_FUNC_PIO1);

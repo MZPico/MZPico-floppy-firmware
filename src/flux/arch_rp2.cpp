@@ -69,6 +69,12 @@ typedef struct floppy_singleton {
   unsigned sm;
   uint16_t offset;
   uint16_t half;
+  // A second sample is pending in `half`. Its own flag, because 0 is a valid
+  // sample ({counter[14:0], index} with ~INDEX low and the counter's low 15
+  // bits 0): testing `half` for zero dropped it and merged two intervals
+  // (2T+2T read as 4T), bit-slipping whatever was under the head (#24;
+  // inherited from Adafruit_Floppy).
+  bool half_valid;
 } floppy_singleton_t;
 
 static floppy_singleton_t g_reader, g_writer;
@@ -194,13 +200,13 @@ static void ring_stop(void) {
 }
 
 static bool data_available() {
-  return g_reader.half || (g_ring_dma >= 0 && ring_unread() != 0);
+  return g_reader.half_valid || (g_ring_dma >= 0 && ring_unread() != 0);
 }
 
 static uint16_t read_fifo() {
-  if (g_reader.half) {
+  if (g_reader.half_valid) {
     uint16_t result = g_reader.half;
-    g_reader.half = 0;
+    g_reader.half_valid = false;
     return result;
   }
   // Callers only get here after data_available(); spin for the word anyway so
@@ -218,6 +224,7 @@ static uint16_t read_fifo() {
   uint32_t value = g_ring[g_ring_consumed & (FLUX_RING_WORDS - 1)];
   g_ring_consumed++;
   g_reader.half = value >> 16;
+  g_reader.half_valid = true;
   return value & 0xffff;
 }
 
@@ -276,6 +283,7 @@ static uint8_t *capture_foreground(int index_pin, uint8_t *start, uint8_t *end,
   uint32_t irq = save_and_disable_interrupts();
   pio_sm_clear_fifos(g_reader.pio, g_reader.sm);
   g_reader.half = 0;
+  g_reader.half_valid = false;
   ring_start();
   pio_sm_set_enabled(g_reader.pio, g_reader.sm, true);
   // Bounded prime -- same reasoning as in rp2040_flux_capture_start(): the
@@ -351,6 +359,7 @@ bool rp2040_flux_capture_start(int index_pin, int rdpin) {
   uint32_t irq = save_and_disable_interrupts();
   pio_sm_clear_fifos(g_reader.pio, g_reader.sm);
   g_reader.half = 0;
+  g_reader.half_valid = false;
   ring_start();
   pio_sm_set_enabled(g_reader.pio, g_reader.sm, true);
   restore_interrupts(irq);

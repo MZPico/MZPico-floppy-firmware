@@ -97,6 +97,8 @@
 #define GW_ACK_WRPROT 6
 #define GW_ACK_NOUNIT 7
 #define GW_ACK_BADPIN 10
+// Bench drive command refused: the MZ-800 has a command in flight (#15).
+#define MZP_ACK_HOST_BUSY 0x80
 
 #define DBG(...)                                                               \
   do {                                                                         \
@@ -130,7 +132,7 @@ static FloppyDrive &g_drive = g_drive0;
 static FloppyDrive *floppy = nullptr;
 
 static uint8_t cmd_buffer[32];
-static uint8_t reply_buffer[256];
+static uint8_t reply_buffer[512]; // WRDIAG alone is 252 bytes (#25)
 static uint8_t flux_transitions[MAX_FLUX_PULSE_PER_TRACK];
 static bool flux_status = false;
 
@@ -157,14 +159,27 @@ template <class T> static inline T tmin(T a, T b) { return a < b ? a : b; }
 
 static uint32_t cdc_avail() { return tud_cdc_available(); }
 
-static uint8_t cdc_read1() {
+// One byte, or -1 after `timeout_ms` with nothing (#9). The old version waited
+// forever: two stray bytes on the port (a terminal, ModemManager's "AT") made
+// a frame header announcing a payload that never came, and core0 -- which
+// also runs the disk task -- was gone for good, BUSY held, floppy dead.
+// `serve_fdc` keeps the disk task running while we wait; only safe while no
+// USB command is executing (i.e. while a frame is still being received).
+static int cdc_read1_to(uint32_t timeout_ms, bool serve_fdc) {
   uint8_t b;
+  uint32_t t0 = millis();
   for (;;) {
     if (tud_cdc_available() && tud_cdc_read(&b, 1) == 1)
       return b;
     tud_task();
+    if (serve_fdc)
+      fdc_disk_task();
+    if (millis() - t0 > timeout_ms)
+      return -1;
   }
 }
+static constexpr uint32_t CDC_FRAME_BYTE_TIMEOUT_MS = 200;
+static constexpr uint32_t CDC_STREAM_TIMEOUT_MS = 2000;
 
 static void cdc_write_all(const void *data, uint32_t len) {
   const uint8_t *p = (const uint8_t *)data;
@@ -208,22 +223,28 @@ static bool setbustype(int bustype) {
 // returned "no command" after consuming two bytes. So: an oversized frame's
 // declared payload is drained and discarded here, and both malformed shapes
 // are reported instead of half-handled.
+//
+// A frame whose payload does not arrive within CDC_FRAME_BYTE_TIMEOUT_MS per
+// byte is dropped and reported (-1), and the disk task keeps running while
+// the rest of a frame is awaited (#9). The buffer is zeroed first, so a short
+// frame can never run a command with the previous command's argument bytes.
 static int get_cmd(uint8_t *buff, uint8_t maxbuff) {
   if (cdc_avail() < 2)
     return 0;
-  buff[0] = cdc_read1();
-  buff[1] = cdc_read1();
+  memset(buff, 0, maxbuff);
+  buff[0] = (uint8_t)cdc_read1_to(CDC_FRAME_BYTE_TIMEOUT_MS, true);
+  buff[1] = (uint8_t)cdc_read1_to(CDC_FRAME_BYTE_TIMEOUT_MS, true);
   uint8_t len = buff[1];
   if (len < 2)
     return -1; // header alone is broken; nothing more of it to consume
-  if (len > maxbuff) {
-    for (int i = 2; i < len; i++)
-      (void)cdc_read1(); // keep the stream in sync; the frame itself is junk
-    return -1;
+  for (int i = 2; i < len; i++) {
+    int b = cdc_read1_to(CDC_FRAME_BYTE_TIMEOUT_MS, true);
+    if (b < 0)
+      return -1; // truncated: drop it, the next bytes start a new frame
+    if (i < maxbuff)
+      buff[i] = (uint8_t)b;
   }
-  for (int i = 2; i < len; i++)
-    buff[i] = cdc_read1();
-  return len;
+  return len > maxbuff ? -1 : len; // oversized: drained above, reported here
 }
 
 void gw_init() {
@@ -247,6 +268,8 @@ void gw_init() {
   fdc_init(g_drives, 2);
 }
 
+static void gw_dispatch(uint8_t cmd, uint8_t len, int i);
+
 void gw_task() {
   int cmd_len = get_cmd(cmd_buffer, sizeof(cmd_buffer));
   if (!cmd_len) {
@@ -260,6 +283,7 @@ void gw_task() {
     // talks to us" rule.
     if ((millis() > timestamp) && ((millis() - timestamp) > 10000)) {
       if (!fdc_is_active()) {
+        fdc_bench_idle();
         if (floppy && floppy->motor_is_spinning()) {
           floppy->select(true);
           floppy->goto_track(0);
@@ -286,6 +310,34 @@ void gw_task() {
     return;
   }
 
+  // Commands that move, spin, read or write the drive share it -- and the
+  // flux buffer and the head -- with the live controller. Refuse them while
+  // the MZ-800 has a command in flight, and drop the controller's shadows of
+  // the drive after each one (#15).
+  bool drive_cmd = false;
+  switch (cmd) {
+  case GW_CMD_SEEK: case GW_CMD_HEAD: case GW_CMD_MOTOR: case GW_CMD_SELECT:
+  case GW_CMD_READFLUX: case GW_CMD_WRITEFLUX: case GW_CMD_SETBUSTYPE:
+  case MZP_CMD_SCAN: case MZP_CMD_STREAMSCAN: case MZP_CMD_FDCSEEK:
+  case MZP_CMD_FDCREAD: case MZP_CMD_FDCWRITE: case MZP_CMD_FDCFORMAT:
+  case MZP_CMD_READTRACK: case MZP_CMD_RDWIN:
+    drive_cmd = true;
+    break;
+  default:
+    break;
+  }
+  if (drive_cmd && fdc_host_busy()) {
+    reply_buffer[i++] = MZP_ACK_HOST_BUSY;
+    cdc_write_all(reply_buffer, 2);
+    return;
+  }
+  gw_dispatch(cmd, len, i);
+  if (drive_cmd)
+    fdc_bench_done();
+}
+
+static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
+  (void)len;
   if (cmd == GW_CMD_GETINFO) {
     uint8_t sub_cmd = cmd_buffer[2];
     if (sub_cmd == GW_CMD_GETINFO_FIRMWARE) {
@@ -318,6 +370,9 @@ void gw_task() {
         reply_buffer[i++] = usec >> 24;
       }
       cdc_write_all(reply_buffer, 34);
+    } else { // unknown sub-command: answer it, never leave the host hanging (#9)
+      reply_buffer[i++] = GW_ACK_BADCMD;
+      cdc_write_all(reply_buffer, 2);
     }
   }
 
@@ -343,6 +398,9 @@ void gw_task() {
       reply_buffer[i++] = floppy->watchdog_delay_ms & 0xFF;
       reply_buffer[i++] = floppy->watchdog_delay_ms >> 8;
       cdc_write_all(reply_buffer, 12);
+    } else { // unknown sub-command (#9)
+      reply_buffer[i++] = GW_ACK_BADCMD;
+      cdc_write_all(reply_buffer, 2);
     }
   }
 
@@ -509,12 +567,20 @@ void gw_task() {
 
       uint32_t fluxors = 0;
       uint8_t flux = 0xFF;
+      bool stalled = false;
       while (flux && (fluxors < MAX_FLUX_PULSE_PER_TRACK)) {
-        flux = cdc_read1();
+        int b = cdc_read1_to(CDC_STREAM_TIMEOUT_MS, false);
+        if (b < 0) {
+          stalled = true; // the host stopped sending: never write a fragment
+          break;
+        }
+        flux = (uint8_t)b;
         flux_transitions[fluxors++] = flux;
       }
-      if (fluxors == MAX_FLUX_PULSE_PER_TRACK) {
-        // overrun; bail with a status the host can see on GETFLUXSTATUS
+      if (fluxors == MAX_FLUX_PULSE_PER_TRACK || stalled || fluxors < 8) {
+        // overrun, a stalled stream, or one too short to hold the 7-byte
+        // trailer (fluxors - 7 would wrap): bail with a status the host sees
+        // on GETFLUXSTATUS
         flux_status = false;
       } else {
         flux_status = floppy->write_track(flux_transitions, fluxors - 7, true,
@@ -537,12 +603,16 @@ void gw_task() {
     cdc_write_all(reply_buffer, 2);
     bandwidth_timer = millis();
     transfered_bytes = numbytes;
+    uint32_t last_rx = millis();
     while (numbytes != 0) {
       uint32_t avail = cdc_avail();
       if (avail == 0) {
         tud_task();
+        if (millis() - last_rx > CDC_STREAM_TIMEOUT_MS)
+          break; // the host stopped sending (#9)
         continue;
       }
+      last_rx = millis();
       uint32_t to_read = tmin(numbytes, tmin((uint32_t)sizeof(reply_buffer), avail));
       numbytes -= tud_cdc_read(reply_buffer, to_read);
     }
@@ -817,6 +887,8 @@ void gw_task() {
     // Bench pin-read: report the live C0..C7 input byte. cmd_buffer[2] != 0 ->
     // isolate (halt SMs, C-pins = SIO in, no pull) so a jumper on C0 owns it.
     uint8_t raw = bus_read_pins(cmd_buffer[2] != 0);
+    if (cmd_buffer[2] != 0)
+      bus_bench_restore(); // the read is done: give the bus back (#17)
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = raw;
     cdc_write_all(reply_buffer, i);
@@ -1061,7 +1133,7 @@ void gw_task() {
     //  wr_late_at_pop(4), wr_late_at_sample(4), rd_late_at_pop(4),
     //  wr_backlog(4), rd_backlog(4), bit_high[8]*4, err_adjacent(4),
     //  rd_reports(4), rd_err(4), rd_bits_want1, rd_bits_want0, rd_last_exp,
-    //  rd_last_got, rd_bit_high[8]*4]  -- 144 bytes total.
+    //  rd_last_got, rd_bit_high[8]*4, rd_late_at_drive(4)]  -- 148 bytes.
     FdcBusTest b;
     fdc_bustest_snapshot(&b);
     reply_buffer[i++] = GW_ACK_OK;
@@ -1106,6 +1178,8 @@ void gw_task() {
     for (int j = 0; j < 8; j++)
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (b.rd_bit_high[j] >> (8 * k)) & 0xFF;
+    for (int k = 0; k < 4; k++) // appended: older probes read the first 144
+      reply_buffer[i++] = (g_bus_diag.rd_late_at_drive >> (8 * k)) & 0xFF;
     cdc_write_all(reply_buffer, i);
   }
 
@@ -1574,6 +1648,7 @@ void gw_task() {
     // Bench per-pad self-test: [cmd, ACK, pullup_byte, pulldown_byte].
     uint8_t pu = 0, pd = 0;
     bus_pin_selftest(&pu, &pd);
+    bus_bench_restore(); // SMs restarted, pulls and gates restored (#17)
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = pu;
     reply_buffer[i++] = pd;

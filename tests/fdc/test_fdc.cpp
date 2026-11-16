@@ -9,6 +9,7 @@
 #include <cstdlib>
 
 #include "board.hpp"
+#include "floppy.hpp"
 #include "testfw.hpp"
 
 using namespace sim;
@@ -1243,4 +1244,97 @@ TEST(overrun_during_read_multiple_keeps_the_pending_sector) {
                                                    x.data.begin() + r * 512), 6, 0, r));
     }
   }, ms(60000));
+}
+
+// ---------------- Robustness batch: #15, #23, #25 ----------------
+
+// #23: READ MULTIPLE's look-ahead past the end of the track is not a failure:
+// not counted and not latched in firstfail. It keeps the WD's search time
+// (without capturing), so a Force Interrupt always beats the RNF. The host
+// here asks for one sector more than the track has and never sends FI.
+TEST(end_of_track_lookahead_is_not_a_failure) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    FdcDebug d0 = dbg();
+    uint64_t t0 = now();
+    // 10 sectors wanted on a 9-sector track: the 10th is the look-ahead.
+    wd::Xfer x = wd::read_sector(5, 1, 10 * 512, /*multi=*/true, 3000);
+    double t_ms = (double)(now() - t0) / ms(1);
+    std::printf("  READ MULTIPLE ended after %.0f ms, st=%02x, %zu bytes\n",
+                t_ms, x.status, x.data.size());
+    CHECK_EQ(x.data.size(), 9u * 512u);
+    CHECK(x.status & wd::RNF); // the WD does report it, at the end...
+    CHECK(t_ms > 800);         // ...after its usual search time, so a host's
+                               // Force Interrupt always arrives first
+    FdcDebug d1 = dbg();
+    CHECK_EQ(d1.sec_rnf, d0.sec_rnf);
+    FdcFirstFail ff{};
+    fdc_firstfail_snapshot(&ff);
+    CHECK(!ff.valid);
+  });
+}
+
+// #15: a bench command that moves the head (as `scan` / `fdcread` do over
+// USB) must not leave the next host read on the bench's cylinder.
+TEST(bench_head_move_is_undone_before_the_next_host_read) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(10);
+    wd::side(1);
+    CHECK(matches_pattern(wd::read_sector(10, 1, 512).data, 10, 0, 1));
+    CHECK(!fdc_host_busy());
+    FloppyDrive *d = fdc_bench_drive(); // what the USB bench does...
+    REQUIRE(d != nullptr);
+    d->goto_track(30);
+    d->side(1);
+    fdc_bench_release();
+    fdc_bench_done();                   // ...and what it now does after
+    wd::side(1);
+    wd::Xfer x = wd::read_sector(10, 2, 512); // no seek: head must be back
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 10, 0, 2));
+    FdcDebug dd = dbg();
+    CHECK_EQ(dd.sec_cyl_mismatch, 0u);
+  });
+}
+
+TEST(host_busy_while_a_read_is_in_flight) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 1);
+    out(0xD8, 0x80);
+    wait_ms(5);
+    CHECK(fdc_host_busy()); // a bench drive command would be refused now
+    wd::wait_ready();
+    while (wd::status() & wd::DRQ)
+      in(0xDB);
+    CHECK(!fdc_host_busy());
+  });
+}
+
+// #25: with `drvlock 1`, a host that selects drive 1 must still have its
+// steps applied to the drive actually being driven (unit 0).
+TEST(drvlock_folds_steps_into_the_driven_unit) {
+  boot_with(Geometry::MZ_DD_DATA);
+  fdc_set_drive_lock(true);
+  run([] {
+    wd::select(1); // locked: unit 0 is driven
+    wd::restore();
+    wd::seek(20);
+    wd::side(1);
+    wd::Xfer x = wd::read_sector(20, 3, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 20, 0, 3));
+    CHECK_EQ(cable().drive[0].cyl, 20);
+  });
 }

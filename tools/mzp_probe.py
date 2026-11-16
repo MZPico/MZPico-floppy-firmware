@@ -24,7 +24,7 @@ Usage:
     python mzp_probe.py PORT wrdiag                       # why the last WRITE SECTOR wrote / was refused
     python mzp_probe.py PORT fdcwrite <track> <sector> [side] [sizecode] [mode] [seed]   # !! WRITES THE DISK
     python mzp_probe.py PORT wrverify <track> <sector> [side] [sizecode] [mode] [seed]   # !! write, read back, compare
-    python mzp_probe.py PORT wrsoak [passes] [sector] [t_start] [t_end] [t_step] [side]  # !! write/verify soak over the surface
+    python mzp_probe.py PORT wrsoak <passes> <sector> <t_start> <t_end> [t_step] [side]  # !! write/verify soak over the surface (range required)
     python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive]  # !! splices; read rdtrack (from rddrive) before each = CP/M A->B
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
@@ -144,7 +144,7 @@ def do_iotrace(s):
     s.flush()
     hdr = read_exact(s, 7)  # cmd, ack, count, total(4 LE)
     if len(hdr) < 7 or hdr[1] != 0:
-        print(f"bad reply: {hdr.hex()}")
+        print(f"bad reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     n = hdr[2]
     total = int.from_bytes(hdr[3:7], "little")
@@ -178,6 +178,17 @@ def do_iotrace(s):
         print(f"  {'RD' if is_rd else 'WR':<3} 0x{port:02X}  "
               f"{REG_NAMES.get(port, '?'):<10} 0x{val:02X}  0x{tv:02X}  "
               f"{rp:>6}  {note}")
+
+
+MZP_ACK_HOST_BUSY = 0x80
+
+
+def busy_hint(r):
+    """Explain the firmware's refusal of a bench drive command (#15)."""
+    if r and len(r) >= 2 and r[1] == MZP_ACK_HOST_BUSY:
+        return (" -- refused: the MZ-800 has a floppy command in flight "
+                "(the bench would move its drive under it); retry when idle")
+    return ""
 
 
 def read_exact(s, n):
@@ -241,7 +252,7 @@ def do_scan(s, track, side, dens):
     s.flush()
     hdr = read_exact(s, 7)  # cmd, ack, ns, nflux(4)
     if len(hdr) < 7 or hdr[1] != 0:
-        print(f"bad/short reply: {hdr.hex()}")
+        print(f"bad/short reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     ns, nflux = hdr[2], int.from_bytes(hdr[3:7], "little")
     print(f"track {track} side {side} dens {dens}: {ns} sectors, "
@@ -260,7 +271,7 @@ def do_streamscan(s, track, side, dens, capture_ms):
     s.flush()
     hdr = read_exact(s, 7)  # cmd, ack, ns, nflux(4)
     if len(hdr) < 7 or hdr[1] != 0:
-        print(f"bad/short reply: {hdr.hex()}")
+        print(f"bad/short reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     ns, nflux = hdr[2], int.from_bytes(hdr[3:7], "little")
     print(f"[streaming] track {track} side {side} dens {dens} "
@@ -274,7 +285,7 @@ def do_enctest(s, nsec, sizecode, dens):
     s.flush()
     hdr = read_exact(s, 9)  # cmd, ack, nsec, ns, valid, nflux(4 LE)
     if len(hdr) < 9 or hdr[1] != 0:
-        print(f"bad/short reply: {hdr.hex()}")
+        print(f"bad/short reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     req, ns, valid = hdr[2], hdr[3], hdr[4]
     nflux = int.from_bytes(hdr[5:9], "little")
@@ -292,7 +303,7 @@ def do_busdump(s):
     # cmd, ack, last_raw[8], wr[8]*4, rd[8]*4, addr_low, addr_high, dat_low, dat_high
     hdr = read_exact(s, 78)
     if len(hdr) < 78 or hdr[1] != 0:
-        print(f"bad/short reply: {hdr.hex()}")
+        print(f"bad/short reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     last_raw = hdr[2:10]
     wr = [int.from_bytes(hdr[10 + 4 * k:14 + 4 * k], "little") for k in range(8)]
@@ -456,7 +467,7 @@ def do_rddiag(s):
     s.flush()
     r = read_exact(s, 104)
     if len(r) < 104 or r[1] != 0:
-        print(f"bad/short reply: {r.hex()}")
+        print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return
 
     def u32(off):
@@ -599,9 +610,9 @@ def do_rddiag(s):
 def do_bustest(s):
     s.write(bytes([MZP_CMD_BUSTEST, 2]))
     s.flush()
-    r = read_exact(s, 144)
+    r = read_exact(s, 148)  # 144 from firmware before #13
     if len(r) < 144 or r[1] != 0:
-        print(f"bad/short reply: {r.hex()}")
+        print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return
 
     def u32(off):
@@ -689,6 +700,9 @@ def do_bustest(s):
     print(f"    write cycle already over when core1 popped : {wr_late_pop}")
     print(f"    write cycle ended mid-sample               : {wr_late_sample}")
     print(f"    read  cycle already over when core1 popped : {rd_late_pop}")
+    if len(r) >= 148:
+        print(f"    read  served but the Z80 had already sampled: {u32(144)}"
+              f"{'   <-- the host got wrong bytes (#13)' if u32(144) else ''}")
     print(f"    FIFO backlog (write / read)                : "
           f"{wr_backlog} / {rd_backlog}")
 
@@ -728,7 +742,7 @@ def do_fdclog(s):
     s.flush()
     hdr = read_exact(s, 5)  # cmd, ACK, count_lo, count_hi, n
     if len(hdr) < 5 or hdr[1] != 0:
-        print(f"bad reply: {hdr.hex()}")
+        print(f"bad reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     count = hdr[2] | (hdr[3] << 8)
     n = hdr[4]
@@ -754,7 +768,7 @@ def do_fdcread(s, track, sector, side, dens):
     s.flush()
     hdr = read_exact(s, 5)  # cmd, ACK, flags, size_lo, size_hi
     if len(hdr) < 5 or hdr[1] != 0:
-        print(f"bad/short reply: {hdr.hex()}")
+        print(f"bad/short reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     flags = hdr[2]
     size = hdr[3] | (hdr[4] << 8)
@@ -789,7 +803,7 @@ def do_rdsoak(s, track, sector, side, n, legacy):
         s.flush()
         r = read_exact(s, 15)
         if len(r) < 15 or r[1] != 0:
-            print(f"bad/short reply: {r.hex()}")
+            print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
             return
         flags = r[2]
         flux_n = int.from_bytes(r[3:7], "little")
@@ -861,7 +875,7 @@ def do_fdcwrite(s, track, sector, side, sizecode, mode, seed):
     s.flush()
     r = read_exact(s, 6)  # cmd, ACK, wrote, flags, size_lo, size_hi
     if len(r) < 6 or r[1] != 0:
-        print(f"bad/short reply: {r.hex()}")
+        print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return False
     wrote, flags = bool(r[2]), r[3]
     size = r[4] | (r[5] << 8)
@@ -913,7 +927,7 @@ def do_wrdiag(s):
     s.flush()
     r = read_exact(s, 252)
     if len(r) < 252 or r[1] != 0:
-        print(f"bad/short reply: {r.hex()}")
+        print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return
     wr_flags, last = r[2], r[3]
     ids_seen = r[4] | (r[5] << 8)
@@ -1129,6 +1143,18 @@ def do_health(s):
             print("           (fewer than 8 distinct commands so far -- "
                   "command-line check skipped)")
 
+    # 3b. Reads served after the Z80 had already sampled (#13): the one
+    # bus fault the other counters cannot see -- a wrong byte, CRC-clean.
+    s.write(bytes([MZP_CMD_BUSTEST, 2]))
+    s.flush()
+    r = read_exact(s, 148)
+    if len(r) >= 148 and r[1] == 0:
+        late = int.from_bytes(r[144:148], "little")
+        print(f"late rd  : {late} read(s) served after the Z80 had sampled")
+        if late:
+            warns.append(f"{late} read(s) reached the bus after the Z80 sampled "
+                         f"it: the host got a wrong byte each time (#13)")
+
     # 4. Verdict.
     print()
     if warns:
@@ -1156,7 +1182,7 @@ def do_resetdiag(s, clear=False):
     s.flush()
     r = read_exact(s, 35)
     if len(r) < 35 or r[1] != 0:
-        print(f"bad/short reply: {r.hex()}")
+        print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return
     line = r[2]
     (samples, rise, fall, high_max, low_min, last_high, events,
@@ -1197,7 +1223,7 @@ def do_firstfail(s, clear=False):
     s.flush()
     r = read_exact(s, 67)
     if len(r) < 67 or r[1] != 0:
-        print(f"bad/short reply: {r.hex()}")
+        print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return
     valid, kind = r[2], r[3]
     count = int.from_bytes(r[4:8], "little")
@@ -1388,7 +1414,7 @@ def do_fdcformat(s, track, side, nsec, sizecode, interleave, fill):
     s.flush()
     r = read_exact(s, 5)
     if len(r) < 5 or r[1] != 0:
-        print(f"bad/short reply: {r.hex()}")
+        print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return False
     result = r[2]
     n = r[3] | (r[4] << 8)
@@ -1423,7 +1449,7 @@ def do_readtrack(s, track, side, limit):
     s.flush()
     hdr = read_exact(s, 4)
     if len(hdr) < 4 or hdr[1] != 0:
-        print(f"bad/short reply: {hdr.hex()}")
+        print(f"bad/short reply: {hdr.hex()}{busy_hint(hdr)}")
         return
     n = hdr[2] | (hdr[3] << 8)
     data = read_exact(s, n) if n else b""
@@ -1450,7 +1476,7 @@ def do_pintest(s):
     s.flush()
     r = read_exact(s, 4)
     if len(r) < 4 or r[1] != 0:
-        print(f"bad reply: {r.hex()}")
+        print(f"bad reply: {r.hex()}{busy_hint(r)}")
         return
     pu, pd = r[2], r[3]
     print(f"pull-up  read = 0b{pu:08b} (0x{pu:02X})   want 0xFF")
@@ -1509,7 +1535,7 @@ def main():
             s.flush()
             r = read_exact(s, 47)
             if len(r) < 47 or r[1] != 0:
-                print(f"bad reply: {r.hex()}")
+                print(f"bad reply: {r.hex()}{busy_hint(r)}")
             else:
                 what = "RESTORE" if target == 0 else f"SEEK {target}"
                 mdesc = "spin_motor+index" if mode == 1 else "motor_raw+delay"
@@ -1531,7 +1557,7 @@ def main():
             s.flush()
             r = read_exact(s, 3)
             if len(r) < 3 or r[1] != 0:
-                print(f"bad reply: {r.hex()}")
+                print(f"bad reply: {r.hex()}{busy_hint(r)}")
             else:
                 print("side select: " + ("INVERTED (ROM side 0 -> physical "
                                          "head 1)" if r[2] else
@@ -1546,7 +1572,7 @@ def main():
             s.flush()
             r = read_exact(s, 3)
             if len(r) < 3 or r[1] != 0:
-                print(f"bad reply: {r.hex()}")
+                print(f"bad reply: {r.hex()}{busy_hint(r)}")
             else:
                 names = {0: "OFF (~INT never driven)",
                          1: "follow EINT (port 0xDF bit0) -- correct/default",
@@ -1794,7 +1820,7 @@ def main():
             s.flush()
             r = read_exact(s, 3)
             if len(r) < 3 or r[1] != 0:
-                print(f"bad reply: {r.hex()}")
+                print(f"bad reply: {r.hex()}{busy_hint(r)}")
             else:
                 print("bus RESET poller: " + ("ON" if r[2] else
                                               "OFF (core1 does not sample "
@@ -1809,10 +1835,18 @@ def main():
         elif cmd == "wrsoak":
             # !! WRITES THE DISK, repeatedly, across the whole surface.
             # args: [passes] [sector] [t_start] [t_end] [t_step] [sides]
-            passes = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-            sector = int(sys.argv[4]) if len(sys.argv) > 4 else 2
-            t0 = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-            t1 = int(sys.argv[6]) if len(sys.argv) > 6 else 39
+            # The range is REQUIRED (#16): with defaults, a bare `wrsoak`
+            # overwrote 60 sectors including cylinder 0 on whichever drive a
+            # previous `drive N` had left selected.
+            if len(sys.argv) <= 6:
+                print("wrsoak WRITES THE DISK: give it explicitly --\n"
+                      "  wrsoak <passes> <sector> <t_start> <t_end> [t_step] [side]\n"
+                      "  e.g. wrsoak 3 2 40 76 4   (scratch disk only)")
+                sys.exit(2)
+            passes = int(sys.argv[3])
+            sector = int(sys.argv[4])
+            t0 = int(sys.argv[5])
+            t1 = int(sys.argv[6])
             step = int(sys.argv[7]) if len(sys.argv) > 7 else 4
             sides = ([int(sys.argv[8])] if len(sys.argv) > 8 else [0, 1])
             do_wrsoak(s, list(range(t0, t1 + 1, step)), sides, passes,
@@ -1824,7 +1858,7 @@ def main():
             s.flush()
             r = read_exact(s, 3)
             if len(r) < 3 or r[1] != 0:
-                print(f"bad reply: {r.hex()}")
+                print(f"bad reply: {r.hex()}{busy_hint(r)}")
             else:
                 print("MZ-800 writes: " + ("ENABLED" if r[2] else
                                            "disabled (WRITE PROTECT returned "
