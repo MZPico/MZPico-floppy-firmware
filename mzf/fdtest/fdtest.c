@@ -27,7 +27,7 @@
  */
 #include <stdint.h>
 
-#define VERSION "1.2"
+#define VERSION "1.3"
 
 /* ---- WD179x ---- */
 #define P_CMD 0xD8
@@ -555,13 +555,13 @@ static void t_read_all(void) {
   end();
   puts("  ");
   putdec(rd_ok);
-  puts(" OK, ");
+  puts(" OK ");
   putdec(rd_err);
-  puts(" BAD; LATENCY AVG ");
+  puts(" BAD, LAT AVG ");
   putdec(lat_n ? lat_sum / lat_n : 0);
   puts(" MAX ");
   putdec(lat_max);
-  puts(" MS\n");
+  puts(" MS\n"); /* fits the 40-column screen */
 }
 
 static void t_read_boot_track(void) {
@@ -785,7 +785,8 @@ static void write_tests(void) {
 int main(void) {
   char k;
   cpu_di();
-  puts("\nFDTEST " VERSION " - WD179X AT D8H\n");
+  mon_putc(0x16); /* CLR: clear the screen (Sharp ASCII 16h via PRNT) */
+  puts("FDTEST " VERSION " - WD179X AT D8H\n");
   do {
     puts("DRIVE (0-3) + CR? ");
     k = getkey();
