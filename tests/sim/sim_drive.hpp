@@ -55,6 +55,9 @@ struct Drive {
   // WGATE on, tunnel erase after WGATE off). 20 us is longer than the 255-tick
   // (10.6 us) capture clamp, as observed on hardware.
   uint64_t splice_junction_ticks = us(20);
+  // A false ~INDEX pulse this long after each real one (0 = none), 20 us
+  // wide: a coupled glitch, not a pulse (issue #18).
+  uint64_t index_glitch_after_ticks = 0;
   std::vector<WriteEvent> writes;
 
   bool spinning(uint64_t now) const {
@@ -87,5 +90,10 @@ public:
 };
 
 FloppyCable &cable();
+
+// One-shot DMA ring overrun (issue #5): the next capture that runs past
+// `at_us` loses `hole_us` of flux, as when the consumer is lapped and jumps
+// ahead, and rp2040_flux_capture_overrun() reports it.
+void arm_capture_overrun(uint64_t at_us, uint64_t hole_us);
 
 } // namespace sim

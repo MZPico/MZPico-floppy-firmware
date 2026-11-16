@@ -12,6 +12,7 @@
 namespace sim {
 
 static FloppyCable g_cable;
+void arm_capture_overrun(uint64_t at_us, uint64_t hole_us);
 FloppyCable &cable() { return g_cable; }
 
 uint32_t Drive::angle_at(uint64_t now) const {
@@ -39,8 +40,19 @@ int FloppyCable::head() const {
 bool FloppyCable::input(int pin, uint64_t now) {
   Drive *d = selected();
   switch (pin) {
-  case PIN_INDEX:
-    return !(d && d->spinning(now) && d->angle_at(now) < INDEX_ANGLE);
+  case PIN_INDEX: {
+    if (!(d && d->spinning(now)))
+      return true;
+    uint32_t a = d->angle_at(now);
+    if (a < INDEX_ANGLE)
+      return false;
+    if (d->index_glitch_after_ticks) {
+      uint64_t g = d->index_glitch_after_ticks * REV_ANGLE / d->rev_ticks;
+      if (a >= g && a < g + us(20) * REV_ANGLE / d->rev_ticks)
+        return false;
+    }
+    return true;
+  }
   case PIN_TRK00:
     return !(d && d->cyl == 0);
   case PIN_WPT:
@@ -159,6 +171,9 @@ using namespace sim;
 namespace {
 bool g_cap_active = false;
 uint64_t g_cap_last = 0; // time of the last transition handed out
+uint64_t g_cap_start = 0;
+bool g_ovr_armed = false, g_ovr_flag = false;
+uint64_t g_ovr_at = 0, g_ovr_hole = 0;
 constexpr uint64_t FIRST_SAMPLE_TIMEOUT = 400000; // us, as arch_rp2.cpp
 } // namespace
 
@@ -175,6 +190,8 @@ bool rp2040_flux_capture_start(int, int) {
   core0_sleep_until(t);
   g_cap_last = t;
   g_cap_active = true;
+  g_cap_start = t;
+  g_ovr_flag = false; // cleared per capture, as ring_start() does
   return true;
 }
 
@@ -189,6 +206,25 @@ size_t rp2040_flux_capture_drain(volatile uint8_t *dest, size_t dest_cap,
     uint64_t t = cable().next_transition(g_cap_last);
     if (t > lim)
       break;
+    if (g_ovr_armed) {
+      // Lapped: nothing between `at` and `at + hole` is ever delivered, the
+      // consumer resumes after it, and the flag is up from then on. (Withheld
+      // per transition, so frequent drains cannot have delivered it first.)
+      uint64_t hs = g_cap_start + sim::us(g_ovr_at);
+      uint64_t he = hs + sim::us(g_ovr_hole);
+      if (t >= hs) {
+        if (lim < he)
+          break; // still inside the hole: deliver nothing yet
+        if (t < he) {
+          g_cap_last = he;
+          g_ovr_armed = false;
+          g_ovr_flag = true;
+          continue;
+        }
+        g_ovr_armed = false;
+        g_ovr_flag = true;
+      }
+    }
     uint64_t d = t - g_cap_last;
     dest[n++] = (uint8_t)(d > 255 ? 255 : d);
     g_cap_last = t;
@@ -198,7 +234,7 @@ size_t rp2040_flux_capture_drain(volatile uint8_t *dest, size_t dest_cap,
 
 void rp2040_flux_capture_stop(void) { g_cap_active = false; }
 void rp2040_flux_capture_disable(void) { g_cap_active = false; }
-bool rp2040_flux_capture_overrun(void) { return false; }
+bool rp2040_flux_capture_overrun(void) { return g_ovr_flag; }
 
 int rp2040_flux_capture_next(uint32_t timeout_us) {
   core0_cost(2);
@@ -309,3 +345,9 @@ uint32_t rp2040_flux_capture(int index_pin, int rdpin, volatile uint8_t *pulses,
 }
 
 } // extern "C"
+
+void sim::arm_capture_overrun(uint64_t at_us, uint64_t hole_us) {
+  g_ovr_armed = true;
+  g_ovr_at = at_us;
+  g_ovr_hole = hole_us;
+}

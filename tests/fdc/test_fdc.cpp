@@ -1125,3 +1125,122 @@ TEST(type1_during_a_read_does_not_wedge_it) {
     CHECK(matches_pattern(x.data, 5, 0, 2));
   });
 }
+
+// ---------------- Read path: #5, #18, #19, #35 ----------------
+
+// #5: a lapped DMA ring leaves a silent hole in the capture. The read must
+// notice (the overrun flag), throw the capture away and capture again --
+// never decode across the hole.
+TEST(read_recaptures_after_a_dma_ring_overrun) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    for (int r = 1; r <= 9; ++r) {
+      arm_capture_overrun(30000, 100000); // 100 ms lost, 30 ms into the capture
+      wd::Xfer x = wd::read_sector(0, (uint8_t)r, 512);
+      if (error_bits(x.status) || !matches_pattern(x.data, 0, 0, r)) {
+        std::fprintf(stderr, "  sector %d: st=%02x n=%zu\n", r, x.status, x.data.size());
+        CHECK(false);
+      }
+    }
+  }, ms(60000));
+}
+
+// #18: a false ~INDEX glitch 160 ms after each real pulse must not be taken
+// for a 160 ms revolution (which would shrink the window below one turn).
+TEST(index_glitch_does_not_shrink_the_read_window) {
+  g_disk[0] = make_filled_disk(Geometry::MZ_DD_DATA, 0xFF, 4);
+  insert(0, &g_disk[0]);
+  cable().drive[0].index_glitch_after_ticks = ms(160);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    srand(5);
+    int bad = 0;
+    for (int i = 0; i < 40; ++i) {
+      wait_us((uint64_t)(rand() % 200000));
+      if (error_bits(wd::read_sector(0, (uint8_t)(1 + i % 9), 512).status))
+        ++bad;
+    }
+    CHECK_EQ(bad, 0);
+    FdcDebug d = dbg();
+    std::printf("  measured rev %u us, window %u us\n", d.rev_us, d.window_us);
+    CHECK(d.rev_us == 0 || (d.rev_us > 195000 && d.rev_us < 205000));
+    CHECK(d.window_us >= 200000 + 10000);
+  }, ms(60000));
+}
+
+// #19: with no host density declaration the latch can be wrong, so the
+// window's sector margin is the DD one (which also covers HD).
+TEST(undeclared_density_uses_the_dd_sector_margin) {
+  g_disk[0] = make_disk(Geometry::HD_DATA);
+  insert(0, &g_disk[0]);
+  board_boot();
+  fdc_set_density_mode(3); // detect: probe media, no 0xDE declaration
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::Xfer x = wd::read_sector(0, 3, 512, false, 3000);
+    if (error_bits(x.status))
+      x = wd::read_sector(0, 3, 512, false, 3000); // after the latch flip
+    CHECK_EQ(error_bits(x.status), 0);
+    FdcDebug d = dbg();
+    uint32_t rev = d.rev_us ? d.rev_us : 220000;
+    std::printf("  window %u us over rev %u us\n", d.window_us, rev);
+    CHECK(d.window_us >= rev + 20000); // DD margin: (512+128) x 16 x 2 us
+  });
+}
+
+// #35: a sector that is not there is searched for over ~4 windows -- the WD's
+// "until the fifth index pulse" -- before RNF. A Force Interrupt still ends
+// the search at once.
+TEST(missing_sector_searched_about_four_revolutions_before_rnf) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    uint64_t t0 = now();
+    uint8_t st = wd::read_sector(0, 14, 512, false, 3000).status;
+    double t_ms = (double)(now() - t0) / ms(1);
+    std::printf("  RNF after %.0f ms\n", t_ms);
+    CHECK(st & wd::RNF);
+    CHECK(t_ms > 800 && t_ms < 1200);
+    // Force Interrupt during the search ends it promptly.
+    out(0xD9, 0);
+    out(0xDA, 14);
+    out(0xD8, 0x80);
+    wait_ms(50);
+    wd::force_interrupt();
+    uint64_t t1 = now();
+    CHECK(!(wd::wait_ready(100) & wd::BUSY));
+    CHECK(now() - t1 < ms(20));
+  });
+}
+
+// #5 during a READ MULTIPLE: an overrun restarts the running capture (and
+// empties the buffer) while a sector is pending. That sector must wait for
+// the new capture, not be reported RNF from the empty buffer.
+TEST(overrun_during_read_multiple_keeps_the_pending_sector) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    for (int at : {20000, 60000, 110000}) {
+      arm_capture_overrun((uint64_t)at, 30000);
+      wd::Xfer x = wd::read_sector(6, 1, 9 * 512, /*multi=*/true, 5000);
+      CHECK_EQ(x.data.size(), 9u * 512u);
+      CHECK_EQ(error_bits(x.status), 0);
+      for (int r = 1; r <= 9 && x.data.size() == 9 * 512; ++r)
+        CHECK(matches_pattern(std::vector<uint8_t>(x.data.begin() + (r - 1) * 512,
+                                                   x.data.begin() + r * 512), 6, 0, r));
+    }
+  }, ms(60000));
+}
