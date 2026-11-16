@@ -1,6 +1,7 @@
 #include "machine.hpp"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -113,19 +114,49 @@ void Machine::trap() {
     if (column_)
       putch(0x0D);
     break;
-  case 0x001B:
-    if (!keys_.empty()) {
-      cpu_.a = keys_.front();
-      keys_.pop_front();
-    } else {
-      cpu_.a = 0;
-      if (++idle_getky_ > 200000) {
-        error_ = "program waits for a key the script does not provide";
-        finished_ = true;
-        return;
-      }
+  case 0x0003: {
+    // GETL: one scripted key is one typed line. Like the monitor, hand back
+    // the whole screen line the cursor is on -- prompt included -- then CR.
+    if (keys_.empty()) {
+      error_ = "program waits for a line the script does not provide";
+      finished_ = true;
+      return;
     }
-    cpu_.cyc += 300;
+    uint8_t k = keys_.front();
+    keys_.pop_front();
+    putch(k);
+    size_t nl = screen_.rfind('\n');
+    std::string line = screen_.substr(nl == std::string::npos ? 0 : nl + 1);
+    uint16_t p = (uint16_t)((cpu_.d << 8) | cpu_.e);
+    for (size_t i = 0; i < line.size() && i < 79; ++i)
+      mem[(uint16_t)(p + i)] = (uint8_t)line[i];
+    mem[(uint16_t)(p + std::min<size_t>(line.size(), 79))] = 0x0D;
+    putch(0x0D);
+    cpu_.cyc += 3546895 / 2; // half a second of typing
+    break;
+  }
+  case 0x001B:
+    // A person's keystroke: GETKY reports the key for as long as it is held
+    // (KEY_HOLD polls), then nothing for a while (KEY_GAP) before the next
+    // one. A program that takes one press per poll instead of waiting for
+    // the release reads one keystroke as several -- caught here as on the
+    // machine.
+    cpu_.a = 0;
+    if (key_phase_ < KEY_HOLD) {
+      if (!keys_.empty()) {
+        cpu_.a = keys_.front();
+        if (++key_phase_ == KEY_HOLD)
+          keys_.pop_front();
+      }
+    } else if (++key_phase_ >= KEY_HOLD + KEY_GAP) {
+      key_phase_ = 0;
+    }
+    if (keys_.empty() && cpu_.a == 0 && ++idle_getky_ > 20000) {
+      error_ = "program waits for a key the script does not provide";
+      finished_ = true;
+      return;
+    }
+    cpu_.cyc += 17000; // ~5 ms: the monitor's keyboard scan is not free
     break;
   default: {
     char b[80];

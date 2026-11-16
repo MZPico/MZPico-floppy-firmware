@@ -152,12 +152,13 @@ uint8_t pattern_byte(int c, int h, int r, int i) {
 static TrackSpec track_for(Geometry g, int c, int h, int fill) {
   TrackSpec t;
   int ns = 9, n = 2;
-  if (g == Geometry::HD_DATA) {
+  if (g == Geometry::HD_DATA || g == Geometry::HD_CPM) {
     t.hd = true;
     ns = 18;
   }
-  if (g == Geometry::MZ_DD_MASTER && c == 0 && h == 1) {
-    ns = 16; // the 16 x 256 IPL track
+  if ((g == Geometry::MZ_DD_MASTER || g == Geometry::HD_CPM) && c == 0 && h == 1) {
+    t.hd = false; // the 16 x 256 IPL track, always DD
+    ns = 16;
     n = 1;
   }
   for (int r = 1; r <= ns; ++r) {
@@ -177,7 +178,7 @@ static TrackSpec track_for(Geometry g, int c, int h, int fill) {
 Disk make_disk(Geometry g, int cylinders, const std::string &name) {
   Disk d;
   d.name = name;
-  d.hd_media = g == Geometry::HD_DATA;
+  d.hd_media = g == Geometry::HD_DATA || g == Geometry::HD_CPM;
   for (int c = 0; c < cylinders && c < MAX_CYL; ++c)
     for (int h = 0; h < 2; ++h)
       d.t[c][h] = encode_track(track_for(g, c, h, -1), 0, (uint32_t)(c * 2 + h + 1));
@@ -186,7 +187,7 @@ Disk make_disk(Geometry g, int cylinders, const std::string &name) {
 
 Disk make_filled_disk(Geometry g, uint8_t fill, int cylinders) {
   Disk d;
-  d.hd_media = g == Geometry::HD_DATA;
+  d.hd_media = g == Geometry::HD_DATA || g == Geometry::HD_CPM;
   for (int c = 0; c < cylinders && c < MAX_CYL; ++c)
     for (int h = 0; h < 2; ++h)
       d.t[c][h] = encode_track(track_for(g, c, h, fill));

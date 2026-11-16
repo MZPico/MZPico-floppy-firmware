@@ -21,13 +21,13 @@
  * and the ROM's side 0 is the drive's physical head 1.
  *
  * Output and input use only the MZ-700/800 monitor entry points PRNT (0012h)
- * and GETKY (001Bh); it returns to the monitor (00ADh) when done.
+ * and GETL (0003h); it returns to the monitor (00ADh) when done.
  *
  * Copyright (c) 2026 the MZPico floppy firmware authors. GPL-2.0-or-later.
  */
 #include <stdint.h>
 
-#define VERSION "1.0"
+#define VERSION "1.4"
 
 /* ---- WD179x ---- */
 #define P_CMD 0xD8
@@ -90,11 +90,11 @@ __asm
 __endasm;
 }
 
-uint8_t mon_getky(void) __naked {
+/* GETL: read a line (ended by CR) into the buffer at DE. */
+void mon_getl(char *buf) __z88dk_fastcall __naked {
 __asm
-    call 0x001b
-    ld l,a
-    ld h,0
+    ex de,hl
+    call 0x0003
     ret
 __endasm;
 }
@@ -264,22 +264,36 @@ static void puthex(uint8_t v) {
   putc(h[v >> 4]);
   putc(h[v & 15]);
 }
+/* Answers are typed as a line and confirmed with CR, through the monitor's
+ * GETL (0003h): no key debouncing to get wrong (1.0 took one held key as
+ * several answers; 1.1's release wait made it deaf on the machine), and the
+ * monitor echoes and edits the input itself. GETL hands back the whole screen
+ * line the cursor is on -- prompt included -- so the answer is the LAST
+ * non-blank character before the CR. */
+static char linebuf[100];
 static char getkey(void) {
-  uint8_t k;
-  do
-    k = mon_getky();
-  while (!k);
+  int8_t i;
+  char k;
+  mon_getl(linebuf);
+  for (i = 0; i < 99 && linebuf[i] != 0x0D; ++i)
+    ;
+  while (i > 0 && linebuf[i - 1] == ' ')
+    --i;
+  k = i > 0 ? linebuf[i - 1] : 0;
   if (k >= 'a' && k <= 'z')
     k -= 32;
-  return (char)k;
+  return k;
 }
 
 static uint16_t n_pass, n_fail;
+static uint8_t n_data_fail; /* failures that make writing unsafe */
+static uint8_t cur_blocks;  /* this check guards the write tests */
 static uint8_t cur_ok;
 
 static void begin(const char *name) {
   puts(name);
   cur_ok = 1;
+  cur_blocks = 1;
 }
 static void fail(const char *why) {
   if (cur_ok)
@@ -297,8 +311,11 @@ static void end(void) {
   if (cur_ok) {
     puts(" OK");
     ++n_pass;
-  } else
+  } else {
     ++n_fail;
+    if (cur_blocks)
+      ++n_data_fail;
+  }
   putc('\n');
 }
 
@@ -376,6 +393,13 @@ static uint8_t read_addr(uint8_t *id) {
   return x_st;
 }
 
+/* ---- density: declared on port DEh as CP/M 4.1 does (00h DD, 81h HD) ---- */
+static uint8_t g_hd;
+static void declare_density(uint8_t hd) {
+  g_hd = hd;
+  wout(P_DENS, hd ? 0x81 : 0x00);
+}
+
 /* ---- geometry, discovered with READ ADDRESS ---- */
 /* [0] ROM side 0, [1] ROM side 1 (data cylinders); [2] the boot cylinder */
 static uint8_t g_nsec[3], g_n[3], g_first[3], g_maxcyl;
@@ -427,6 +451,28 @@ static void t_restore(void) {
     failst("NOT READY", st);
   else if (!(st & ST_TRK0))
     failst("NO TRK0", st);
+  end();
+}
+
+/* Which density are the data cylinders? Try DD, then HD, on cylinder 2. An
+ * HD disk formatted by CP/M carries a DD boot track on cylinder 0, so cylinder
+ * 0 cannot answer this. */
+static void t_density(void) {
+  uint8_t id[6], i, hd, found = 0;
+  begin("DENSITY ...............");
+  seek(2, 0);
+  side(1);
+  for (hd = 0; hd < 2 && !found; ++hd) {
+    declare_density(hd);
+    for (i = 0; i < 4 && !found; ++i)
+      if (!(read_addr(id) & ST_ERRS))
+        found = 1;
+  }
+  if (!found) {
+    declare_density(0);
+    fail("NO IDS AT DD OR HD");
+  }
+  puts(g_hd ? " HD" : " DD");
   end();
 }
 
@@ -515,26 +561,41 @@ static void t_read_all(void) {
   end();
   puts("  ");
   putdec(rd_ok);
-  puts(" OK, ");
+  puts(" OK ");
   putdec(rd_err);
-  puts(" BAD; LATENCY AVG ");
+  puts(" BAD, LAT AVG ");
   putdec(lat_n ? lat_sum / lat_n : 0);
   puts(" MAX ");
   putdec(lat_max);
-  puts(" MS\n");
+  puts(" MS\n"); /* fits the 40-column screen */
 }
 
 static void t_read_boot_track(void) {
   uint8_t st;
   begin("READ CYL 0 (BOOT) .....");
+  /* The boot track is DD even on a CP/M HD disk, and DD on HD media is
+   * marginal on drives that sense density from the media hole: a failure
+   * here is reported but does not stop the write tests, which use the data
+   * cylinders. */
+  cur_blocks = 0;
   seek(0, 0);
   side(0);
-  if (!discover(0, 2))
-    fail("NO IDS ON SIDE 0");
-  else {
-    st = read_sec(0, g_first[2], BUF, g_size[2], 0);
-    if (st & ST_ERRS)
-      failst("READ", st);
+  {
+    /* The boot track is DD even on a CP/M HD disk (the boot ROM only reads
+     * DD); a plain HD data disk has HD there. Try DD first, then HD. */
+    uint8_t hd = g_hd, d, ok = 0;
+    for (d = 0; d < 2 && !ok; ++d) {
+      declare_density(d);
+      ok = discover(0, 2) != 0;
+    }
+    if (!ok)
+      fail("NO IDS ON SIDE 0");
+    else {
+      st = read_sec(0, g_first[2], BUF, g_size[2], 0);
+      if (st & ST_ERRS)
+        failst("READ", st);
+    }
+    declare_density(hd);
   }
   end();
   puts("  ");
@@ -717,6 +778,7 @@ static void t_format(void) {
 static void read_tests(void) {
   t_detect();
   t_restore();
+  t_density();
   t_seek_verify();
   t_geometry();
   t_read_boot_track();
@@ -734,30 +796,27 @@ static void write_tests(void) {
 int main(void) {
   char k;
   cpu_di();
-  puts("\nFDTEST " VERSION " - WD179X AT D8H\n");
-  puts("DRIVE (0-3)? ");
-  do
+  mon_putc(0x16); /* CLR: clear the screen (Sharp ASCII 16h via PRNT) */
+  puts("FDTEST " VERSION " - WD179X AT D8H\n");
+  do {
+    puts("DRIVE (0-3) + CR? ");
     k = getkey();
-  while (k < '0' || k > '3');
+  } while (k < '0' || k > '3');
   drive = (uint8_t)(k - '0');
-  putc(k);
-  puts("\n1=READ  2=WRITE (SCRATCH!)  3=BOTH? ");
-  do
+  do {
+    puts("1=READ 2=WRITE(SCRATCH!) 3=BOTH? ");
     k = getkey();
-  while (k < '1' || k > '3');
-  putc(k);
-  putc('\n');
+  } while (k < '1' || k > '3');
   if (k != '1') {
-    puts("WRITES CYLINDERS NEAR THE HUB. Y=GO? ");
+    puts("WRITES NEAR THE HUB. Y=GO? ");
     if (getkey() != 'Y') {
       puts("CANCELLED\n");
       return 0;
     }
-    putc('\n');
   }
   wout(P_EINT, 0);
   read_tests();
-  if (k != '1' && n_fail == 0)
+  if (k != '1' && n_data_fail == 0)
     write_tests();
   else if (k != '1')
     puts("WRITE TESTS SKIPPED (READ FAILED)\n");

@@ -61,7 +61,7 @@ against `tests/sim`:
   - write-protect and wrong-cylinder refusals
   - WRITE TRACK and READ TRACK
   - HD, two drives, `~INT`/EINT
-- `fdtest_*` (ctest only): `FDTEST.MZF` running on the emulated MZ-800
+- `fdtest_*` (ctest only): `FDTEST.MZF` running on the emulated MZ-800 (answers are typed lines through the monitor's GETL, as on the machine)
   against the firmware, on several media, plus two negative runs (a
   write-protected disk, an empty drive) that FDTEST must report as failures.
 - `fdtest_local_*`: the same against every `*.dsk` (EDSK) image in
@@ -80,7 +80,6 @@ that closes the issue also has to remove the marker. Open ones:
 
 | Issue | Test |
 |---|---|
-| #2 side not re-applied after a seek | `side_change_after_seek_reaches_the_read` |
 | #4 ID paired with a far data mark | `id_without_data_field_is_not_paired_...`, `scan_does_not_swallow_...` |
 | #8 unit 2/3 wedges the controller | `unit2_selected_reports_not_ready_then_unit0_still_works` |
 | #20 Verify accepts any cylinder | `seek_verify_detects_wrong_cylinder` |

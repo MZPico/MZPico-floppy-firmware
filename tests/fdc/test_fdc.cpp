@@ -685,7 +685,6 @@ TEST(unit2_selected_reports_not_ready_then_unit0_still_works) {
 // side it asked for. The two heads hold different data, so a wrong-side read
 // is visible even though its CRC is clean.
 TEST(side_change_after_seek_reaches_the_read) {
-  XFAIL("#2: side select not re-applied after a seek");
   boot_with(Geometry::MZ_DD_DATA);
   run([] {
     wd::select(0);
@@ -719,6 +718,56 @@ TEST(read_after_seek_is_not_answered_from_the_old_capture) {
   });
 }
 
+// #3, the exact ordering: read A is still capturing (~240 ms) when the host
+// gives up -- Force Interrupt, a SEEK, and read B on the new cylinder, all
+// within microseconds, as CP/M does. B must be served from a capture taken
+// AFTER its move, not from A's window.
+TEST(read_issued_during_a_capture_waits_for_its_own_move) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 1);
+    out(0xD8, 0x80); // read A, cylinder 0
+    wait_ms(60);     // core0 is now inside A's capture
+    wd::force_interrupt();
+    out(0xDB, 6);
+    out(0xD8, 0x10); // SEEK 6, no wait
+    wd::Xfer b = wd::read_sector(6, 4, 512);
+    CHECK_EQ(error_bits(b.status), 0);
+    CHECK(matches_pattern(b.data, 6, 0, 4));
+    FdcDebug d = dbg();
+    CHECK_EQ(d.sec_cyl_mismatch, 0u); // no wrong-cylinder answer along the way
+  });
+}
+
+// #3 with a side change instead of a move: B must not be decoded from A's
+// window, which holds the other surface. Nothing would flag it -- same
+// cylinder, clean CRC -- so the data itself is checked.
+TEST(read_issued_during_a_capture_gets_its_own_side) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(9);
+    wd::side(1); // head 0
+    out(0xD9, 9);
+    out(0xDA, 1);
+    out(0xD8, 0x80); // read A on head 0
+    wait_ms(60);
+    wd::force_interrupt();
+    wd::side(0);     // head 1
+    wd::Xfer b = wd::read_sector(9, 5, 512);
+    CHECK_EQ(error_bits(b.status), 0);
+    bool right = matches_pattern(b.data, 9, 1, 5);
+    if (!right && matches_pattern(b.data, 9, 0, 5))
+      std::fprintf(stderr, "  got head 0's sector from read A's window\n");
+    CHECK(right);
+  });
+}
+
 // #1: a READ abandoned by Force Interrupt can complete on core0 after the host
 // has moved on to a WRITE SECTOR; its result must not land in the write buffer.
 TEST(abandoned_read_does_not_corrupt_following_write) {
@@ -738,6 +787,48 @@ TEST(abandoned_read_does_not_corrupt_following_write) {
     CHECK_EQ(error_bits(w.status), 0);
     CHECK(wd::read_sector(6, 2, 512).data == v);
   });
+}
+
+// #1, the exact ordering: a read of a sector that is not there takes the RNF
+// path with its second-chance capture (~480 ms in all). The host gives up
+// during it and starts a WRITE SECTOR, feeding bytes as the stale read
+// completes. The stale completion must not drop the write's DRQ, raise RNF on
+// it, or touch its buffer.
+TEST(stale_read_completion_does_not_break_a_write_being_fed) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(11);
+    wd::side(1);
+    out(0xD9, 11);
+    out(0xDA, 14); // no such sector: RNF after two captures
+    out(0xD8, 0x80);
+    wait_ms(300);  // inside the SECOND (second-chance) capture
+    wd::force_interrupt();
+    out(0xD9, 11);
+    out(0xDA, 3);
+    out(0xD8, 0xA0); // WRITE SECTOR 3, fed slowly across the stale completion
+    std::vector<uint8_t> v(512);
+    for (int i = 0; i < 512; ++i)
+      v[i] = (uint8_t)(0x40 ^ i);
+    size_t fed = 0;
+    uint8_t st = 0xFF;
+    for (uint64_t end = now() + ms(3000); now() < end;) {
+      st = wd::status();
+      if ((st & wd::DRQ) && fed < v.size()) {
+        out(0xDB, v[fed++]);
+        wait_us(1500); // ~770 ms to feed the sector
+        continue;
+      }
+      if (!(st & wd::BUSY))
+        break;
+    }
+    CHECK_EQ(fed, 512u);
+    CHECK_EQ(error_bits(st), 0);
+    CHECK(wd::read_sector(11, 3, 512).data == v);
+  });
+  CHECK_EQ(count_valid_sectors(g_disk[0].at(11, 0), false), 9);
 }
 
 // ---------------- ~INT ----------------

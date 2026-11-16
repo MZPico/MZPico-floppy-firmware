@@ -145,7 +145,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   2. clamp **per command**, so surplus STEP-OUTs past TRK00 are absorbed as a
      real drive absorbs them, not summed against later STEP-INs;
   3. never start a capture while `op_done != op_seq` — the read must wait for
-     the pending move or it answers from the previous cylinder.
+     the pending move or it answers from the previous cylinder;
+  4. core0 publishes nothing host-visible (buffer, error bits, DRQ, BUSY) from
+     work that blocked, if `S.cmd_gen` moved meanwhile: core1 bumps it on every
+     command write, Force Interrupt included. The per-kind `*_seq` counters
+     only see commands of their own kind (#1, #3). Side and drive select are
+     re-applied at the start of every operation block, not just once per pass
+     (#2).
 - **WD ID track compare:** ✅ a read matches an ID only when **both** its sector
   and its cylinder byte agree with the Sector/Track registers; a sector-number
   match on the wrong cylinder is RNF, not data. This is real WD179x behaviour and

@@ -11,6 +11,9 @@ load `BUSTEST.MZF`. It starts at 1200h and returns to the monitor when done.
 
 ## Using it
 
+Each answer is typed and confirmed with **CR**, through the monitor's line input (GETL).
+
+
 1. Pick the drive (`0`–`3`).
 2. Pick the test:
    - `1` READ: read-only. Use any MZ-800 disk (CP/M, Disk BASIC, a game).
@@ -24,11 +27,12 @@ last line is `FDTEST RESULT: PASS` or `FAIL`.
 
 | Check | What it does |
 |---|---|
+| DENSITY | READ ADDRESS on cylinder 2 at DD, then HD, declaring it on port DEh as CP/M 4.1 does (00h / 81h) |
 | DETECT CONTROLLER | Track register write/read-back on the inverted bus |
 | RESTORE | TRK00 reached, drive ready |
 | SEEK + VERIFY | Seeks with the V bit to 1, 2, 5, 10, 20, 39, 0; probes 40 or 80 cylinders |
 | GEOMETRY | READ ADDRESS ×40 per side on cylinder 2: sector count, size, first sector |
-| READ CYL 0 (BOOT) | ROM side 0 of cylinder 0, the 16×256 IPL track on a master disk |
+| READ CYL 0 (BOOT) | ROM side 0 of cylinder 0: the 16×256 IPL track on a master disk, which is DD even on a CP/M HD disk |
 | READ SECTORS | Every sector of cylinders 2, 3, 10, 20, 39, both sides; prints the latency from command to first DRQ |
 | READ MULTIPLE + FI | 90h across a whole track, then Force Interrupt (STATUS must be clean, as the ROM requires); compared with single reads |
 | STEP BURSTS (CP/M) | CP/M 4.1's STEP + FORCE INT bursts without waiting for BUSY, including surplus STEP OUT at track 0; READ ADDRESS must then find cylinder 7 |
