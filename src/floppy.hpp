@@ -51,10 +51,11 @@ public:
   // Only ~DSn is per-drive. ~HDSEL and ~MOTOR_ON are one wire each, reaching
   // every drive on the ribbon (on this board's J3, MOTOR is driven onto pins 10
   // AND 16), so the newly selected instance's beliefs about them describe pins
-  // it does not own and would otherwise be stale. Left uncorrected, a `side(0)`
-  // on a drive that already believes `_side == 0` short-circuits and the head
-  // stays on side 1, where the previous drive left the line -- a read from the
-  // wrong surface with every status bit clean.
+  // it does not own and would otherwise be stale. side() always writes the pin,
+  // but spin_motor() skips the write when it believes the motor is already in
+  // the requested state, and get_side() reports the belief -- so a stale belief
+  // can leave a shared line where the previous drive left it (historically: a
+  // read from the wrong surface with every status bit clean).
   //
   // _is_index_seen is deliberately NOT adopted: the motor LINE is shared but
   // the spindles are not, so the new drive must earn its own index sighting.

@@ -2,8 +2,9 @@
 //
 // GPIO map extracted from MZPico-800-Floppy-Board.kicad_sch (purple 16MB Pico
 // clone). Floppy signals are active-low, wired direct to the Pico. See
-// ../CLAUDE.md and docs/PHASE0.md. NB: RDATA (GPIO20) needs an external ~1k
-// pull-up to 3.3V — the board has none; the Pico read pin has no internal one.
+// ../CLAUDE.md and docs/PHASE0.md. NB: RDATA (GPIO20) requires an external
+// pull-up to 3.3V (the firmware enables no internal pull-up on it); see
+// docs/hardware-notes.md for the value fitted and why.
 #pragma once
 
 // ---- Floppy interface (34-pin) ----
@@ -29,7 +30,7 @@
 // No status LED on this board (GPIO25 = DS1). -1 disables LED code.
 #define PIN_LED (-1)
 
-// ---- MZ-800 expansion bus (unused in Phase 1; reserved for the FDC phase) ----
+// ---- MZ-800 expansion bus (pins defined in bus/board_bus.h) ----
 // GPIO0-7 = shared C0..C7 (addr/data via SN74LVC245), 8=IORQ, 9=RD, 10=WR,
 // 11=EXWAIT, 12=INT, 26=EN0, 27=EN1, 28=RD1, 29=RESET.
 

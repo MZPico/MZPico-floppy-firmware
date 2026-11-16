@@ -1,4 +1,4 @@
-// Milestone 3.1 — WD179x/FD1791 Type I + STATUS bridge to a real drive.
+// WD179x/FD1791 bridge to a real drive (Type I/II/III + STATUS).
 //
 // Split across the two cores (see docs/wd-fidelity.md):
 //   core1 (bus)  : fdc_reg_read/fdc_reg_write — decode commands, serve the WD
@@ -101,7 +101,7 @@ void fdc_set_densel(int8_t mode);
 int8_t fdc_get_densel(void);
 int fdc_get_densel_level(void);
 
-// core1 (bus, hot path): register access. `addr` in 0xD8..0xDE. On write, `raw`
+// core1 (bus, hot path): register access. `addr` in 0xD8..0xDF. On write, `raw`
 // is the byte seen on the bus. fdc_reg_read returns the exact byte to drive back
 // onto the bus (inversion already applied for 0xD8..0xDB).
 void fdc_reg_write(uint8_t addr, uint8_t raw);
@@ -115,7 +115,7 @@ uint8_t fdc_reg_read(uint8_t addr);
 // measurably broke the machine: that loop has ~560 ns to answer a Z80 I/O
 // cycle, and even a couple of instructions per pass made core1 late enough that
 // the MZ-800 reported "no floppy driver detected". core1 rather than core0,
-// because core0 blocks for ~250 ms at a time inside a flux capture with
+// because core0 runs whole write splices (~0.5 s) and track writes with
 // interrupts disabled. See fdc_bus_reset_isr() for the full reasoning.
 void fdc_bus_reset_irq_init(void);
 
@@ -338,7 +338,7 @@ void fdc_firstfail_snapshot(FdcFirstFail *out);
 // the debounce, which the event counter alone cannot do.
 struct FdcResetDiag {
   uint8_t line;          // level right now
-  uint32_t samples;      // core1 polls (i.e. is the poller even running?)
+  uint32_t samples;      // RESET edge interrupts taken (is the IRQ even firing?)
   uint32_t rise, fall;   // edges seen since the counters were cleared
   uint32_t high_max_us;  // longest completed HIGH excursion
   uint32_t low_min_us;   // shortest completed LOW excursion
@@ -405,10 +405,11 @@ void fdc_bustest_snapshot(FdcBusTest *out);
 void fdc_set_side_invert(bool on);
 bool fdc_get_side_invert(void);
 
-// How ~INT (GPIO12) is driven: 0 = never, 1 = INTRQ at command completion (WD
-// default), 2 = INTRQ | DRQ for a card that ORs both onto the Z80 interrupt.
-// Switchable because the MZ-800 floppy card's wiring of the WD's two separate
-// INTRQ/DRQ pins is not known from the ROM alone.
+// How ~INT (GPIO12) is driven: 0 = never, 1 = DRQ-driven and gated by EINT
+// (port 0xDF) -- the default, matching the reference firmware's card model;
+// 2 = the same DRQ-driven source ignoring EINT (diagnostic only: a host that
+// never arms EINT would be interrupted with no ISR installed). See
+// fdc_refresh_int_line().
 void fdc_set_int_mode(uint8_t mode);
 uint8_t fdc_get_int_mode(void);
 

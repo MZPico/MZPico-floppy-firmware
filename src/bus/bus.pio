@@ -23,13 +23,19 @@
 ;          C0..C7 (the "late at sample" failure mode is gone).
 ;
 ; Never assert ~EN0 and ~EN1 together: every switch passes through BLOCK
-; (break-before-make), one PIO cycle apart.
+; (break-before-make), one PIO cycle apart. At 200 MHz that is 5 ns -- on the
+; write SM's BLOCK -> DATA_IN step it is the whole break, shorter on paper than
+; the LVC245's worst-case disable time (works on hardware; noted, not changed).
+; The read SM's BLOCK -> DATA_OUT step is separated by core1's verdict wait.
 ;
 ; A side-set must never sit inside an SM's wait_iorq_low loop: each SM spins in
 ; that loop for the whole of the OTHER kind of cycle and would re-assert its
 ; idle gates every two cycles over the capturing SM's sequence.
 ;
-; GUARD DELAY (~24 cycles = ~133 ns @180 MHz, a counted loop: the 3-bit side-set leaves one delay bit) between "IORQ released" and
+; GUARD DELAY (a counted loop, since the 3-bit side-set leaves one delay bit:
+; `set y, 22` + 23 `jmp y--` passes = 24 cycles = 120 ns at 200 MHz / 5 ns per
+; cycle; on the read SM the preceding BLOCK nop makes it 25 cycles = 125 ns
+; from dropping the drive to U1 returning) between "IORQ released" and
 ; re-enabling the address buffer: core1 is still driving C0..C7 for a few tens
 ; of ns after a read cycle, and U1's 24 mA drivers must not meet the Pico pads.
 ; Cheap: the Z80 cannot start another I/O cycle for >= 3 us.
@@ -76,7 +82,7 @@ spike_r:
     wait 1 gpio 8
     nop                 side GATES_BLOCK ; drop the drive first...
     set y, 22                            ; ...then the guard before U1 returns:
-guard_r:                                 ; 1 set + 23 loop cycles (~133 ns).
+guard_r:                                 ; 1 set + 23 loop cycles (120 ns).
     jmp y-- guard_r                      ; (.side_set 3 opt leaves 1 delay bit)
 .wrap
 

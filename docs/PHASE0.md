@@ -78,18 +78,22 @@ gw write --device COM5 game.dsk                    # write an MZ-800 EDSK (.dsk)
    against the stop (no status outputs). Fix: use a **twisted PC cable** with
    the drive on the **post-twist end connector**. (J3 is the standard-PC header;
    J2 has a different select/motor pinout — see hardware-notes.md.)
-6. **RDATA needs an external pull-up.** The board has **no pull-up** on `~RDATA`
+6. **RDATA needs an external pull-up.** The PCB has **no pull-up** on `~RDATA`
    and the library leaves the read pin as bare `INPUT` (no internal pull-up).
    Result: `gw rpm`/`gw read` hang (flux capture over a floating line) while
    `seek` works. **The bodge fitted is 4k7 from GPIO20 (Pico pin 23) to +3.3 V
    (Pico pin 36 / VCC)** (per the Adafruit suggestion). Use 3.3 V, never 5 V
    (GPIO not 5 V tolerant).
-   - **4k7 is too weak for HD.** RDATA is open-collector from the drive, so the
-     pull-up alone sets the rise time: 4k7 into ~1.5 m of ribbon (~150 pF) is
-     ~0.7 µs. Fine at DD (2 µs bit cell); at HD (1 µs cell) it eats the timing
-     budget and any coupled noise from the C0..C7 bus shifts the edge — this is
-     the root of the HD write-splice corruption (see hardware-notes RDATA
-     crosstalk item). **Fit 1 kΩ, or 680 Ω, for a stiffer/faster edge.**
+   - **Is 4k7 strong enough for HD?** RDATA is open-collector from the drive,
+     so the pull-up alone sets the rise time: 4k7 into ~1.5 m of ribbon
+     (~150 pF) is ~0.7 µs, which looked marginal against HD's 1 µs bit cell
+     and was for a while suspected as the cause of the HD write-splice
+     failures. **Measurement retired that theory:** a 4k7→1 kΩ swap changed
+     nothing, a PIO pulse-width monitor showed a clean RDATA train during
+     failing hunts, and the "blind hunts" were two firmware bugs (see
+     [hardware-notes.md](hardware-notes.md) §2b). The 4k7 bodge stays; a
+     proper 1 kΩ-to-+5 V termination behind 5 V-tolerant buffers is the plan
+     for the next board revision (hardware-notes.md §1).
 7. **Writing DD images needs DD media.** `gw write` verifies each track by
    reading it back; writing a **DD** image (e.g. an MZ-800 720K EDSK) onto **HD**
    media fails verify (HD media magnetizes too weakly at DD current). Options:
@@ -99,8 +103,9 @@ gw write --device COM5 game.dsk                    # write an MZ-800 EDSK (.dsk)
    *matched* HD image (`gw write --format ibm.1440 disk.img`) to an HD disk.
 8. **`.dsk` = Extended DSK (EDSK).** The reference firmware's images (and the
    ones we tested) are standard **EDSK** ("EXTENDED CPC DSK File" magic). gw
-   auto-detects and writes them directly — no conversion. Inspect one with
-   `dsk_analyze.py` (see docs/) to dump geometry.
+   auto-detects and writes them directly — no conversion. (Geometry was
+   inspected with a local helper script, `dsk_analyze.py`, which is not part of
+   this repository.)
 
 ## Result
 ```

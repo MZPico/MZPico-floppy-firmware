@@ -169,7 +169,7 @@ static inline uint32_t ring_written(void) {
 // this reaches FLUX_RING_WORDS the DMA has lapped us and the oldest unread
 // words have been overwritten. The old index-masked version wrapped a full
 // lap back to a small number and reported "caught up" while handing out
-// overwritten, out-of-sequence samples -- garbage deltas with no flag, which
+// overwritten, out-of-sequence samples -- garbage deltas with no flag, which no consumer could detect.
 static inline uint32_t ring_unread(void) {
   return ring_written() - g_ring_consumed;
 }
@@ -602,8 +602,8 @@ bool rp2040_flux_write_now(int wrgate_pin, const uint8_t *pulses, size_t n) {
   // Let the FIFO drain and the last pulse actually reach the head before WGATE
   // drops -- unlike the greaseweazle path (which ends at an index pulse, in the
   // middle of a gap) a splice ends a few bytes past the data CRC, and cutting
-  // the tail short there truncates real data. The longest single pulse is ~4 us
-  // at DD; 32 us covers it with margin.
+  // the tail short there truncates real data. The longest single pulse is 4T,
+  // 8 us at DD; 32 us covers it with margin.
   while (!pio_sm_is_tx_fifo_empty(g_writer.pio, g_writer.sm)) {
   }
   busy_wait_us_32(32);

@@ -28,7 +28,7 @@ Usage:
     python mzp_probe.py PORT wrburst <track> [side] [nsec] [seed] [rdtrack] [rddrive]  # !! splices; read rdtrack (from rddrive) before each = CP/M A->B
     python mzp_probe.py PORT firstfail [clear]            # the FIRST failure since power-up, held unaltered
     python mzp_probe.py PORT resetdiag [clear]            # what the bus RESET pin actually does (edges, pulse lengths)
-    python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET poller on/off (no arg = query)
+    python mzp_probe.py PORT resetpoll [0|1]              # core1 bus-RESET handling (edge IRQ) on/off (no arg = query)
     python mzp_probe.py PORT posfix [0|1]                 # head-position self-correction on/off (no arg = query)
     python mzp_probe.py PORT fmten [0|1]                  # allow WRITE TRACK from the MZ-800 (default ON)
     python mzp_probe.py PORT drive [0|1]                  # which unit (~DS0/~DS1) the bench commands drive (no arg = query)
@@ -561,7 +561,9 @@ def do_rddiag(s):
               f"FAILED TO START its flux capture  seek_error={seek_error}")
     else:
         print(f"  verify  : {verify_attempts} Verify pass(es); last captured "
-              f"{verify_n} flux bytes (~{verify_n / 43500:.2f} revolutions)  "
+              f"{verify_n} flux bytes (very rough ~{verify_n / 43500:.2f} rev: "
+              f"transitions per rev are data-dependent; the capture is "
+              f"bounded by a time window)  "
               f"seek_error={seek_error}")
     if seek_error:
         print("            ^ SEEK ERROR is latched: Verify found no ID field "
@@ -1175,8 +1177,9 @@ def do_resetdiag(s, clear=False):
 
     "resets seen: 0" after pressing reset has at least three causes that the
     event counter cannot tell apart: the line never moves, it pulses the other
-    way (active low, not high), or the pulse is shorter than the debounce. The
-    edge counts and pulse lengths here separate them.
+    way (active low, not high), or the pulse is shorter than the 20 us confirm
+    the edge interrupt applies (FDC_RESET_CONFIRM_US). The edge counts and
+    pulse lengths here separate them.
     """
     s.write(bytes([MZP_CMD_RESETDIAG, 3, 1 if clear else 0]))
     s.flush()
@@ -1188,7 +1191,7 @@ def do_resetdiag(s, clear=False):
     (samples, rise, fall, high_max, low_min, last_high, events,
      at_ms) = [int.from_bytes(r[3 + 4 * k:7 + 4 * k], "little") for k in range(8)]
     print(f"RESET pin (GPIO29) level now: {'HIGH' if line else 'low'}")
-    print(f"  core1 polls      : {samples}")
+    print(f"  edge IRQs taken  : {samples}")
     print(f"  edges seen       : {rise} rising, {fall} falling")
     print(f"  longest HIGH     : {high_max} us"
           + (f"  (most recent {last_high} us)" if last_high else ""))
@@ -1197,7 +1200,8 @@ def do_resetdiag(s, clear=False):
           + (f"  (last at {at_ms / 1000:.1f} s)" if events else ""))
     print()
     if samples == 0:
-        print("  core1 is not polling at all -- the listen loop is not running")
+        print("  No RESET edge interrupt has been counted: the line has not moved,")
+        print("  or reset handling is disabled (`resetpoll 0` -- counts stop too).")
     elif rise == 0 and fall == 0:
         print("  The pin NEVER MOVED. Either the machine's reset does not reach")
         print("  GPIO29 on this board, or it was not pressed while this ran.")
@@ -1205,7 +1209,7 @@ def do_resetdiag(s, clear=False):
         print("  bus_init() pulls it down, so an unconnected pin reads low too.")
     elif rise and not events:
         print(f"  The pin DOES pulse high, but no assertion was confirmed: the")
-        print(f"  longest high was {high_max} us against a 100 us debounce.")
+        print(f"  longest high was {high_max} us against a 20 us confirm.")
         print("  Shorten FDC_RESET_CONFIRM_US to match what the machine emits.")
     elif fall and not rise:
         print("  Only FALLING edges: the line rests high and pulses LOW, i.e.")
@@ -1566,7 +1570,8 @@ def main():
         elif cmd == "iotrace":
             do_iotrace(s)
         elif cmd == "intmode":
-            # no arg = query (0xFF), else 0 = off, 1 = INTRQ, 2 = INTRQ|DRQ
+            # no arg = query (0xFF), else 0 = off, 1 = DRQ-driven, EINT-gated
+            # (default), 2 = DRQ-driven ignoring EINT (diagnostic)
             val = int(sys.argv[3]) if len(sys.argv) > 3 else 0xFF
             s.write(bytes([MZP_CMD_INTMODE, 3, val & 0xFF]))
             s.flush()
@@ -1732,7 +1737,8 @@ def main():
                 if h0 != 0xFF and h1 != 0xFF and h0 == h1:
                     print("  (both heads on the same cylinder -- park them apart to test independence)")
         elif cmd == "density":
-            # 0 = force DD, 1 = force HD, 2 = auto (default), 3 = query.
+            # 0 = force DD, 1 = force HD, 2 = auto (default), 3 = detect,
+            # no arg = query (sends 4).
             names = {"dd": 0, "hd": 1, "auto": 2, "detect": 3}
             val = names.get(sys.argv[3].lower(), None) if len(sys.argv) > 3 else 4
             if val is None:

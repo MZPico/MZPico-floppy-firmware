@@ -49,7 +49,7 @@
 
 // Buffer-settle delay between switching a '245 gate and sampling/driving C0..C7.
 // An LVC245 propagates in ~5 ns; the RP2040 GPIO input synchroniser costs 2
-// sysclk. Six nops @180 MHz is ~33 ns -- ample, and ~5x cheaper than the
+// sysclk. Six nops @200 MHz is 30 ns -- ample, and ~5x cheaper than the
 // `for (volatile int k...)` loop it replaces (which burned ~150 ns of the ~560 ns
 // Z80 I/O window). See docs/phase3-plan.md "Board-specific bus handshake".
 ALWAYS_INLINE void bus_settle(void) {
@@ -84,8 +84,9 @@ ALWAYS_INLINE void release_data_bus(void) {
 
 // Buffer gates (U1 address, U2 data + direction) are ALL owned by the bus PIO
 // side-set (see bus.pio): the write SM captures the data byte itself, and the
-// read SM turns U2 toward the bus only after core1 queues a go-word for a port
-// we own. core1 never touches EN0/EN1/RD1 in normal operation; only the bench
+// read SM waits for exactly ONE verdict word from core1 for EVERY read cycle
+// on the machine (1 = ours, the byte is already driven: turn U2 toward the bus;
+// 0 = not ours or too late: leave every gate off). core1 never touches EN0/EN1/RD1 in normal operation; only the bench
 // self-tests take them back as SIO (bus_read_pins / bus_drive_test).
 
 // EXWAIT / INT are driven low (open-drain style: assert = drive low, release =

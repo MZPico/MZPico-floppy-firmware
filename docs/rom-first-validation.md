@@ -1,5 +1,14 @@
 # ROM-first validation sequence (Phase 3.2 focus)
 
+> **Historical (pre-3.2).** This checklist was written before READ SECTOR worked
+> and describes firmware of that time — e.g. the index-synchronized read start
+> it targets was later removed (reads now start at any rotational phase with a
+> one-revolution + one-sector-span window). `tools/rom_first_validation.sh` is
+> equally historical. For the current design see [../CLAUDE.md](../CLAUDE.md)
+> and [wd-fidelity.md](wd-fidelity.md); for a current on-machine check use
+> `FDTEST.MZF` ([../mzf/fdtest/README.md](../mzf/fdtest/README.md)) and start
+> every bench session with `mzp_probe.py PORT health`.
+
 This checklist is for validating that the MZ-800 ROM floppy routines run reliably first, before adding more feature scope.
 
 ## Scope

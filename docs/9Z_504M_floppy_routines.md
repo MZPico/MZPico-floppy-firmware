@@ -2,6 +2,11 @@
 
 This note maps the confirmed floppy-controller I/O in `9Z_504M.dis.asm` and gives probable routine roles.
 
+The sources this note is drawn from — the boot ROM image `9Z_504M.ROM`, its
+disassembly `9Z_504M.dis.asm`, and the Disk BASIC listing `MZ2Z046.ASM` — are
+copyrighted Sharp material. They are kept locally (git-ignored) and are **not
+distributed with this repository**; addresses below refer to the ROM itself.
+
 ## Port map (MZ-800 Disk BASIC convention)
 
 - `0xD8`: WD status (read) / WD command (write), active-low bus values

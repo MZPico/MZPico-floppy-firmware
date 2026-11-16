@@ -1,8 +1,9 @@
 // MFM track encoder — sectors -> flux, the write-side counterpart of
 // mfm_decode. Wraps the encoder in flux/mfm_impl.h with correct timing/settings.
 // Produces a uniform-format track (all sectors 128<<size_code bytes, IDs 1..N);
-// mixed/interleaved layouts and the in-place single-sector write-splice come
-// with the Phase-3 WD bridge. See docs/wd-fidelity.md.
+// mixed/interleaved layouts are produced by the WD WRITE TRACK encoder
+// (format-image -> flux, below), and the in-place single-sector write splice
+// lives in mfm_splice. See docs/wd-fidelity.md.
 #pragma once
 #include <cstddef>
 #include <cstdint>

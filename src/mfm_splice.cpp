@@ -230,7 +230,7 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
       break;
     }
 
-    // Flux still queued in the FIFO is disk that has ALREADY gone past the
+    // Flux still queued in the capture ring is disk that has ALREADY gone past the
     // head, so it has to come off the gap we are about to wait out. Normally
     // this is zero or one transition -- the search consumes them as fast as
     // they arrive -- but it is exactly the error that would put the splice in
