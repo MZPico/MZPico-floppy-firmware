@@ -1,0 +1,85 @@
+# Build the firmware, build the MZ-800 test programs, run the host test suite.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    name: Firmware (RP2040)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: pico-sdk submodule (and only its TinyUSB submodule)
+        run: |
+          git submodule update --init --depth 1 external/pico-sdk
+          git -C external/pico-sdk submodule update --init --depth 1 lib/tinyusb
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib ninja-build
+          arm-none-eabi-gcc --version | head -1
+      - name: build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: report
+        run: |
+          {
+            echo '### Firmware'
+            echo '```'
+            arm-none-eabi-size build/mzpico_floppy.elf
+            echo "build id: $(cat build/generated/gitver.h)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware
+          path: |
+            build/mzpico_floppy.uf2
+            build/mzpico_floppy.elf
+          retention-days: 30
+
+  host-tests:
+    name: Host tests (simulated drive + emulated MZ-800)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: toolchain versions
+        run: grep -v '^#' tools/ci/toolchains.env >> "$GITHUB_ENV"
+      - name: z88dk (Docker image)
+        run: docker pull -q "$Z88DK_IMAGE"
+      - name: build
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends ninja-build
+          export PATH="$PWD/tools/ci/z88dk:$PATH"
+          cmake -S tests -B build-tests -G Ninja
+          cmake --build build-tests
+      - name: test
+        run: ctest --test-dir build-tests -j "$(nproc)" --output-on-failure --output-log ctest.log
+      - name: report
+        if: always()
+        run: |
+          {
+            echo '### Host tests'
+            echo 'Known open bugs are XFAIL tests: they pass the suite while the bug exists and fail it once fixed.'
+            echo '```'
+            grep -E '^\[(XFAIL |XPASS | FAIL )\]|tests: |tests passed|FDTEST RESULT' ctest.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mzf
+          path: build-tests/*.MZF
+          retention-days: 30

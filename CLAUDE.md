@@ -237,6 +237,35 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   before believing it. (ADDRESS bits 6/7 always read stuck high: every port we
   own, 0xD8–0xDF, has both set.)
 
+## Testing (CI) — reproduce on the host before the bench
+
+- **`tests/`** compiles `fdc.cpp`, `floppy.cpp` and the MFM code *unmodified*
+  against a deterministic simulation: virtual 24 MHz clock, core0 as a
+  coroutine, a pin-level simulated drive whose disk stores flux positions and
+  really turns, and an emulated MZ-800 (Z80 + trapped monitor calls) running
+  `FDTEST.MZF`. `cmake -S tests -B build-tests -G Ninja && cmake --build
+  build-tests && ctest --test-dir build-tests -j`. See
+  [tests/README.md](tests/README.md). When a hardware symptom has a
+  cross-core or rotational explanation, write the failing test first. #2 and #4
+  were reproduced this way in seconds.
+- **Open bugs are `XFAIL("#N")` tests.** They turn into failures once fixed, so
+  the fixing commit must drop the marker.
+- **`mzf/fdtest/`**: `FDTEST.MZF`, the on-machine controller test (read-only on
+  any disk, write/format on a scratch disk). It is faster than testing through
+  CP/M, and it is the same binary CI runs. Built with z88dk `+mz`, the same
+  toolchain as MZPico-800-Manager: the `z88dk.zcc` snap locally, or the image
+  pinned in `tools/ci/toolchains.env` via `tools/ci/z88dk/z88dk.zcc`.
+- Real disk images (`*.dsk`) and the Sharp ROMs are copyrighted, so they are
+  never committed. ctest picks up any `*.dsk` in `MZP_MEDIA_DIR` (default: the
+  repository root) as a local-only `fdtest_local_*` run.
+- **Workflows:** `.github/workflows/ci.yml` builds the uf2 with the pinned
+  pico-sdk and runs the host tests on every push and PR; `release.yml`
+  publishes a release when an annotated `fw-*`/`v*` tag is pushed. A release
+  re-runs the tests, checks that the build id equals the tag commit, and
+  attaches the uf2, the elf, `FDTEST.MZF`, `BUSTEST.MZF` and SHA256SUMS. The tag
+  message becomes the release notes, so write down what was verified on
+  hardware. Released uf2s replace `build/known-good/` as the bisect baseline.
+
 ## Conventions (inherited from the reference firmware)
 
 - Pico-SDK, CMake, C11 / C++17. RP2040 (consider RP2350). Overclock (~180 MHz).

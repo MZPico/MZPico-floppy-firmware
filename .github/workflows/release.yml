@@ -1,0 +1,94 @@
+# Publish a hardware-verified build: push an annotated tag (fw-<hash> or
+# v<version>) on the commit that was validated on the machine. The tag
+# message becomes the release notes, so write what was verified there.
+#
+#   git tag -a fw-1234abc -m "Validated on hardware: ..." && git push origin fw-1234abc
+#
+# workflow_dispatch publishes (or re-publishes) a release for an existing tag.
+name: Release
+
+on:
+  push:
+    tags: ['fw-*', 'v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: existing tag to release
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - name: toolchain versions
+        run: grep -v '^#' tools/ci/toolchains.env >> "$GITHUB_ENV"
+      - name: toolchains
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib ninja-build
+          docker pull -q "$Z88DK_IMAGE"
+          git submodule update --init --depth 1 external/pico-sdk
+          git -C external/pico-sdk submodule update --init --depth 1 lib/tinyusb
+
+      - name: host tests (a release must pass them)
+        run: |
+          export PATH="$PWD/tools/ci/z88dk:$PATH"
+          cmake -S tests -B build-tests -G Ninja
+          cmake --build build-tests
+          ctest --test-dir build-tests -j "$(nproc)" --output-on-failure
+
+      - name: firmware
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          # The build id the firmware reports (mzp_probe.py fwver) must be the
+          # tagged commit, clean: that is what makes a release bisectable.
+          want="$(git rev-parse --short HEAD)"
+          got="$(sed -n 's/.*"\(.*\)".*/\1/p' build/generated/gitver.h)"
+          echo "build id: $got (tag commit $want)"
+          test "$got" = "$want"
+
+      - name: assets
+        run: |
+          mkdir -p dist
+          cp build/mzpico_floppy.uf2 "dist/mzpico_floppy-$TAG.uf2"
+          cp build/mzpico_floppy.elf "dist/mzpico_floppy-$TAG.elf"
+          cp build-tests/FDTEST.MZF dist/
+          cp tools/mzf/BUSTEST.MZF dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
+
+      - name: notes
+        run: |
+          {
+            git for-each-ref "refs/tags/$TAG" --format='%(contents)'
+            echo
+            echo '---'
+            echo "Firmware build id: \`$(git rev-parse --short HEAD)\` (check with \`mzp_probe.py PORT fwver\`)."
+            echo
+            echo '- `mzpico_floppy-'"$TAG"'.uf2`: flash with BOOTSEL.'
+            echo '- `FDTEST.MZF`: controller test for the MZ-800 (read-only test on any disk; write test on a scratch disk only).'
+            echo '- `BUSTEST.MZF`: bus loopback test (`mzp_probe.py PORT bustestreset`, run it, then `bustest`).'
+          } > notes.md
+          cat notes.md
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md
+          fi
