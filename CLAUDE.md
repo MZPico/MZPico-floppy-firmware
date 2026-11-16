@@ -283,8 +283,12 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - Pico-SDK, CMake, C11 / C++17. RP2040 (consider RP2350). Overclock (~180 MHz).
 - Direct SIO register access + PIO for bus and flux timing; `RAM_FUNC` /
   `ALWAYS_INLINE` for hot paths (see `bus.hpp`, `common.hpp` in the reference).
-- FDC code carries a **GPL v2+** notice (ported MZ800 emulator origin) — keep
-  license headers intact when adapting `fdc.cpp`.
+- **License: Apache-2.0** (LICENSE, NOTICE). `src/bus/fdc.*` is original
+  work: it shares no code with the GPL fdc.cpp of the MZ800 emulator that the
+  reference firmware's image-backed controller ported (checked line by line
+  when the license was chosen, #26). Do not copy code from that file, or from
+  mz800emu, into this repository. The Adafruit_Floppy-derived files keep their
+  MIT notices (LICENSES/).
 
 ## Status
 

@@ -1,3 +1,6 @@
+// Derived from Adafruit_Floppy (https://github.com/adafruit/Adafruit_Floppy),
+// MIT License, Copyright (c) 2021 Limor Fried for Adafruit Industries.
+// See LICENSES/MIT-Adafruit_Floppy.txt. Changes: Apache-2.0, see LICENSE.
 #include "floppy.hpp"
 
 #include "flux/arch_rp2.h"

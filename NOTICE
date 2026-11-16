@@ -1,0 +1,32 @@
+MZPico floppy firmware
+Copyright 2026 The MZPico floppy firmware authors
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This product includes software from the following projects, under their own
+licenses (the full texts are in LICENSES/):
+
+- Adafruit_Floppy (https://github.com/adafruit/Adafruit_Floppy)
+  MIT License, Copyright (c) 2021 Limor Fried for Adafruit Industries;
+  mfm_impl.h Copyright 2022 Jeff Epler for Adafruit Industries.
+  Ported to the bare Pico SDK: src/flux/ (arch_rp2.*, greasepack.h,
+  mfm_impl.h), src/floppy.*, src/gw_protocol.*.
+  -> LICENSES/MIT-Adafruit_Floppy.txt
+
+- MZPico firmware (reference), Apache License 2.0.
+  The MZ-800 bus helpers in src/bus/board_bus.h, src/bus/mz_bus.cpp,
+  src/bus/bus.pio and src/usb_descriptors.c started from it.
+
+- superzazu/z80 (https://github.com/superzazu/z80), MIT License,
+  Copyright (c) 2019 Nicolas Allemand. Test harness only (tests/third_party/z80).
+  -> LICENSES/MIT-superzazu-z80.txt
+
+Built with, not included in this repository's source:
+- Raspberry Pi Pico SDK (BSD-3-Clause) and TinyUSB (MIT), the git submodule
+  external/pico-sdk.
+- z88dk (Clarified Artistic License) builds the MZ-800 programs in mzf/.
+
+The WD179x controller emulation (src/bus/fdc.*) is original to this project:
+it implements the controller's documented behaviour and contains no code from
+the GPL-licensed fdc.cpp of the MZ800 emulator (Michal Hucik, Bohumil Novacek)
+that the reference firmware's image-backed controller is based on.

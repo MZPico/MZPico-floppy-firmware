@@ -1,3 +1,6 @@
+// Derived from Adafruit_Floppy (https://github.com/adafruit/Adafruit_Floppy),
+// MIT License, Copyright (c) 2021 Limor Fried for Adafruit Industries.
+// See LICENSES/MIT-Adafruit_Floppy.txt. Changes: Apache-2.0, see LICENSE.
 // RP2040 PIO flux capture/write — bare Pico-SDK port of Adafruit_Floppy's
 // arch_rp2. Only the two free functions are kept (no Arduino, no MFM, no
 // Adafruit_FloppyBase). See src/flux/README-port.md for what changed.
