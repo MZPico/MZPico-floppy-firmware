@@ -13,7 +13,13 @@
 #include <cstdint>
 
 #define ALWAYS_INLINE inline __attribute__((always_inline))
+#ifdef MZP_HOST_SIM
+// Host simulation (tests/): no RAM/flash distinction, and a code section named
+// .data would be mapped non-executable on the host.
+#define RAM_FUNC __attribute__((noinline))
+#else
 #define RAM_FUNC __attribute__((section(".data.ram_func"))) __attribute__((noinline))
+#endif
 
 // Shared 8-bit bus C0..C7
 #define DATA_BUS_BASE 0
