@@ -12,6 +12,10 @@
 #include "tusb.h"
 
 int main() {
+  // Before anything else: the '245 gates default to "both buffers on" until
+  // driven (issue #10).
+  bus_park_gates();
+
   // Overclock for reliable flux timing (Adafruit recommends ~200MHz on RP2040).
   vreg_set_voltage(VREG_VOLTAGE_1_15);
   sleep_ms(2);

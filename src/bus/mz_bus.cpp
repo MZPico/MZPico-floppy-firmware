@@ -51,13 +51,40 @@ static void init_bus_gpio(void) {
   // then hand all three to the bus PIO (pio1) side-set. From here on core1
   // never touches them (bus.pio owns the gate sequencing; only the bench
   // self-tests take them back).
+  //
+  // The handover itself must not glitch (issue #10): switching a pad to the
+  // PIO used to hand it to a PIO output latch of 0 with output-enable 0, so the
+  // pins floated -- and the pads' default pull-DOWN reads as "both '245s on,
+  // U2 driving the bus". Preload the PIO's own pin latch with BLOCK (all 1)
+  // and its pin directions with "output" first; then the function switch
+  // changes who drives the 1, not the level.
+  const uint32_t gate_mask = 7u << EN0_PIN;
+  pio_sm_set_pins_with_mask(BUS_PIO, SM_READ, gate_mask, gate_mask);
+  pio_sm_set_pindirs_with_mask(BUS_PIO, SM_READ, gate_mask, gate_mask);
+  const int gate_pins[] = {EN0_PIN, EN1_PIN, RD1_PIN};
+  for (int p : gate_pins) {
+    // (Already parked high by bus_park_gates() at the top of main().)
+    gpio_put(p, 1); // EN0=1 addr buffer off, EN1=1 data buffer off, RD1=1 read
+    gpio_set_dir(p, GPIO_OUT);
+    gpio_pull_up(p); // and hold them off on their own if anything lets go
+    gpio_set_slew_rate(p, GPIO_SLEW_RATE_FAST);
+    gpio_set_function(p, GPIO_FUNC_PIO1);
+  }
+}
+
+// The very first thing main() does: drive the three buffer gates OFF as plain
+// SIO outputs, with their pull-ups on. Until this runs -- from power-on, during
+// clock and USB bring-up -- the pads are inputs with the RP2040's default
+// pull-DOWN, which the '245s read as both buffers on and U2 driving the
+// MZ-800 data bus (issue #10). Firmware cannot cover the time before main()
+// (reset, BOOTSEL): that needs pull-up resistors on ~EN0/~EN1 (board rev 2).
+void bus_park_gates(void) {
   const int gate_pins[] = {EN0_PIN, EN1_PIN, RD1_PIN};
   for (int p : gate_pins) {
     gpio_init(p);
-    gpio_put(p, 1); // EN0=1 addr buffer off, EN1=1 data buffer off, RD1=1 read
+    gpio_put(p, 1);
     gpio_set_dir(p, GPIO_OUT);
-    gpio_set_slew_rate(p, GPIO_SLEW_RATE_FAST);
-    gpio_set_function(p, GPIO_FUNC_PIO1);
+    gpio_pull_up(p);
   }
 }
 

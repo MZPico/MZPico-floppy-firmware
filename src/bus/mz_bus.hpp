@@ -47,6 +47,9 @@ extern BusDiag g_bus_diag;
 // single-experiment measurement impossible.)
 void bus_diag_reset(void);
 
+// Drive the '245 gates OFF at once (see mz_bus.cpp). First line of main().
+void bus_park_gates(void);
+
 // Init bus GPIO + PIO and launch the core1 listen loop. Call once from main().
 void bus_init(void);
 

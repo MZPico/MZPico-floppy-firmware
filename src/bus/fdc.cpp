@@ -540,7 +540,11 @@ struct FdcState {
   // host's actual intent is visible instead of inferred from command opcodes.
   // Runs of identical consecutive accesses are coalesced into a repeat count --
   // without that, one STATUS poll loop (48k reads seen) flushes all history.
-  static constexpr uint8_t IO_TRACE_N = 96;
+  // A power of two: core1 wraps the ring with a mask. `% 96` compiled to two
+  // __aeabi_idivmod calls per register access -- flash-resident code on
+  // core1's bus path (issue #12).
+  static constexpr uint8_t IO_TRACE_N = 128;
+  static_assert((IO_TRACE_N & (IO_TRACE_N - 1)) == 0, "mask wrap");
   volatile uint8_t io_port[IO_TRACE_N] = {0};
   volatile uint8_t io_val[IO_TRACE_N] = {0};  // byte as it appears on the bus
   volatile uint8_t io_rd[IO_TRACE_N] = {0};   // 1 = read, 0 = write
@@ -729,8 +733,7 @@ namespace {
 // so the rule lives in one place.
 ALWAYS_INLINE void fdc_trace_io(uint8_t port, uint8_t val, uint8_t is_rd) {
   S.io_total++;
-  uint8_t last = (uint8_t)((S.io_pos + FdcState::IO_TRACE_N - 1) %
-                           FdcState::IO_TRACE_N);
+  uint8_t last = (uint8_t)((S.io_pos - 1) & (FdcState::IO_TRACE_N - 1));
   if (S.io_n && S.io_port[last] == port && S.io_val[last] == val &&
       S.io_rd[last] == is_rd) {
     if (S.io_rep[last] < 0xFFFF)
@@ -741,7 +744,7 @@ ALWAYS_INLINE void fdc_trace_io(uint8_t port, uint8_t val, uint8_t is_rd) {
   S.io_val[S.io_pos] = val;
   S.io_rd[S.io_pos] = is_rd;
   S.io_rep[S.io_pos] = 1;
-  S.io_pos = (uint8_t)((S.io_pos + 1) % FdcState::IO_TRACE_N);
+  S.io_pos = (uint8_t)((S.io_pos + 1) & (FdcState::IO_TRACE_N - 1));
   if (S.io_n < FdcState::IO_TRACE_N)
     S.io_n++;
 }
@@ -821,6 +824,15 @@ ALWAYS_INLINE void fdc_refresh_int_line(void) {
 static constexpr uint32_t FDC_RESET_CONFIRM_US = 20;
 
 RAM_FUNC static void fdc_bus_reset_isr(void) {
+  // A rising RESET can land in the middle of a served read, between
+  // acquire_data_bus_for_writing() and release_data_bus(). The Z80 drops
+  // IORQ, the read SM turns U1 (address buffer) back on ~230 ns later, and
+  // this ISR then spends 20 us debouncing -- with GPIO0-7 still driven, the
+  // exact contention bus.pio's guard delay exists to prevent. Let go of the
+  // pads (and EXWAIT) before anything else (issue #11). Rising edge only: a
+  // falling edge is the machine leaving reset, never mid-read.
+  if (sio_hw->gpio_in & (1u << RESET_PIN))
+    sio_hw->gpio_oe_clr = DATA_BUS_MASK | (1u << EXWAIT_PIN);
   uint32_t events = gpio_get_irq_event_mask(RESET_PIN);
   gpio_acknowledge_irq(RESET_PIN, events);
   if (!g_reset_poll_enabled)
