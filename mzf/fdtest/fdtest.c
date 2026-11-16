@@ -27,7 +27,7 @@
  */
 #include <stdint.h>
 
-#define VERSION "1.3"
+#define VERSION "1.4"
 
 /* ---- WD179x ---- */
 #define P_CMD 0xD8
@@ -286,11 +286,14 @@ static char getkey(void) {
 }
 
 static uint16_t n_pass, n_fail;
+static uint8_t n_data_fail; /* failures that make writing unsafe */
+static uint8_t cur_blocks;  /* this check guards the write tests */
 static uint8_t cur_ok;
 
 static void begin(const char *name) {
   puts(name);
   cur_ok = 1;
+  cur_blocks = 1;
 }
 static void fail(const char *why) {
   if (cur_ok)
@@ -308,8 +311,11 @@ static void end(void) {
   if (cur_ok) {
     puts(" OK");
     ++n_pass;
-  } else
+  } else {
     ++n_fail;
+    if (cur_blocks)
+      ++n_data_fail;
+  }
   putc('\n');
 }
 
@@ -567,6 +573,11 @@ static void t_read_all(void) {
 static void t_read_boot_track(void) {
   uint8_t st;
   begin("READ CYL 0 (BOOT) .....");
+  /* The boot track is DD even on a CP/M HD disk, and DD on HD media is
+   * marginal on drives that sense density from the media hole: a failure
+   * here is reported but does not stop the write tests, which use the data
+   * cylinders. */
+  cur_blocks = 0;
   seek(0, 0);
   side(0);
   {
@@ -805,7 +816,7 @@ int main(void) {
   }
   wout(P_EINT, 0);
   read_tests();
-  if (k != '1' && n_fail == 0)
+  if (k != '1' && n_data_fail == 0)
     write_tests();
   else if (k != '1')
     puts("WRITE TESTS SKIPPED (READ FAILED)\n");
