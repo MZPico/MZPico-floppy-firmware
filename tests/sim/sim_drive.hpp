@@ -51,6 +51,10 @@ struct Drive {
   uint64_t motor_on_since = 0;
   bool motor = false;
   int steps = 0;              // STEP pulses obeyed (test assertions)
+  // Flux-free stretch at each end of a spliced write (write-current ramp at
+  // WGATE on, tunnel erase after WGATE off). 20 us is longer than the 255-tick
+  // (10.6 us) capture clamp, as observed on hardware.
+  uint64_t splice_junction_ticks = us(20);
   std::vector<WriteEvent> writes;
 
   bool spinning(uint64_t now) const {

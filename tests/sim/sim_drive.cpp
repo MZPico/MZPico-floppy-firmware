@@ -119,8 +119,14 @@ void FloppyCable::write_flux(uint64_t t0, const uint8_t *deltas, size_t n,
     return;
   }
   Track &tr = d->disk->at(d->cyl, ev.head);
+  // A splice is not a clean cut on real media: the write current ramps up
+  // after WGATE asserts, so the first stretch records no transitions, and the
+  // tunnel-erase gap trails the write head, so a stretch after WGATE drops is
+  // erased too. Both leave a flux-free interval longer than any MFM symbol at
+  // each end of a rewritten data field -- which a reader must tolerate.
+  uint64_t junction = full_track ? 0 : d->splice_junction_ticks;
   // Erase [a0, a0+span) (with wrap), then lay down the new transitions.
-  uint64_t span = dur * REV_ANGLE / d->rev_ticks;
+  uint64_t span = (dur + junction) * REV_ANGLE / d->rev_ticks;
   auto erased = [&](uint32_t p) {
     uint64_t rel = (p + (uint64_t)REV_ANGLE - ev.a0) % REV_ANGLE;
     return span >= REV_ANGLE || rel < span;
@@ -135,6 +141,8 @@ void FloppyCable::write_flux(uint64_t t0, const uint8_t *deltas, size_t n,
     t += deltas[i];
     if (t > dur)
       break;
+    if (t < junction)
+      continue; // write current still ramping up
     out.push_back((uint32_t)((ev.a0 + t * REV_ANGLE / d->rev_ticks) % REV_ANGLE));
   }
   std::sort(out.begin(), out.end());
@@ -240,20 +248,23 @@ bool rp2040_flux_write_now(int wrgate_pin, const uint8_t *pulses, size_t n) {
 
 // Whole-track write (WRITE TRACK / gw write): optionally from the index
 // falling edge, ending at the next one or when the pulses run out. The index
-// waits have NO timeout, exactly as in arch_rp2.cpp -- a drive with no index
-// would hang real core0 here, so the simulation reports that as a hang.
+// waits are bounded at 600 ms, as in arch_rp2.cpp (issue #7); the guard below
+// reports a hang should that bound ever go missing again.
 bool rp2040_flux_write(int index_pin, int wrgate_pin, int, uint8_t *pulses,
                        uint8_t *pulse_end, bool, bool, bool use_index) {
   uint64_t start = now();
-  auto guard = [&] {
+  auto timed_out = [&] {
     if (now() - start > sim::ms(10000))
       core0_report_hang("rp2040_flux_write: index wait never ends (no ~INDEX)");
+    return now() - start > sim::us(600000);
   };
   if (use_index) {
     while (!gpio_get(index_pin))
-      guard();
+      if (timed_out())
+        return false;
     while (gpio_get(index_pin))
-      guard();
+      if (timed_out())
+        return false;
   }
   gpio_set_dir(wrgate_pin, GPIO_OUT);
   gpio_put(wrgate_pin, 0);

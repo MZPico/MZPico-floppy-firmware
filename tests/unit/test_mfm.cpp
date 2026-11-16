@@ -114,7 +114,6 @@ TEST(wrong_cylinder_id_is_reported_not_returned) {
 }
 
 TEST(id_without_data_field_is_not_paired_with_a_later_orphan_data_field) {
-  XFAIL("#4: an ID field is paired with the next data mark at any distance");
   // ID(1) with no data field, then a data field with no ID (0x22s): the
   // situation a missed sync leaves in a capture. A WD gives up on a data mark
   // that does not follow within ~43 bytes of the ID; the orphan must never be
@@ -131,7 +130,6 @@ TEST(id_without_data_field_is_not_paired_with_a_later_orphan_data_field) {
 }
 
 TEST(scan_does_not_swallow_the_sector_after_an_id_without_data) {
-  XFAIL("#4: mfm_scan_track consumes the next ID as a data mark");
   TrackSpec spec = uniform(1, 0, 3, 2, false);
   spec.sectors[0].no_data = true;
   Track t = encode_track(spec);
@@ -161,4 +159,58 @@ TEST(verify_track_checks_cylinder) {
   std::vector<uint8_t> f = deltas(t, 1);
   CHECK(mfm_verify_track(f.data(), f.size(), 2.0f, 30));
   CHECK(!mfm_verify_track(f.data(), f.size(), 2.0f, 31));
+}
+
+// #4 via a dropout: the capture clamps long intervals to 255, so a flux gap
+// between an ID and an orphan data field must not shrink below the DAM
+// window in the sum. A saturated interval inside the window rejects the pair.
+TEST(flux_dropout_between_id_and_orphan_data_does_not_pair_them) {
+  XFAIL("dropout under-count: the 8-bit capture clamps gaps to 255 and a splice junction makes that clamp legal; see mfm_decode.cpp find_data_sync");
+  TrackSpec spec = uniform(1, 0, 4, 2, false);
+  spec.sectors[0].no_data = true;
+  spec.sectors[1].no_id = true;
+  spec.sectors[1].data.assign(512, 0x22);
+  Track t = encode_track(spec);
+  std::vector<uint8_t> f = deltas(t, 1);
+  // Find sector 1's ID (it ends ~ after the first few hundred transitions of
+  // the index area); replace a long stretch of the gap after it with one
+  // saturated interval, as a 1.2 ms dropout is captured: time removed, 255 left.
+  std::vector<uint8_t> out(512);
+  SectorRead before = mfm_read_sector(f.data(), f.size(), 2.0f, 1, 1, out.data(), 512);
+  CHECK(!(before.found && before.has_data)); // no pairing without the dropout
+  // Collapse the whole stretch between ID 1 and the orphan's sync region into
+  // a couple of saturated bytes: the clamped sum now "fits" the window.
+  size_t id_end = 0;
+  {
+    // locate the first 0xFE ID mark by decoding progressively larger prefixes
+    for (size_t n = 200; n < f.size(); n += 50) {
+      uint8_t id[6];
+      if (mfm_read_address(f.data(), n, 2.0f, id)) { id_end = n; break; }
+    }
+  }
+  REQUIRE(id_end > 0);
+  // The orphan's data sync is the first A1 sync after ID 1 (which has no data
+  // field): MFM 0x4489 shows up as 4T,3T,4T,3T intervals (192,144,... ticks).
+  auto near = [](uint8_t v, int want) { return v > want - 20 && v < want + 20; };
+  size_t sync = 0;
+  for (size_t i = id_end + 20; i + 4 < f.size(); ++i)
+    if (near(f[i], 192) && near(f[i + 1], 144) && near(f[i + 2], 192) &&
+        near(f[i + 3], 144)) {
+      sync = i;
+      break;
+    }
+  REQUIRE(sync > id_end);
+  // Keep ~25 bytes (25 x 16 cells x 48 ticks) before the sync, and replace
+  // everything between the ID and there with ONE saturated interval: a long
+  // dropout, as the capture records it.
+  size_t cut_from = id_end + 20, cut_to = sync;
+  uint32_t kept = 0;
+  while (cut_to > cut_from && kept < 25u * 16u * 48u)
+    kept += f[--cut_to];
+  REQUIRE(cut_to > cut_from + 50); // a real gap was removed
+  std::vector<uint8_t> g(f.begin(), f.begin() + (long)cut_from);
+  g.push_back(255);
+  g.insert(g.end(), f.begin() + (long)cut_to, f.end());
+  SectorRead r = mfm_read_sector(g.data(), g.size(), 2.0f, 1, 1, out.data(), 512);
+  CHECK(!(r.found && r.has_data && r.data_crc_ok));
 }

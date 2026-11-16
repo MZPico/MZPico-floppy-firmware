@@ -288,6 +288,9 @@ static uint8_t *capture_foreground(int index_pin, uint8_t *start, uint8_t *end,
   }
   int last = read_fifo();
   bool last_index = gpio_get(index_pin);
+  // Flux can also STOP mid-capture (disk pulled, motor stopped). Bound the gap
+  // between transitions, or this loop spins forever with interrupts off.
+  uint32_t last_data_us = time_us_32();
   while (ptr != end) {
     bool now_index = gpio_get(index_pin);
     if (!now_index && last_index) {
@@ -301,8 +304,11 @@ static uint8_t *capture_foreground(int index_pin, uint8_t *start, uint8_t *end,
     last_index = now_index;
 
     if (!data_available()) {
+      if (time_us_32() - last_data_us > FLUX_FIRST_SAMPLE_TIMEOUT_US)
+        break;
       continue;
     }
+    last_data_us = time_us_32();
 
     int data = read_fifo();
     int delta = last - data;
@@ -441,11 +447,16 @@ static bool init_write(int wrdata_pin, bool is_apple2) {
   }
   const pio_program_t *program =
       is_apple2 ? &fluxwrite_apple2_struct : &fluxwrite_struct;
-  g_writer.program = program;
-
   if (!allocate_pio_set_program(&g_writer, program)) {
     return false;
   }
+  // AFTER the allocation: allocate_pio_set_program() memsets the whole struct,
+  // so assigning before it left `program` null and free_write() handed
+  // pio_remove_program() a null program on every write -- on the RP2040 that
+  // reads a garbage length out of the boot ROM at address 0 and clears that
+  // many bits of the PIO's instruction-space bookkeeping, which can let a
+  // later program load over another one (e.g. the bus SMs').
+  g_writer.program = program;
 
   uint32_t wrdata_bit = 1u << wrdata_pin;
   pio_gpio_init(g_writer.pio, wrdata_pin);
@@ -474,13 +485,24 @@ static void disable_write() {
   pio_sm_set_enabled(g_writer.pio, g_writer.sm, false);
 }
 
-static void write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
+// How long a track write waits for the index pulse it starts on. One
+// revolution is <= ~220 ms on any drive seen; no index in this long means no
+// disk, an absent drive or a stopped spindle. The waits used to be unbounded,
+// so a host WRITE TRACK on an empty drive hung core0 for good (issue #7).
+static constexpr uint32_t WRITE_INDEX_TIMEOUT_US = 600000;
+
+static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
                              uint8_t *pulse_end, bool store_greaseweazle,
                              bool use_index) {
   if (use_index) {
+    uint32_t t0 = time_us_32();
     while (!gpio_get(index_pin)) { /* not during an index pulse */
+      if (time_us_32() - t0 > WRITE_INDEX_TIMEOUT_US)
+        return false;
     }
     while (gpio_get(index_pin)) { /* wait for falling edge of index */
+      if (time_us_32() - t0 > WRITE_INDEX_TIMEOUT_US)
+        return false;
     }
   }
 
@@ -516,6 +538,7 @@ static void write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
   pio_sm_set_enabled(g_writer.pio, g_writer.sm, false);
   gpio_set_dir(wrgate_pin, GPIO_IN); // release WGATE (external/internal pull-up)
   gpio_pull_up(wrgate_pin);
+  return true;
 }
 
 static void free_write() {
@@ -605,8 +628,8 @@ bool rp2040_flux_write(int index_pin, int wrgate_pin, int wrdata_pin,
   if (!init_write(wrdata_pin, is_apple2)) {
     return false;
   }
-  write_foreground(index_pin, wrgate_pin, pulses, pulse_end, store_greaseweazle,
-                   use_index);
+  bool ok = write_foreground(index_pin, wrgate_pin, pulses, pulse_end,
+                             store_greaseweazle, use_index);
   free_write();
-  return true;
+  return ok;
 }
