@@ -19,7 +19,7 @@ jobs:
     name: Firmware (RP2040)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: pico-sdk submodule (and only its TinyUSB submodule)
         run: |
           git submodule update --init --depth 1 external/pico-sdk
@@ -43,7 +43,7 @@ jobs:
             echo "build id: $(cat build/generated/gitver.h)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: firmware
           path: |
@@ -55,7 +55,7 @@ jobs:
     name: Host tests (simulated drive + emulated MZ-800)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: toolchain versions
         run: grep -v '^#' tools/ci/toolchains.env >> "$GITHUB_ENV"
       - name: z88dk (Docker image)
@@ -78,7 +78,7 @@ jobs:
             grep -E '^\[(XFAIL |XPASS | FAIL )\]|tests: |tests passed|FDTEST RESULT' ctest.log || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mzf
           path: build-tests/*.MZF
