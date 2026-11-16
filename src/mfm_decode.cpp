@@ -13,6 +13,34 @@ static constexpr uint32_t GW_SF = 24000000UL;
 
 static const uint8_t MFM_IO_DDAM = 0xF8; // deleted data address mark
 
+// The data field belongs to the ID before it only if its sync mark follows
+// within the WD's search window: a WD179x gives up on the data address mark 43
+// bytes after the ID field's CRC (MFM) and reports RNF. A standard track puts
+// it 37 bytes on (Gap 2 + presync + the sync itself) and our write splice ~2
+// bytes later, so 46 bytes (with slack for bit-cell drift) separates a real
+// data field from whatever comes next. Without the limit an ID whose own data
+// sync was lost was paired with the NEXT data field on the track -- right
+// cylinder and sector, CRC-valid, another sector's content (issue #4).
+//
+// Returns true with `io` just past the data sync. On false, io->pos is put
+// back where it was, so the caller's next sync search finds what really comes
+// next -- typically the following sector's ID, which a scan must not swallow.
+static constexpr uint32_t MFM_DAM_WINDOW_BYTES = 46;
+static bool find_data_sync(mfm_io_t *io) {
+  size_t start = io->pos;
+  bool ok = skip_triple_sync_mark(io);
+  if (ok) {
+    uint32_t ticks = 0;
+    uint32_t limit = MFM_DAM_WINDOW_BYTES * 16u * io->T1_nom;
+    for (size_t i = start; i < io->pos && ticks <= limit; ++i)
+      ticks += io->pulses[i];
+    ok = ticks <= limit;
+  }
+  if (!ok)
+    io->pos = start;
+  return ok;
+}
+
 int mfm_scan_track(const uint8_t *flux, size_t n_flux, float nominal_bit_time_us,
                    SectorInfo *out, int max_sectors, uint8_t *scratch,
                    size_t scratch_size) {
@@ -54,10 +82,11 @@ int mfm_scan_track(const uint8_t *flux, size_t n_flux, float nominal_bit_time_us
     s->deleted = false;
 
     // The data field follows after Gap 2 + its own sync mark.
-    if (skip_triple_sync_mark(&io)) {
+    size_t after_id = io.pos;
+    if (find_data_sync(&io)) {
       size_t dsize = s->size;
+      uint8_t dmark = 0;
       if (dsize <= scratch_size) {
-        uint8_t dmark = 0;
         uint16_t dcrc =
             receive_crc(&io, &dmark, (size_t)1, scratch, dsize, crcbuf,
                         (size_t)sizeof(crcbuf), (uint8_t *)NULL);
@@ -68,6 +97,8 @@ int mfm_scan_track(const uint8_t *flux, size_t n_flux, float nominal_bit_time_us
           s->data_crc_ok = (dcrc == 0);
         }
       }
+      if (!s->has_data)
+        io.pos = after_id; // that sync was the next ID: leave it to the loop
     }
     n++;
   }
@@ -129,7 +160,7 @@ SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
     r.size = size;
     r.size_n = nsz;
 
-    if (skip_triple_sync_mark(&io) && size <= out_size) {
+    if (find_data_sync(&io) && size <= out_size) {
       uint8_t dmark = 0;
       uint16_t dcrc = receive_crc(&io, &dmark, (size_t)1, out, size, crcbuf,
                                   (size_t)sizeof(crcbuf), (uint8_t *)NULL);

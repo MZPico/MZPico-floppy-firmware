@@ -78,11 +78,20 @@ A test for an open bug is marked `XFAIL("#N: ...")`. It passes the suite
 while it fails, and it **fails the suite once it passes** (XPASS), so the fix
 that closes the issue also has to remove the marker. Open ones:
 
+None at the moment: #2, #4, #8 and #20 started as XFAIL tests and are fixed.
+Every fixed review bug keeps a test that fails on the old firmware:
+
 | Issue | Test |
 |---|---|
+| #1 stale read completion breaks a write | `stale_read_completion_does_not_break_a_write_being_fed` |
+| #2 side not re-applied after a seek | `side_change_after_seek_reaches_the_read` |
+| #3 new read answered from the old capture | `read_issued_during_a_capture_*` |
 | #4 ID paired with a far data mark | `id_without_data_field_is_not_paired_...`, `scan_does_not_swallow_...` |
-| #8 unit 2/3 wedges the controller | `unit2_selected_reports_not_ready_then_unit0_still_works` |
-| #20 Verify accepts any cylinder | `seek_verify_detects_wrong_cylinder` |
+| #7 WRITE TRACK hangs on an empty drive | `write_track_on_empty_drive_fails_instead_of_hanging` |
+| #8 unit 2/3 wedges the controller | `unit2_selected_...`, `type1_on_missing_unit_does_not_move_drive0` |
+| #20 Verify accepts any cylinder | `seek_verify_detects_wrong_cylinder`, `verify_after_lost_steps_...` |
+| #21 size code 4..7 overruns the buffer | `oversized_size_code_cannot_overrun_the_transfer_buffer` |
+| #22 write refused from the other drive's WP | `write_to_writable_drive_right_after_switching_from_protected_one` |
 
 ## Limits
 

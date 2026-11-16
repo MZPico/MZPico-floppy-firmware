@@ -170,6 +170,13 @@ struct FdcState {
   // Physical status core0 -> core1.
   volatile bool at_track0 = true;
   volatile bool write_protect = false;
+  // ~WPT as last sensed on EACH unit (core0 writes, core1 reads). core1 decides
+  // a write refusal at command time, often microseconds after the host
+  // re-selected another drive and before core0 has applied that select, so
+  // the single `write_protect` above can still be the previous drive's
+  // (issue #22). The bit core0 re-reads right before any flux stays the last
+  // line of defence.
+  volatile bool wp_unit[2] = {false, false};
   volatile bool seek_error = false; // Verify (if requested) found no matching ID
 
   // ---- Type II READ SECTOR ----------------------------------------------
@@ -599,12 +606,26 @@ ALWAYS_INLINE int fdc_cur_idx(void) {
   return (g_cur_drive >= 0 && g_cur_drive < FDC_DRIVE_MAX) ? g_cur_drive : 0;
 }
 
+// core0: record ~WPT for the drive it is driving (see wp_unit).
+ALWAYS_INLINE void fdc_note_wp(bool wp) {
+  S.write_protect = wp;
+  S.wp_unit[fdc_cur_idx()] = wp;
+}
+// core1: write protection of the unit the HOST has selected, as last sensed.
+ALWAYS_INLINE bool fdc_host_unit_wp(void) {
+  uint8_t d = S.drive_sel;
+  return d < 2 ? S.wp_unit[d] : S.write_protect;
+}
+
 ALWAYS_INLINE uint16_t fdc_sector_size_for(uint8_t trk) {
   int d = fdc_drive_idx();
   int h = S.side1 ? 1 : 0;
   uint8_t n =
       (trk < FDC_SIZE_CACHE_N) ? g_size_code[d][h][trk] : FDC_SIZE_CODE_DEFAULT;
-  return (uint16_t)(128u << (n & 7));
+  // Size codes 4..7 (2-16 KB) exist on odd media, but the transfer buffer is
+  // FDC_SECTOR_MAX: this length bounds core1's writes into xfer[] (issue #21).
+  uint16_t sz = (uint16_t)(128u << (n & 7));
+  return sz <= FDC_SECTOR_MAX ? sz : (uint16_t)FDC_SECTOR_MAX;
 }
 
 // Remember the size code an ID field on `trk` reported. Called from core0 on
@@ -1042,7 +1063,7 @@ static bool fdc_apply_drive_select(void) {
   // unprotected drive 0 is what would let a WRITE SECTOR reach a write-protected
   // disk in drive 1 before the next refresh caught up.
   S.at_track0 = next->get_track0_sense();
-  S.write_protect = next->get_write_protect();
+  fdc_note_wp(next->get_write_protect());
   return true;
 }
 
@@ -1337,6 +1358,7 @@ static constexpr uint32_t FDC_READADDR_DRQ_WINDOW_US = 2000;
 // Bounded to one buffer's worth of flux (well over one revolution) as a safety
 // net; real WD hardware retries for up to ~5 revolutions if a slower drive or
 // unlucky rotational timing ever needs more headroom than that here.
+static void fdc_resync_head(uint8_t seen_cyl);
 static bool fdc_verify_track(uint8_t track) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
@@ -1377,35 +1399,33 @@ static bool fdc_verify_track(uint8_t track) {
   S.verify_n = (uint32_t)n;
   bool ok = (n > 0) && mfm_verify_track(flux, n, fdc_bit_us(), track);
 
+  // A WD Verify passes only on an ID whose cylinder equals the Track register.
+  // There used to be a "compatibility fallback" here that accepted the seek on
+  // ANY CRC-valid ID: it dated from the D7 solder fault (see the note on the
+  // ROM bring-up workarounds) and it made a head on the wrong cylinder pass
+  // Verify, with no SEEK ERROR for the host and no resync (issue #20). Now a
+  // valid ID from another cylinder fails the Verify, as on a WD, and -- as on
+  // the read path -- tells us where the head really is.
   bool any_valid_id = ok;
-  if (!ok && n > 0) {
-    // Compatibility fallback for ROM bring-up: some media/boot tracks can carry
-    // non-canonical C bytes while still being readable. If strict WD-style
-    // cylinder equality fails, accept the seek as verified when any valid IDAM
-    // is visible on-track. This keeps the ROM path moving while preserving
-    // strict read CRC/RNF checks in Type II data transfer.
-    SectorInfo ids[32];
-    int ns = mfm_scan_track(flux, n, fdc_bit_us(), ids, 32, g_secbuf,
-                            sizeof(g_secbuf));
-    for (int i = 0; i < ns; ++i) {
-      if (ids[i].id_crc_ok) {
-        any_valid_id = true;
-        ok = true;
-        break;
-      }
-    }
+  int seen_cyl = -1;
+  uint8_t id[6];
+  if (!ok && n > 0 && mfm_read_address(flux, n, fdc_bit_us(), id)) {
+    any_valid_id = true;
+    seen_cyl = id[0];
   }
 
   // Only a capture with NO valid ID at the latched clock justifies the
-  // other-density probe. The order matters: the boot ROM exercises the
-  // fallback above on marginal captures, under its own status-poll timeout,
-  // and the first version of HD support ran the (then much more expensive)
-  // probe BEFORE the fallback on every strict-verify miss -- which broke
-  // booting outright. A DD->HD disk swap still gets noticed here: the swapped
+  // other-density probe. A DD->HD disk swap gets noticed here: the swapped
   // disk yields no valid ID at the old clock, the probe proves the new one,
   // and the verify is repeated at the flipped density.
-  if (!any_valid_id && n > 0 && fdc_try_other_density(flux, n))
+  if (!any_valid_id && n > 0 && fdc_try_other_density(flux, n)) {
     ok = mfm_verify_track(flux, n, fdc_bit_us(), track);
+    if (!ok && mfm_read_address(flux, n, fdc_bit_us(), id))
+      seen_cyl = id[0];
+  }
+
+  if (!ok && seen_cyl >= 0)
+    fdc_resync_head((uint8_t)seen_cyl);
 
   return ok; // capture already stopped above, before the decode
 }
@@ -1770,6 +1790,19 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       }
       // Fold into the target. A second Type I arriving before core0 has run the
       // first must combine with it, never replace it -- see head_target.
+      //
+      // Unless the selected unit does not exist (port 0xDC can name units 2/3,
+      // e.g. C: under CP/M): a WD runs a Type I without checking READY, the
+      // pulses go nowhere, the Track register is updated and the command
+      // completes at once with NOT READY in the status. It must not be folded
+      // into drive 0's target (fdc_drive_idx() clamps to 0), and it must not
+      // leave a move pending that no drive will ever execute (issue #8).
+      if (!g_drive_lock && S.drive_sel >= (uint8_t)g_ndrives) {
+        S.op_verify = false;
+        S.busy = false;
+        fdc_refresh_int_line();
+        break;
+      }
       if (restore) {
         S.head_target[fdc_drive_idx()] = 0;
         S.restore_req++; // force a physical TRK00 seek even if we think we're there
@@ -1851,6 +1884,22 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.force_int_latched = true;
         fdc_refresh_int_line();
       }
+    } else if (!g_drive_lock && S.drive_sel >= (uint8_t)g_ndrives) {
+      // ---- Type II/III on a unit that does not exist ----
+      // A WD checks READY before a data command and does not start it: the
+      // command ends at once with NOT READY (compose_status reports it for
+      // units 2/3). Nothing is queued for core0. Issue #8.
+      S.type2 = true;
+      S.reading = false;
+      S.read_addr = false;
+      fdc_note_write_abandoned();
+      S.writing = false;
+      S.wr_armed = false;
+      if (S.trk_op == 1 || (S.trk_op == 2 && !S.trk_armed))
+        S.trk_op = 0;
+      S.drq = false;
+      S.busy = false;
+      fdc_refresh_int_line();
     } else if ((cmd & 0xC0) == 0x80) {
       // ---- Type II (sector data): 0x80..0xBF ----
       S.type2 = true;
@@ -1895,7 +1944,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.reading = false;
         S.read_addr = false;
         S.write_attempts++;
-        if (S.write_protect || !g_write_enable) {
+        if (fdc_host_unit_wp() || !g_write_enable) {
           // Refused before the disk is touched. WRITE PROTECT is a real WD
           // status bit for a write command and says "this did not happen"
           // unambiguously -- unlike clearing BUSY with no error bits, which
@@ -1982,9 +2031,9 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.drq = false;
         S.busy = true;
         S.trk_seq++;
-      } else if (S.write_protect || !g_write_enable || !g_format_enable) {
+      } else if (fdc_host_unit_wp() || !g_write_enable || !g_format_enable) {
         S.trk_refuse_why =
-            S.write_protect ? 1 : (!g_write_enable ? 2 : 3);
+            fdc_host_unit_wp() ? 1 : (!g_write_enable ? 2 : 3);
         S.trk_refused++;
         // WRITE TRACK refused before anything is destroyed -- by ~WPT, the
         // `wren` master switch, or the `fmten` escape hatch (default ON; see
@@ -2043,7 +2092,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       break;
     }
     if (S.writing && S.drq) {
-      S.xfer[S.xfer_pos] = S.data;
+      if (S.xfer_pos < FDC_SECTOR_MAX) // never past the buffer, whatever xfer_len says
+        S.xfer[S.xfer_pos] = S.data;
       S.xfer_pos++;
       S.last_data_read_us = time_us_32();
       if (S.xfer_pos >= S.xfer_len) {
@@ -2582,7 +2632,7 @@ void fdc_bench_seek(uint8_t target, uint16_t param, uint8_t mode, FdcDebug *o) {
   int t = DRV->track();
   S.track = (t < 0) ? 0 : (uint8_t)t;
   S.at_track0 = DRV->get_track0_sense();
-  S.write_protect = DRV->get_write_protect();
+  fdc_note_wp(DRV->get_write_protect());
   S.motor_on = true;
   S.busy = false;
   fdc_debug_snapshot(o);
@@ -2703,7 +2753,7 @@ bool fdc_bench_write_sector(uint8_t track, uint8_t sector, uint8_t side,
   DRV->goto_track(track);
 
   S.write_attempts++;
-  S.write_protect = DRV->get_write_protect();
+  fdc_note_wp(DRV->get_write_protect());
   if (S.write_protect) {
     S.wr_refused++;
     return false; // the disk says no; nothing else to report
@@ -2977,6 +3027,28 @@ static void fdc_apply_side(void) {
   g_flux_n = 0; // any captured flux belongs to the other head
 }
 
+// The host has selected a unit that does not exist while work is still queued
+// for core0 (queued before the switch). No drive will ever run it, so end it
+// the way a WD ends a command on a drive that is not ready: BUSY drops, and the
+// status shows NOT READY. Leaving it pending kept BUSY up forever.
+static void fdc_end_for_missing_unit(void) {
+  bool pending = S.op_done != S.op_seq || S.reading || S.writing || S.trk_op;
+  S.op_done = S.op_seq;
+  S.restore_done = S.restore_req;
+  if (!pending)
+    return;
+  S.reading = false;
+  S.read_addr = false;
+  S.writing = false;
+  S.wr_armed = false;
+  S.trk_op = 0;
+  S.trk_armed = false;
+  S.drq = false;
+  S.busy = false;
+  S.cmd_gen++; // anything still in flight for it must not publish
+  fdc_refresh_int_line();
+}
+
 void fdc_disk_task(void) {
   if (!S.active || g_ndrives == 0)
     return; // idle until the MZ-800 talks to us (don't fight USB/gw drive use)
@@ -3001,9 +3073,17 @@ void fdc_disk_task(void) {
   // operation-execution block below ALSO applies the select at its start --
   // the point where nothing is in flight for the new command yet, which is
   // exactly where a select is safe.
-  if (!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) {
-    if (!fdc_apply_drive_select())
+  // ...and also whenever no drive is resolved at all: a failed select leaves
+  // DRV null, and returning on that before reaching any block that re-selects
+  // used to wedge the controller for good once a host had named unit 2/3 with
+  // a command pending -- every later command BUSY forever, even after it
+  // re-selected drive 0 (issue #8).
+  if ((!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) ||
+      !DRV) {
+    if (!fdc_apply_drive_select()) {
+      fdc_end_for_missing_unit();
       return; // no such unit; STATUS already reports NOT READY
+    }
   }
   if (!DRV)
     return; // selected unit never resolved (only reachable before the first one)
@@ -3107,7 +3187,7 @@ void fdc_disk_task(void) {
     }
 
     S.at_track0 = DRV->get_track0_sense();
-    S.write_protect = DRV->get_write_protect();
+    fdc_note_wp(DRV->get_write_protect());
 
     // A prior Type II stream could still be marked active here if this seek
     // command arrived hot on the heels of a Force-Interrupt-aborted read,
@@ -3253,7 +3333,7 @@ void fdc_disk_task(void) {
     }
     g_flux_n = 0; // the captured window describes the track we are replacing
 
-    S.write_protect = DRV->get_write_protect();
+    fdc_note_wp(DRV->get_write_protect());
 
     // Refuse an image that cannot be a format. A real track image is thousands
     // of bytes and necessarily carries the write-channel commands for a sync
@@ -3301,10 +3381,23 @@ void fdc_disk_task(void) {
     }
     bool plausible = S.trk_len >= FDC_TRACK_IMAGE_MIN && census_sectors > 0;
 
+    // A track write starts at the index pulse, so it needs a turning disk.
+    // Spin up as the seek block does (a host may format with the motor bit
+    // off), and refuse on a drive that shows no index -- no disk, absent drive
+    // -- instead of waiting for a pulse that never comes (issue #7).
+    if (plausible && !S.write_protect && !g_applied_motor) {
+      g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+      g_applied_motor = true;
+      g_motor_off_at = 0;
+    }
+    bool ready = g_ready[fdc_cur_idx()];
+
     bool ok = false;
     uint32_t t0 = time_us_32();
     if (!plausible) {
       S.trk_implausible++;
+    } else if (!ready) {
+      // nothing written; reported below as a failed track write
     } else if (!S.write_protect) {
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
@@ -3483,7 +3576,7 @@ void fdc_disk_task(void) {
 
     // Re-read ~WPT now rather than trusting the value cached at the last seek:
     // this is the last moment before flux goes onto the media.
-    S.write_protect = DRV->get_write_protect();
+    fdc_note_wp(DRV->get_write_protect());
 
     // Write-protected between the command and here (or the tab was always
     // open and the earlier check ran on a stale sense). Report WRITE PROTECT

@@ -93,7 +93,6 @@ TEST(seek_with_verify_passes_on_good_media) {
 }
 
 TEST(seek_verify_detects_wrong_cylinder) {
-  XFAIL("#20: Type I Verify accepts any CRC-valid ID");
   // Cylinder 12 of this disk carries IDs that say cylinder 13: a WD179x
   // reports SEEK ERROR for a Verify there.
   g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
@@ -662,7 +661,6 @@ TEST(two_drives_keep_their_own_heads_and_media) {
 }
 
 TEST(unit2_selected_reports_not_ready_then_unit0_still_works) {
-  XFAIL("#8: a command on unit 2/3 wedges the controller");
   boot_with(Geometry::MZ_DD_DATA);
   run([] {
     wd::select(2);
@@ -882,5 +880,134 @@ TEST(int_line_follows_drq_with_eint) {
     CHECK(asserted);
     CHECK_EQ(n, 512u);
     CHECK(!pin_oe(12));
+  });
+}
+
+// ---------------- Review batch 2 ----------------
+
+// #21: an ID with size code 4..7 (2-16 KB) must not let a WRITE SECTOR stream
+// past the 1 KB transfer buffer into the rest of the controller state.
+TEST(oversized_size_code_cannot_overrun_the_transfer_buffer) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
+  TrackSpec t;
+  for (int r = 1; r <= 3; ++r) {
+    SectorSpec s;
+    s.c = 15; s.h = 0; s.r = (uint8_t)r; s.n = 4; // 2048-byte IDs
+    s.no_data = true;
+    t.sectors.push_back(s);
+  }
+  g_disk[0].t[15][0] = encode_track(t);
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(15);
+    wd::side(1);
+    wd::Xfer a = wd::read_address(); // caches N=4 for this cylinder
+    CHECK_EQ(a.data.size(), 6u);
+    out(0xD9, 15);
+    out(0xDA, 1);
+    out(0xD8, 0xA0);
+    size_t fed = 0;
+    for (uint64_t end = now() + ms(500); now() < end && fed < 4096;) {
+      if (wd::status() & wd::DRQ) {
+        out(0xDB, 0x55);
+        ++fed;
+      }
+    }
+    FdcDebug d = dbg();
+    CHECK(d.xfer_len <= 1024);
+    CHECK(d.xfer_pos <= 1024);
+    CHECK(fed <= 1024);
+    wd::force_interrupt();
+    wd::seek(3);
+    wd::Xfer r = wd::read_sector(3, 2, 512);
+    CHECK_EQ(error_bits(r.status), 0);
+    CHECK(matches_pattern(r.data, 3, 0, 2));
+  });
+}
+
+// #22: write refusal must use the selected unit's write protection, not the
+// last drive core0 happened to sense.
+TEST(write_to_writable_drive_right_after_switching_from_protected_one) {
+  boot_with(Geometry::MZ_DD_DATA, Geometry::MZ_DD_DATA, /*two=*/true);
+  g_disk[0].write_protect = true;
+  run([] {
+    wd::select(1);
+    wd::restore();     // unit 1 sensed: writable
+    wd::select(0);
+    wd::restore();     // unit 0 sensed: protected
+    wd::select(1);     // back to B, and straight into a write (no wait)
+    out(0xD8, 0x50);   // STEP IN...
+    wd::force_interrupt();
+    wd::side(1);
+    std::vector<uint8_t> v(512, 0x3C);
+    wd::Xfer w = wd::write_sector(1, 4, v);
+    CHECK(!(w.status & wd::WPROT));
+    CHECK_EQ(error_bits(w.status), 0);
+    CHECK(wd::read_sector(1, 4, 512).data == v);
+  });
+  CHECK(cable().drive[0].writes.empty());
+}
+
+// #20: a head that is physically on another cylinder (lost steps) must fail a
+// Verify with SEEK ERROR -- and, as on the read path, the cylinder the disk
+// reported must bring the head back to where the host asked.
+TEST(verify_after_lost_steps_reports_seek_error_and_repositions) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(10);
+    wait_ms(100);
+    cable().drive[0].cyl = 12; // two steps "lost" behind the firmware's back
+    wd::side(1);
+    uint8_t st = wd::seek(10, /*verify=*/true);
+    CHECK(st & wd::SEEKERR);
+    wait_ms(200);
+    CHECK_EQ(cable().drive[0].cyl, 10);
+    wd::Xfer x = wd::read_sector(10, 5, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 10, 0, 5));
+  });
+}
+
+// #8, second half: a Type I sent to unit 2 must not be folded into drive 0's
+// head target (fdc_drive_idx() clamps 2 -> 0), so drive 0 stays where it was.
+TEST(type1_on_missing_unit_does_not_move_drive0) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(20);
+    wait_ms(200);
+    int steps = cable().drive[0].steps;
+    wd::select(2);
+    CHECK(!(wd::restore() & wd::BUSY));
+    CHECK(wd::status() & wd::NOTREADY);
+    wd::select(0);
+    out(0xD9, 20);
+    wd::side(1);
+    wd::Xfer x = wd::read_sector(20, 1, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 20, 0, 1));
+    CHECK_EQ(cable().drive[0].steps, steps); // no recalibrate nobody asked for
+  });
+}
+
+// #7: WRITE TRACK on a drive with no disk (no index pulse) must end the
+// command with an error, not hang core0 waiting for an index forever.
+TEST(write_track_on_empty_drive_fails_instead_of_hanging) {
+  board_boot(); // drive present, no disk
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::Xfer f = wd::write_track(wd::format_image(0, 0, 9, 2, false), 5000);
+    CHECK(!f.timed_out);
+    CHECK(f.status & (wd::NOTREADY | wd::RNF));
+    // ...and the controller still answers afterwards.
+    CHECK(!(wd::restore() & wd::BUSY));
   });
 }

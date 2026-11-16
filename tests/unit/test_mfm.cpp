@@ -114,7 +114,6 @@ TEST(wrong_cylinder_id_is_reported_not_returned) {
 }
 
 TEST(id_without_data_field_is_not_paired_with_a_later_orphan_data_field) {
-  XFAIL("#4: an ID field is paired with the next data mark at any distance");
   // ID(1) with no data field, then a data field with no ID (0x22s): the
   // situation a missed sync leaves in a capture. A WD gives up on a data mark
   // that does not follow within ~43 bytes of the ID; the orphan must never be
@@ -131,7 +130,6 @@ TEST(id_without_data_field_is_not_paired_with_a_later_orphan_data_field) {
 }
 
 TEST(scan_does_not_swallow_the_sector_after_an_id_without_data) {
-  XFAIL("#4: mfm_scan_track consumes the next ID as a data mark");
   TrackSpec spec = uniform(1, 0, 3, 2, false);
   spec.sectors[0].no_data = true;
   Track t = encode_track(spec);

@@ -240,20 +240,23 @@ bool rp2040_flux_write_now(int wrgate_pin, const uint8_t *pulses, size_t n) {
 
 // Whole-track write (WRITE TRACK / gw write): optionally from the index
 // falling edge, ending at the next one or when the pulses run out. The index
-// waits have NO timeout, exactly as in arch_rp2.cpp -- a drive with no index
-// would hang real core0 here, so the simulation reports that as a hang.
+// waits are bounded at 600 ms, as in arch_rp2.cpp (issue #7); the guard below
+// reports a hang should that bound ever go missing again.
 bool rp2040_flux_write(int index_pin, int wrgate_pin, int, uint8_t *pulses,
                        uint8_t *pulse_end, bool, bool, bool use_index) {
   uint64_t start = now();
-  auto guard = [&] {
+  auto timed_out = [&] {
     if (now() - start > sim::ms(10000))
       core0_report_hang("rp2040_flux_write: index wait never ends (no ~INDEX)");
+    return now() - start > sim::us(600000);
   };
   if (use_index) {
     while (!gpio_get(index_pin))
-      guard();
+      if (timed_out())
+        return false;
     while (gpio_get(index_pin))
-      guard();
+      if (timed_out())
+        return false;
   }
   gpio_set_dir(wrgate_pin, GPIO_OUT);
   gpio_put(wrgate_pin, 0);
