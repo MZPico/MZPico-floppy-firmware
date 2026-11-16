@@ -224,7 +224,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   **"no floppy driver detected"**, which is indistinguishable from dead
   hardware and costs a session to diagnose. Bus RESET had to become an edge
   interrupt for exactly this reason. Anything that must watch a line either
-  interrupts, or lives in PIO.
+  interrupts, or lives in PIO. **A RAM function is not enough on its own:** a
+  `%` by a non-power-of-two compiles to a libgcc call in flash, and a `switch`
+  to a jump table in flash `.rodata` (both found in the register handlers,
+  #12; fdc.cpp now builds with `-fno-jump-tables`). CI runs
+  `tools/ci/check_core1_ram.py` on the built firmware: it fails if the listen
+  loop or the register handlers call into flash (veneers included) or load a
+  flash literal.
 - **Bisect before theorising.** When a known-good build exists and a new one
   fails, build the midpoint and flash it. Reasoning from indirect evidence lost
   most of a session here, through four wrong hypotheses, while two flashes

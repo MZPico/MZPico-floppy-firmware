@@ -55,6 +55,12 @@ target_include_directories(mzpico_floppy PRIVATE
 # -O3 for reliable PIO flux timing (per Adafruit_Floppy guidance).
 target_compile_options(mzpico_floppy PRIVATE -O3)
 
+# fdc.cpp holds core1's register handlers (fdc_reg_read/fdc_reg_write, RAM_FUNC).
+# A `switch` compiles to a jump table in flash .rodata, which a RAM function
+# still loads on every register access -- a flash fetch on core1's bus path.
+# If-chains instead (issue #12; see "core1's listen loop is sacred").
+set_source_files_properties(src/bus/fdc.cpp PROPERTIES COMPILE_OPTIONS "-fno-jump-tables")
+
 target_link_libraries(mzpico_floppy
     pico_stdlib
     pico_multicore

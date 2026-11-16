@@ -97,6 +97,15 @@ wait_iorq_low:
 settle_w:
     jmp x-- settle_w
     in pins, 8          side GATES_BLOCK   ; data byte pushed; all gates off
+    ; IORQ spike filter, as on the read SM (issue #6): the U2 gate edge just
+    ; above can couple a spike into IORQ that satisfies a single wait. The SM
+    ; would then wrap, find IORQ+WR still low and push a second (address,
+    ; data) pair for the same cycle -- a duplicated byte in a sector or a
+    ; doubled command. Outlast it (~90 ns) and re-verify.
+    wait 1 gpio 8
+    set x, 15
+spike_w:
+    jmp x-- spike_w
     wait 1 gpio 8                     ; cycle over; guard before U1 returns
     set y, 22
 guard_w:
