@@ -1100,3 +1100,28 @@ TEST(read_multiple_whole_track_takes_about_one_revolution) {
     CHECK(t_ms < 450);
   });
 }
+
+// A Type I issued while a READ is still capturing (no Force Interrupt first)
+// does not end the read on this controller. The read must still complete --
+// never wedge with BUSY up -- once it notices its flux is from before the
+// move.
+TEST(type1_during_a_read_does_not_wedge_it) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 3);
+    out(0xD8, 0x80); // READ sector 3 on cylinder 0...
+    wait_ms(40);
+    out(0xDB, 5);
+    out(0xD8, 0x10); // ...and a SEEK 5 on top of it, no Force Interrupt
+    uint8_t st = wd::wait_ready(3000);
+    CHECK(st != 0xFF); // BUSY dropped
+    // ...and the controller is usable afterwards.
+    wd::Xfer x = wd::read_sector(5, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 5, 0, 2));
+  });
+}

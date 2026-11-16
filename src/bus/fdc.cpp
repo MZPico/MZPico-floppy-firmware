@@ -1512,6 +1512,11 @@ struct FdcReadCapture {
 };
 static FdcReadCapture g_rc;
 bool g_rc_active = false; // a READ capture is running (g_stream_active too)
+// The command generation the flux in the buffer was captured for. A sector is
+// only ever decoded out of a buffer captured for the live command: a new READ
+// landing between the fresh-capture check and the decode must not be served
+// from the previous command's flux (another drive, side or cylinder).
+uint32_t g_flux_gen = 0;
 
 static void fdc_read_capture_end(bool complete) {
   if (g_stream_active) {
@@ -1542,6 +1547,10 @@ static bool fdc_read_capture_pump(void) {
     return false;
   }
   if (now - g_rc.t0 >= g_rc.window_us || g_flux_n >= cap) {
+    // Take what the DMA ring collected since the last pass before stopping,
+    // or a sector ending in that stretch would be cut short.
+    if (g_flux_n < cap)
+      g_flux_n = rp2040_flux_capture_drain(flux, cap, g_flux_n, false);
     fdc_read_capture_end(true);
     return false;
   }
@@ -1568,6 +1577,7 @@ static void fdc_read_capture_start(uint32_t window_us, uint32_t gen) {
   g_rc.t0 = time_us_32();
   g_rc.window_us = window_us;
   g_rc.gen = gen;
+  g_flux_gen = gen;
   g_rc.decoded = 0;
   // Until this drive's revolution has been measured, run the full window: an
   // early answer rarely leaves time for two index pulses, and the window size
@@ -4014,6 +4024,18 @@ void fdc_disk_task(void) {
     if (S.rd_done != S.rd_seq && !S.drq) {
       uint32_t seq = S.rd_seq; // snapshot
       uint32_t gen = S.cmd_gen;
+      // The buffer belongs to an older command generation: never decode it
+      // for this one. A new READ has rd_fresh set already; any other command
+      // that left this read live (a Type I does not end a read) gets a fresh
+      // capture for the live state -- after its move, since the capture waits
+      // for op_done -- instead of a decode of stale flux, or a wedge.
+      if (!S.read_addr && g_flux_gen != gen) {
+        if (g_rc_active)
+          fdc_read_capture_end(false);
+        g_flux_n = 0;
+        S.rd_fresh = true;
+        return;
+      }
       uint8_t want = S.rd_sector;
       size_t cap = 0;
       uint8_t *flux = mzp_flux_buffer(&cap);
