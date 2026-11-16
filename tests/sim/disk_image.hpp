@@ -41,7 +41,9 @@ Track encode_track(const TrackSpec &t, uint32_t jitter_ticks = 0,
 //   HD data disk: 80 x 2 x 18 x 512 at 500 kbit/s.
 // Sector payloads are deterministic functions of (c, h, r) so a test can
 // predict every byte: pattern_byte().
-enum class Geometry { MZ_DD_DATA, MZ_DD_MASTER, HD_DATA };
+//   CP/M HD disk: HD_DATA, but cyl 0 / head 1 is the 16 x 256 DD boot track
+//     (CP/M 4.1's FORMAT4 /1440 writes it DD so the DD-only boot ROM can read it).
+enum class Geometry { MZ_DD_DATA, MZ_DD_MASTER, HD_DATA, HD_CPM };
 uint8_t pattern_byte(int c, int h, int r, int i);
 Disk make_disk(Geometry g, int cylinders = 80, const std::string &name = "");
 // Fill a whole disk with one data byte (e.g. 0xFF: an empty CP/M directory as

@@ -114,16 +114,25 @@ void Machine::trap() {
       putch(0x0D);
     break;
   case 0x001B:
-    if (!keys_.empty()) {
-      cpu_.a = keys_.front();
-      keys_.pop_front();
-    } else {
-      cpu_.a = 0;
-      if (++idle_getky_ > 200000) {
-        error_ = "program waits for a key the script does not provide";
-        finished_ = true;
-        return;
+    // A person's keystroke: GETKY reports the key for as long as it is held
+    // (KEY_HOLD polls), then nothing for a while (KEY_GAP) before the next
+    // one. A program that takes one press per poll instead of waiting for
+    // the release reads one keystroke as several -- caught here as on the
+    // machine.
+    cpu_.a = 0;
+    if (key_phase_ < KEY_HOLD) {
+      if (!keys_.empty()) {
+        cpu_.a = keys_.front();
+        if (++key_phase_ == KEY_HOLD)
+          keys_.pop_front();
       }
+    } else if (++key_phase_ >= KEY_HOLD + KEY_GAP) {
+      key_phase_ = 0;
+    }
+    if (keys_.empty() && cpu_.a == 0 && ++idle_getky_ > 400000) {
+      error_ = "program waits for a key the script does not provide";
+      finished_ = true;
+      return;
     }
     cpu_.cyc += 300;
     break;

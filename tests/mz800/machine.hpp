@@ -54,6 +54,8 @@ private:
   bool finished_ = false;
   int column_ = 0;
   uint32_t idle_getky_ = 0;
+  static constexpr uint32_t KEY_HOLD = 40, KEY_GAP = 2000; // GETKY polls
+  uint32_t key_phase_ = KEY_HOLD; // start released: keys come after a prompt
 };
 
 } // namespace mz800

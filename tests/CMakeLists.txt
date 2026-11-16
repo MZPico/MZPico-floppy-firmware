@@ -71,6 +71,8 @@ if(MZF_FDTEST)
   mz800_test(fdtest_master_read_write ${MZF_FDTEST} --quiet --disk0 master --keys 03Y --expect "RESULT: PASS")
   mz800_test(fdtest_data_disk_drive1 ${MZF_FDTEST} --quiet --disk0 dd --disk1 dd --keys 11 --expect "RESULT: PASS")
   mz800_test(fdtest_dense_media ${MZF_FDTEST} --quiet --disk0 dense --keys 01 --expect "RESULT: PASS")
+  mz800_test(fdtest_hd_data_disk ${MZF_FDTEST} --quiet --disk0 hd --keys 03Y --expect "RESULT: PASS")
+  mz800_test(fdtest_hd_cpm_disk ${MZF_FDTEST} --quiet --disk0 hdcpm --keys 03Y --expect "RESULT: PASS")
   mz800_test(fdtest_slow_spindle ${MZF_FDTEST} --quiet --disk0 master --rev0 218700 --keys 03Y --expect "RESULT: PASS")
   # Negative runs: FDTEST must notice a controller-visible fault.
   mz800_test(fdtest_reports_write_protect ${MZF_FDTEST} --quiet --disk0 master --wp0 --keys 03Y --expect "RESULT: FAIL")

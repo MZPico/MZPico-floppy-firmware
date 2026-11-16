@@ -27,7 +27,7 @@
  */
 #include <stdint.h>
 
-#define VERSION "1.0"
+#define VERSION "1.1"
 
 /* ---- WD179x ---- */
 #define P_CMD 0xD8
@@ -264,8 +264,17 @@ static void puthex(uint8_t v) {
   putc(h[v >> 4]);
   putc(h[v & 15]);
 }
+/* GETKY reports a key for as long as it is HELD, so one press would answer
+ * the next prompt too. Wait for the keyboard to be released (debounced),
+ * then for a fresh press. */
+static void key_release(void) {
+  uint16_t quiet = 0;
+  while (quiet < 400)
+    quiet = mon_getky() ? 0 : quiet + 1;
+}
 static char getkey(void) {
   uint8_t k;
+  key_release();
   do
     k = mon_getky();
   while (!k);
@@ -376,6 +385,13 @@ static uint8_t read_addr(uint8_t *id) {
   return x_st;
 }
 
+/* ---- density: declared on port DEh as CP/M 4.1 does (00h DD, 81h HD) ---- */
+static uint8_t g_hd;
+static void declare_density(uint8_t hd) {
+  g_hd = hd;
+  wout(P_DENS, hd ? 0x81 : 0x00);
+}
+
 /* ---- geometry, discovered with READ ADDRESS ---- */
 /* [0] ROM side 0, [1] ROM side 1 (data cylinders); [2] the boot cylinder */
 static uint8_t g_nsec[3], g_n[3], g_first[3], g_maxcyl;
@@ -427,6 +443,28 @@ static void t_restore(void) {
     failst("NOT READY", st);
   else if (!(st & ST_TRK0))
     failst("NO TRK0", st);
+  end();
+}
+
+/* Which density are the data cylinders? Try DD, then HD, on cylinder 2. An
+ * HD disk formatted by CP/M carries a DD boot track on cylinder 0, so cylinder
+ * 0 cannot answer this. */
+static void t_density(void) {
+  uint8_t id[6], i, hd, found = 0;
+  begin("DENSITY ...............");
+  seek(2, 0);
+  side(1);
+  for (hd = 0; hd < 2 && !found; ++hd) {
+    declare_density(hd);
+    for (i = 0; i < 4 && !found; ++i)
+      if (!(read_addr(id) & ST_ERRS))
+        found = 1;
+  }
+  if (!found) {
+    declare_density(0);
+    fail("NO IDS AT DD OR HD");
+  }
+  puts(g_hd ? " HD" : " DD");
   end();
 }
 
@@ -529,12 +567,22 @@ static void t_read_boot_track(void) {
   begin("READ CYL 0 (BOOT) .....");
   seek(0, 0);
   side(0);
-  if (!discover(0, 2))
-    fail("NO IDS ON SIDE 0");
-  else {
-    st = read_sec(0, g_first[2], BUF, g_size[2], 0);
-    if (st & ST_ERRS)
-      failst("READ", st);
+  {
+    /* The boot track is DD even on a CP/M HD disk (the boot ROM only reads
+     * DD); a plain HD data disk has HD there. Try DD first, then HD. */
+    uint8_t hd = g_hd, d, ok = 0;
+    for (d = 0; d < 2 && !ok; ++d) {
+      declare_density(d);
+      ok = discover(0, 2) != 0;
+    }
+    if (!ok)
+      fail("NO IDS ON SIDE 0");
+    else {
+      st = read_sec(0, g_first[2], BUF, g_size[2], 0);
+      if (st & ST_ERRS)
+        failst("READ", st);
+    }
+    declare_density(hd);
   }
   end();
   puts("  ");
@@ -717,6 +765,7 @@ static void t_format(void) {
 static void read_tests(void) {
   t_detect();
   t_restore();
+  t_density();
   t_seek_verify();
   t_geometry();
   t_read_boot_track();

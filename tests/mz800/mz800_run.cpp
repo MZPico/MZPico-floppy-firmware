@@ -1,7 +1,7 @@
 // Run an MZ-800 program (MZF) against the firmware's FDC on a simulated drive.
 //
 //   mz800_run PROGRAM.MZF [options]
-//     --disk0 SPEC  --disk1 SPEC   media: dd | master | hd | dense | none |
+//     --disk0 SPEC  --disk1 SPEC   media: dd | master | hd | hdcpm | dense | none |
 //                                  edsk:PATH (an EXTENDED CPC DSK image)
 //     --wp0 / --wp1                write-protect the disk
 //     --rev0 US / --rev1 US        spindle period (default 200000)
@@ -29,6 +29,8 @@ static bool make_media(const std::string &spec, Disk *d) {
     *d = make_disk(Geometry::MZ_DD_MASTER);
   else if (spec == "hd")
     *d = make_disk(Geometry::HD_DATA);
+  else if (spec == "hdcpm")
+    *d = make_disk(Geometry::HD_CPM);
   else if (spec == "dense")
     *d = make_filled_disk(Geometry::MZ_DD_MASTER, 0xFF);
   else if (spec.rfind("edsk:", 0) == 0) {
