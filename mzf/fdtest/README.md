@@ -11,6 +11,9 @@ load `BUSTEST.MZF`. It starts at 1200h and returns to the monitor when done.
 
 ## Using it
 
+Each answer is typed and confirmed with **CR**, through the monitor's line input (GETL).
+
+
 1. Pick the drive (`0`–`3`).
 2. Pick the test:
    - `1` READ: read-only. Use any MZ-800 disk (CP/M, Disk BASIC, a game).

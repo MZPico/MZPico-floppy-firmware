@@ -8,7 +8,8 @@
 //   0012h PRNT  print the character in A (0Dh = newline)
 //   0015h MSG   print the 0Dh-terminated string at DE
 //   0006h LETNL newline        0009h NL  newline unless at column 0
-//   001Bh GETKY next scripted key in A, 0 if none
+//   0003h GETL  read a line: the next scripted key, as typed + CR
+//   001Bh GETKY the scripted key while 'held', else 0
 //   0000h / 00ADh  monitor (re)entry: the program has finished
 // A program that needs more of the monitor stops with an error naming the
 // call, rather than running off into empty memory.
@@ -54,7 +55,9 @@ private:
   bool finished_ = false;
   int column_ = 0;
   uint32_t idle_getky_ = 0;
-  static constexpr uint32_t KEY_HOLD = 40, KEY_GAP = 2000; // GETKY polls
+  // GETKY polls. A real GETKY call scans the keyboard and costs milliseconds
+  // (modelled as ~5 ms below), so a key is held ~0.2 s and released ~1 s.
+  static constexpr uint32_t KEY_HOLD = 40, KEY_GAP = 200;
   uint32_t key_phase_ = KEY_HOLD; // start released: keys come after a prompt
 };
 

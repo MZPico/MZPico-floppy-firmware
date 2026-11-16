@@ -21,13 +21,13 @@
  * and the ROM's side 0 is the drive's physical head 1.
  *
  * Output and input use only the MZ-700/800 monitor entry points PRNT (0012h)
- * and GETKY (001Bh); it returns to the monitor (00ADh) when done.
+ * and GETL (0003h); it returns to the monitor (00ADh) when done.
  *
  * Copyright (c) 2026 the MZPico floppy firmware authors. GPL-2.0-or-later.
  */
 #include <stdint.h>
 
-#define VERSION "1.1"
+#define VERSION "1.2"
 
 /* ---- WD179x ---- */
 #define P_CMD 0xD8
@@ -90,11 +90,11 @@ __asm
 __endasm;
 }
 
-uint8_t mon_getky(void) __naked {
+/* GETL: read a line (ended by CR) into the buffer at DE. */
+void mon_getl(char *buf) __z88dk_fastcall __naked {
 __asm
-    call 0x001b
-    ld l,a
-    ld h,0
+    ex de,hl
+    call 0x0003
     ret
 __endasm;
 }
@@ -264,23 +264,25 @@ static void puthex(uint8_t v) {
   putc(h[v >> 4]);
   putc(h[v & 15]);
 }
-/* GETKY reports a key for as long as it is HELD, so one press would answer
- * the next prompt too. Wait for the keyboard to be released (debounced),
- * then for a fresh press. */
-static void key_release(void) {
-  uint16_t quiet = 0;
-  while (quiet < 400)
-    quiet = mon_getky() ? 0 : quiet + 1;
-}
+/* Answers are typed as a line and confirmed with CR, through the monitor's
+ * GETL (0003h): no key debouncing to get wrong (1.0 took one held key as
+ * several answers; 1.1's release wait made it deaf on the machine), and the
+ * monitor echoes and edits the input itself. GETL hands back the whole screen
+ * line the cursor is on -- prompt included -- so the answer is the LAST
+ * non-blank character before the CR. */
+static char linebuf[100];
 static char getkey(void) {
-  uint8_t k;
-  key_release();
-  do
-    k = mon_getky();
-  while (!k);
+  int8_t i;
+  char k;
+  mon_getl(linebuf);
+  for (i = 0; i < 99 && linebuf[i] != 0x0D; ++i)
+    ;
+  while (i > 0 && linebuf[i - 1] == ' ')
+    --i;
+  k = i > 0 ? linebuf[i - 1] : 0;
   if (k >= 'a' && k <= 'z')
     k -= 32;
-  return (char)k;
+  return k;
 }
 
 static uint16_t n_pass, n_fail;
@@ -784,25 +786,21 @@ int main(void) {
   char k;
   cpu_di();
   puts("\nFDTEST " VERSION " - WD179X AT D8H\n");
-  puts("DRIVE (0-3)? ");
-  do
+  do {
+    puts("DRIVE (0-3) + CR? ");
     k = getkey();
-  while (k < '0' || k > '3');
+  } while (k < '0' || k > '3');
   drive = (uint8_t)(k - '0');
-  putc(k);
-  puts("\n1=READ  2=WRITE (SCRATCH!)  3=BOTH? ");
-  do
+  do {
+    puts("1=READ 2=WRITE(SCRATCH!) 3=BOTH? ");
     k = getkey();
-  while (k < '1' || k > '3');
-  putc(k);
-  putc('\n');
+  } while (k < '1' || k > '3');
   if (k != '1') {
-    puts("WRITES CYLINDERS NEAR THE HUB. Y=GO? ");
+    puts("WRITES NEAR THE HUB. Y=GO? ");
     if (getkey() != 'Y') {
       puts("CANCELLED\n");
       return 0;
     }
-    putc('\n');
   }
   wout(P_EINT, 0);
   read_tests();

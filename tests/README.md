@@ -61,7 +61,7 @@ against `tests/sim`:
   - write-protect and wrong-cylinder refusals
   - WRITE TRACK and READ TRACK
   - HD, two drives, `~INT`/EINT
-- `fdtest_*` (ctest only): `FDTEST.MZF` running on the emulated MZ-800 (keys are held and released as a person types them)
+- `fdtest_*` (ctest only): `FDTEST.MZF` running on the emulated MZ-800 (answers are typed lines through the monitor's GETL, as on the machine)
   against the firmware, on several media, plus two negative runs (a
   write-protected disk, an empty drive) that FDTEST must report as failures.
 - `fdtest_local_*`: the same against every `*.dsk` (EDSK) image in
