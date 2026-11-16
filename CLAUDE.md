@@ -345,6 +345,15 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     A/B on the real disk (`mzp_probe.py rdsoak T S side N legacy`, read-only,
     random phases through the live window): old window 7/200 failures, new
     200/200. A count-based window must never come back.
+    **Since #35 a READ is answered early:** the capture is decoded as it
+    arrives, and the sector is published as soon as it is whole with a good
+    CRC. That averages ~140 ms at a random rotational phase instead of the
+    whole ~225 ms window. The capture keeps running for the rest of its
+    window, so the next sector of a READ MULTIPLE is usually already in the
+    buffer. Stopping at the first sector made every following one wait a
+    revolution, which failed READ MULTIPLE at HD. The window is still the
+    limit for a sector that is not there. The first read on each drive after
+    power-up runs the full window, to measure the spindle.
   - **3.3 WRITE SECTOR: DONE (hardware-verified) -- CP/M 4.1 on the MZ-800
     writes files to a physical disk and reads them back correct.** Measured over
     two disks (13 and 3 host writes): every write completed, and `wrdiag`
