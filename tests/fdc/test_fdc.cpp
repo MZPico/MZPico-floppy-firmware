@@ -1338,3 +1338,32 @@ TEST(drvlock_folds_steps_into_the_driven_unit) {
     CHECK_EQ(cable().drive[0].cyl, 20);
   });
 }
+
+// #15 (review): the head goes back only when the MZ-800 is about to use it --
+// idle passes (which also run while a USB frame is arriving, e.g. between a
+// greaseweazle SEEK and its WRITEFLUX) leave it where the bench put it. And
+// a READ issued at once, with the bench having stopped the spindle, still
+// reads the host's cylinder.
+TEST(bench_head_is_restored_at_the_next_host_operation_not_when_idle) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(10);
+    wd::side(1);
+    wd::read_sector(10, 1, 512);
+    FloppyDrive *d = fdc_bench_drive();
+    REQUIRE(d != nullptr);
+    d->goto_track(30);
+    d->spin_motor(false); // as `scan` leaves it
+    fdc_bench_release();
+    fdc_bench_done();
+    wait_ms(300); // idle: the head must stay on the bench cylinder
+    CHECK_EQ(cable().drive[0].cyl, 30);
+    wd::Xfer x = wd::read_sector(10, 7, 512); // straight in, no seek
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 10, 0, 7));
+    CHECK_EQ(cable().drive[0].cyl, 10);
+    CHECK_EQ(dbg().sec_cyl_mismatch, 0u);
+  });
+}

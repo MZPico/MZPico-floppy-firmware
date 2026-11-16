@@ -317,6 +317,7 @@ void gw_task() {
   bool drive_cmd = false;
   switch (cmd) {
   case GW_CMD_SEEK: case GW_CMD_HEAD: case GW_CMD_MOTOR: case GW_CMD_SELECT:
+  case GW_CMD_DESELECT:
   case GW_CMD_READFLUX: case GW_CMD_WRITEFLUX: case GW_CMD_SETBUSTYPE:
   case MZP_CMD_SCAN: case MZP_CMD_STREAMSCAN: case MZP_CMD_FDCSEEK:
   case MZP_CMD_FDCREAD: case MZP_CMD_FDCWRITE: case MZP_CMD_FDCFORMAT:

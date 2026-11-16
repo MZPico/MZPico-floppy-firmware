@@ -3374,6 +3374,32 @@ static void fdc_end_for_missing_unit(void) {
   fdc_refresh_int_line();
 }
 
+// A bench command moved the head behind the host's back (#15): put it back on
+// the host's target. Called at the start of every operation block -- read,
+// write, format -- right where the head is about to be used, like the select
+// and the side. Not on idle passes: those also run while a USB frame is
+// being received, and a greaseweazle SEEK followed by WRITEFLUX must not have
+// its head moved in between. And not only once per pass: a spin-up earlier in
+// the pass can block long enough for the operation to arrive after a check
+// at the top. Spun up first (stepping a stopped disk can strand the head);
+// the caller has already applied the drive select (a deselected drive
+// ignores step pulses while the belief says they landed).
+static void fdc_bench_restore_head(void) {
+  if (!g_bench_head_dirty || !DRV || S.op_done != S.op_seq)
+    return;
+  int tgt = S.head_target[fdc_cur_idx()];
+  if (DRV->track() != tgt) {
+    if (!g_applied_motor) {
+      g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+      g_applied_motor = true;
+      g_motor_off_at = 0;
+    }
+    DRV->goto_track(tgt);
+  }
+  g_bench_head_dirty = false;
+  S.at_track0 = DRV->get_track0_sense();
+}
+
 void fdc_disk_task(void) {
   if (!S.active || g_ndrives == 0)
     return; // idle until the MZ-800 talks to us (don't fight USB/gw drive use)
@@ -3413,16 +3439,7 @@ void fdc_disk_task(void) {
   if (!DRV)
     return; // selected unit never resolved (only reachable before the first one)
 
-  // A bench command moved the head behind the host's back (#15): put it back
-  // on the host's target before anything else uses it.
-  if (g_bench_head_dirty && S.op_done == S.op_seq && !S.reading &&
-      !S.writing && S.trk_op == 0) {
-    g_bench_head_dirty = false;
-    int tgt = S.head_target[fdc_cur_idx()];
-    if (DRV->track() != tgt)
-      DRV->goto_track(tgt);
-    S.at_track0 = DRV->get_track0_sense();
-  }
+
 
   if (!g_timing_set) {
     // Faster step rate than the flux-capture default so a full-stroke RESTORE
@@ -3525,6 +3542,7 @@ void fdc_disk_task(void) {
       if (DRV->track() != tgt)
         DRV->goto_track(tgt);
     }
+    g_bench_head_dirty = false; // the move put it where the host wants it
 
     S.at_track0 = DRV->get_track0_sense();
     fdc_note_wp(DRV->get_write_protect());
@@ -3577,6 +3595,7 @@ void fdc_disk_task(void) {
     if (!fdc_apply_drive_select() || !DRV)
       return;
     fdc_apply_side();
+    fdc_bench_restore_head();
 
     if (S.trk_op == 1) { // READ TRACK
       if (S.trk_done != S.trk_seq) {
@@ -3916,6 +3935,7 @@ void fdc_disk_task(void) {
     if (!fdc_apply_drive_select() || !DRV)
       return;
     fdc_apply_side(); // a splice on the other surface destroys a sector there
+    fdc_bench_restore_head();
 
     uint32_t seq = S.wr_seq; // snapshot
     uint32_t gen = S.cmd_gen;
@@ -4160,6 +4180,7 @@ void fdc_disk_task(void) {
       if (!fdc_apply_drive_select() || !DRV)
         return;
       fdc_apply_side();
+      fdc_bench_restore_head();
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
       // sync -- a rev + sector-span window contains every sector whole
@@ -4287,32 +4308,12 @@ void fdc_disk_task(void) {
         // (Force Interrupt), and is skipped on a wrong-cylinder result:
         // another revolution cannot move the head -- the resync below is the
         // fix for that.
-        // READ MULTIPLE's look-ahead past the end of the track: a full window
-        // was decoded, it holds IDs, and none is the one wanted. That is the
-        // end of the track, not a sector worth hunting for over four
-        // revolutions (#23).
-        if (!sd.found && !sd.cyl_mismatch && g_flux_complete && g_flux_n > 0 &&
-            want != S.rd_first) {
-          fdc_note_track_ids(flux, g_flux_n);
-          bool present = false;
-          for (int k = 0; k < S.rd_ids_seen && k < FDC_IDS_N; ++k)
-            present |= S.rd_ids[k] == want;
-          lookahead_absent = S.rd_ids_seen > 0 && !present;
-          if (lookahead_absent) {
-            // Keep the WD's timing, drop only the wasted captures. A WD hunts
-            // for this sector until the fifth index pulse, so the host's Force
-            // Interrupt -- which it sends right after the last byte it wants
-            // -- always arrives first, and the ROM requires a clean STATUS
-            // after it. Answering RNF at once beat the Force Interrupt and
-            // left RNF in STATUS (FDTEST's READ MULTIPLE + FI failed). So wait
-            // out the search time, idle; a Force Interrupt ends it silently.
-            uint32_t w0 = time_us_32();
-            uint32_t span = (uint32_t)FDC_READ_SEARCH_WINDOWS * fdc_read_window_us(S.track);
-            while (S.reading && S.cmd_gen == gen && time_us_32() - w0 < span) {
-            }
-          }
-        }
-        for (int w = 1; w < FDC_READ_SEARCH_WINDOWS && !sd.found && !lookahead_absent &&
+        // (READ MULTIPLE's look-ahead past the end of the track searches like
+        // any read: the WD's timing is what lets the host's Force Interrupt,
+        // sent right after the last byte it wants, arrive before the RNF --
+        // the ROM requires a clean STATUS after it. Only the accounting
+        // differs, below (#23).)
+        for (int w = 1; w < FDC_READ_SEARCH_WINDOWS && !sd.found &&
                         !sd.cyl_mismatch && S.reading && S.cmd_gen == gen;
              ++w) {
           fdc_apply_side();
@@ -4324,6 +4325,19 @@ void fdc_disk_task(void) {
             sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                                  g_secbuf, sizeof(g_secbuf));
         }
+      }
+      // A look-ahead that was never found, on a track whose last complete
+      // capture holds IDs but not this one: the end of the track, expected --
+      // not counted, and not latched in firstfail (#23). Judged on the final
+      // capture of the whole search, not on a single decode, so a sector the
+      // decoder merely missed once is not mistaken for an absent one.
+      if (!S.read_addr && !sd.found && !sd.cyl_mismatch && want != S.rd_first &&
+          g_flux_complete && g_flux_n > 0) {
+        fdc_note_track_ids(flux, g_flux_n);
+        bool present = false;
+        for (int k = 0; k < S.rd_ids_seen && k < FDC_IDS_N; ++k)
+          present |= S.rd_ids[k] == want;
+        lookahead_absent = S.rd_ids_seen > 0 && !present;
       }
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;
