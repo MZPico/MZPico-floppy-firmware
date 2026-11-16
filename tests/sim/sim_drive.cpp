@@ -85,6 +85,7 @@ void FloppyCable::output(int pin, bool level, uint64_t now) {
     int c = d->cyl + (in ? 1 : -1);
     d->cyl = std::clamp(c, 0, MAX_CYL - 1);
     d->steps++;
+    d->last_step_at = now;
   }
 }
 
@@ -92,6 +93,12 @@ uint64_t FloppyCable::next_transition(uint64_t t) {
   Drive *d = selected();
   if (!d || !d->spinning(t + 1))
     return UINT64_MAX;
+  if (d->reading_noise(t)) {
+    // Ringing head or a spindle below speed: transitions at no MFM spacing
+    // in particular (deterministic in t, so a run is reproducible).
+    uint64_t h = (t + 1) * 0x9E3779B97F4A7C15ull;
+    return t + 30 + (h >> 56); // 30..285 ticks
+  }
   const Track &tr = d->disk->at(d->cyl, head());
   if (tr.pos.empty())
     return UINT64_MAX;
@@ -103,7 +110,16 @@ uint64_t FloppyCable::next_transition(uint64_t t) {
   else
     da = (uint64_t)REV_ANGLE - a + tr.pos.front();
   uint64_t dt = d->ticks_for_angle(da);
-  return t + (dt ? dt : 1);
+  uint64_t next = t + (dt ? dt : 1);
+  if (d->reading_marginal(next) && next > t + d->marginal_jitter_ticks + 1) {
+    // Shift this transition by a deterministic pseudo-random amount. Only
+    // forward-safe shifts (never before t), so the sequence stays ordered.
+    uint64_t h = (next + 7) * 0xD6E8FEB86659FD93ull;
+    int64_t j = (int64_t)(h >> 59) - 16; // -16..15
+    j = j * (int64_t)d->marginal_jitter_ticks / 16;
+    next = (uint64_t)((int64_t)next + j);
+  }
+  return next;
 }
 
 void FloppyCable::write_flux(uint64_t t0, const uint8_t *deltas, size_t n,

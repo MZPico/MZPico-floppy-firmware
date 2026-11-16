@@ -51,6 +51,28 @@ struct Drive {
   uint64_t motor_on_since = 0;
   bool motor = false;
   int steps = 0;              // STEP pulses obeyed (test assertions)
+  // Real drives are not ready the instant they are told (issue #32):
+  //  - after a STEP the head rings for a while: the read channel delivers
+  //    noise until it settles (3.5" drives specify ~15 ms);
+  //  - after the motor starts, ~INDEX pulses appear before the spindle is at
+  //    speed: data read before then is at the wrong bit rate, i.e. garbage.
+  // Noise + marginal = 15 ms, the settle time 3.5" drives specify.
+  uint64_t settle_noise_ticks = ms(8);
+  uint64_t speed_stable_ticks = ms(450); // from motor on (index from spinup_ticks)
+  uint64_t last_step_at = 0;
+  // ...and the ringing does not stop at once: for a while after the noise the
+  // signal is marginal -- real transitions, with timing jitter enough to flip
+  // the odd bit. An ID field (6 bytes) usually survives that; a 512-byte data
+  // field usually does not: the right ID with a bad data CRC.
+  uint64_t settle_marginal_ticks = ms(7);
+  uint32_t marginal_jitter_ticks = 16; // 1/3 DD cell, 2/3 HD cell
+  bool reading_noise(uint64_t now) const {
+    return (last_step_at && now < last_step_at + settle_noise_ticks) ||
+           now < motor_on_since + speed_stable_ticks;
+  }
+  bool reading_marginal(uint64_t now) const {
+    return last_step_at && now < last_step_at + settle_noise_ticks + settle_marginal_ticks;
+  }
   // Flux-free stretch at each end of a spliced write (write-current ramp at
   // WGATE on, tunnel erase after WGATE off). 20 us is longer than the 255-tick
   // (10.6 us) capture clamp, as observed on hardware.

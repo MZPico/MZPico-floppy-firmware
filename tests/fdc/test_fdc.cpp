@@ -1367,3 +1367,63 @@ TEST(bench_head_is_restored_at_the_next_host_operation_not_when_idle) {
     CHECK_EQ(dbg().sec_cyl_mismatch, 0u);
   });
 }
+
+// ---------------- #32: head settle and spin-up ----------------
+
+// A read issued right after a one-cylinder step: the simulated head rings for
+// 12 ms and is marginal for 10 ms more (Drive::settle_*), as real heads are.
+// Every read must still be clean -- a WD does not read until the head has
+// settled. (In this model the early answer usually masks the ringing -- a
+// later pass of the sector is taken -- so this passes without the settle
+// wait too; it guards the combination.)
+TEST(read_right_after_a_step_is_clean) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    srand(21);
+    int bad = 0, n = 0;
+    for (int i = 0; i < 72; ++i) {
+      uint8_t c = (uint8_t)(10 + (i & 1)); // one step every time
+      wd::seek(c);
+      wait_us((uint64_t)(rand() % 3000)); // the host's own small delay
+      uint8_t r = (uint8_t)(1 + (i * 5) % 9);
+      wd::Xfer x = wd::read_sector(c, r, 512);
+      ++n;
+      if (error_bits(x.status) || !matches_pattern(x.data, c, 0, r)) {
+        ++bad;
+        if (bad <= 3)
+          std::fprintf(stderr, "  i=%d c%u r%u st=%02x\n", i, c, r, x.status);
+      }
+    }
+    std::printf("  %d of %d reads after a step failed\n", bad, n);
+    CHECK_EQ(bad, 0);
+  }, ms(120000));
+}
+
+// The first read after a cold spin-up: ~INDEX is there before the spindle is
+// at speed (Drive::speed_stable_ticks), and data read then is garbage.
+TEST(first_read_after_a_cold_spin_up_is_clean) {
+  // Six cold starts in one power-up: the motor is switched off long enough
+  // (past the 3 s deferred motor-off) for the spindle to stop each time.
+  int bad = 0;
+  boot_with(Geometry::MZ_DD_DATA);
+  run([&bad] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    for (int k = 0; k < 6; ++k) {
+      wd::select(0, /*motor=*/false);
+      wait_ms(3600); // past the 3 s deferred motor-off: the spindle stops
+      wait_us((uint64_t)(k * 37000));
+      wd::select(0, /*motor=*/true);
+      wd::Xfer x = wd::read_sector(0, (uint8_t)(1 + k), 512, false, 3000);
+      if (error_bits(x.status) || !matches_pattern(x.data, 0, 0, 1 + k)) {
+        ++bad;
+        std::fprintf(stderr, "  spin-up %d: st=%02x n=%zu\n", k, x.status, x.data.size());
+      }
+    }
+    CHECK_EQ(bad, 0);
+  }, ms(120000));
+}

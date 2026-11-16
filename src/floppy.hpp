@@ -68,6 +68,14 @@ public:
     _is_index_seen = false;
   }
 
+  // Is the head ready to read? False until `settle_us` has passed since this
+  // drive's last STEP pulse, and until `spinup_us` has passed since the (shared)
+  // motor line was switched on -- a drive delivers index pulses before its
+  // spindle is at speed, and noise while its head still rings after a step.
+  // Each condition latches clear once met, so the us timer's wrap can't
+  // re-arm it (issue #32).
+  bool head_ready(uint32_t settle_us, uint32_t spinup_us);
+
   bool read_index();
   bool get_write_protect();
   bool get_track0_sense();
@@ -102,4 +110,8 @@ private:
   bool _is_motor_spinning = false;
   bool _is_index_seen = false;
   bool _track0_crosscheck = true;
+  bool _settle_pending = false;
+  uint32_t _last_step_us = 0;
+  static bool s_spinup_pending; // ~MOTOR_ON is one wire for every drive
+  static uint32_t s_motor_on_us;
 };

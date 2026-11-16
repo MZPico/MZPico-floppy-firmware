@@ -1479,10 +1479,32 @@ static constexpr uint32_t FDC_READADDR_DRQ_WINDOW_US = 2000;
 // WD hardware retries for up to ~5 revolutions if a slower drive or unlucky
 // rotational timing ever needs more headroom than that here.
 static void fdc_resync_head(uint8_t seen_cyl);
+// Don't read until the head can (issue #32). A drive delivers index pulses
+// before its spindle is at speed, and noise while its head still rings after
+// a step; flux captured then decodes as the right ID with a bad data CRC --
+// what `firstfail` latched on a CP/M boot. A WD waits too: the drive's settle
+// time, and a spun-up motor before it reads.
+//   settle: 20 ms after this drive's last STEP pulse (3.5" drives specify
+//     ~15 ms; goto_track() already sleeps settle_delay_ms, 5);
+//   spin-up: 500 ms after the motor line came on. spin_motor() already waits
+//     300 ms plus one index pulse (<= 500 ms), so this only lengthens the
+//     short cases and never the longest one.
+// READ ADDRESS skips the settle wait: its search accepts only CRC-valid IDs,
+// so it waits out the ringing by itself, and CP/M gives it only ~52 ms.
+static constexpr uint32_t FDC_HEAD_SETTLE_US = 20000;
+static constexpr uint32_t FDC_SPINUP_STABLE_US = 500000;
+static void fdc_wait_head_ready(bool settle) {
+  if (!DRV)
+    return;
+  while (!DRV->head_ready(settle ? FDC_HEAD_SETTLE_US : 0, FDC_SPINUP_STABLE_US)) {
+  }
+}
+
 static bool fdc_verify_track(uint8_t track) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
   S.verify_attempts++; // counted at entry, so an early return still shows up
+  fdc_wait_head_ready(true);
 
   // Start verify capture at an index edge when possible, to reduce rotational
   // alignment misses on media where the expected IDs are index-relative.
@@ -1580,6 +1602,7 @@ static constexpr uint32_t FDC_READADDR_TIMEOUT_US = 40000;
 static void fdc_capture_window(uint32_t window_us) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
+  fdc_wait_head_ready(true);
 
   g_flux_n = 0;
   uint32_t t0 = time_us_32();
@@ -1698,6 +1721,7 @@ static void fdc_read_capture_start(uint32_t window_us, uint32_t gen) {
     rp2040_flux_capture_stop();
     g_stream_active = false;
   }
+  fdc_wait_head_ready(true);
   g_rc_active = false;
   g_flux_n = 0;
   g_flux_complete = false;
@@ -1766,6 +1790,7 @@ static bool fdc_read_address_search(uint8_t *id_out) {
   size_t cap = 0;
   uint8_t *flux = mzp_flux_buffer(&cap);
   size_t limit = (cap < FDC_READADDR_MAX_BYTES) ? cap : FDC_READADDR_MAX_BYTES;
+  fdc_wait_head_ready(false); // spin-up only (see fdc_wait_head_ready)
 
   g_flux_n = 0;
   uint32_t t0 = time_us_32();
@@ -3845,6 +3870,7 @@ void fdc_disk_task(void) {
         // is what makes this a *track* write rather than a very long splice --
         // there is no timing window to hit, which is why formatting is the
         // safer of the two write paths despite being the more destructive.
+        fdc_wait_head_ready(true);
         ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
                               /*use_index=*/true);
       }
@@ -3997,6 +4023,7 @@ void fdc_disk_task(void) {
     }
 
     float bit = fdc_bit_us();
+    fdc_wait_head_ready(true); // the splice hunts IDs by reading
     SpliceResult sr =
         mfm_write_sector(want, (int)S.track, g_secbuf, n, S.wr_deleted,
                          bit, FDC_WRITE_SEARCH_TIMEOUT_US);
