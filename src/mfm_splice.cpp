@@ -211,7 +211,11 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
       r.cyl_mismatch = true;
       r.seen_cyl = idam[1];
       r.seen_head = idam[2];
-      continue;
+      // Stop here: the head is on the wrong cylinder, so no later ID on this
+      // track can match. Hunting on cost the full 500 ms search with
+      // interrupts off for every wrong-cylinder write (#25); the caller
+      // reports RNF and resyncs the head from seen_cyl.
+      break;
     }
 
     r.id_found = true;

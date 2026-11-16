@@ -47,6 +47,14 @@ uint8_t fdc_get_drive(void);
 // Release it with fdc_bench_release() so the FDC re-selects from scratch.
 FloppyDrive *fdc_bench_drive(void);
 void fdc_bench_release(void);
+// True while the MZ-800 has a command in flight: bench drive commands must
+// then be refused (#15).
+bool fdc_host_busy(void);
+// Call after every bench drive command: drops the disk task's shadows of the
+// side, motor, flux buffer and head (#15).
+void fdc_bench_done(void);
+// USB idle with no MZ-800 attached: stop the spindle, deselect.
+void fdc_bench_idle(void);
 
 // Per-drive state for ALL units at once, selected or not. fdcdump only ever
 // shows the drive that happens to be selected, which makes the property this
