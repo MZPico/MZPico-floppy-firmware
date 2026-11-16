@@ -119,8 +119,14 @@ void FloppyCable::write_flux(uint64_t t0, const uint8_t *deltas, size_t n,
     return;
   }
   Track &tr = d->disk->at(d->cyl, ev.head);
+  // A splice is not a clean cut on real media: the write current ramps up
+  // after WGATE asserts, so the first stretch records no transitions, and the
+  // tunnel-erase gap trails the write head, so a stretch after WGATE drops is
+  // erased too. Both leave a flux-free interval longer than any MFM symbol at
+  // each end of a rewritten data field -- which a reader must tolerate.
+  uint64_t junction = full_track ? 0 : d->splice_junction_ticks;
   // Erase [a0, a0+span) (with wrap), then lay down the new transitions.
-  uint64_t span = dur * REV_ANGLE / d->rev_ticks;
+  uint64_t span = (dur + junction) * REV_ANGLE / d->rev_ticks;
   auto erased = [&](uint32_t p) {
     uint64_t rel = (p + (uint64_t)REV_ANGLE - ev.a0) % REV_ANGLE;
     return span >= REV_ANGLE || rel < span;
@@ -135,6 +141,8 @@ void FloppyCable::write_flux(uint64_t t0, const uint8_t *deltas, size_t n,
     t += deltas[i];
     if (t > dur)
       break;
+    if (t < junction)
+      continue; // write current still ramping up
     out.push_back((uint32_t)((ev.a0 + t * REV_ANGLE / d->rev_ticks) % REV_ANGLE));
   }
   std::sort(out.begin(), out.end());

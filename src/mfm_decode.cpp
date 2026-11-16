@@ -32,17 +32,17 @@ static bool find_data_sync(mfm_io_t *io) {
   if (ok) {
     uint32_t ticks = 0;
     uint32_t limit = MFM_DAM_WINDOW_BYTES * 16u * io->T1_nom;
-    // A byte of 255 is a SATURATED interval: the capture clamps longer gaps
-    // (a dropout, a damaged stretch) to 255, so its true length is unknown and
-    // the sum would under-count. No legal MFM interval comes near it (4T is
-    // 192 ticks at DD), so treat one inside the window as "too far".
-    for (size_t i = start; i < io->pos && ticks <= limit; ++i) {
-      if (io->pulses[i] == 255) {
-        ticks = limit + 1;
-        break;
-      }
+    // A saturated byte (255: the capture clamps longer gaps) counts as 255,
+    // i.e. the sum can under-count a flux dropout. It must NOT be rejected:
+    // every spliced data field has one right here, because the write current
+    // ramps up after WGATE asserts and records nothing for ~10-20 us (seen on
+    // hardware: rejecting it turned FDTEST's write+read-back into RNF; the
+    // simulated drive now models the gap, see splice_junction_ticks). A
+    // dropout long enough to hide an orphan data field inside the window is
+    // the residual case; preserving true durations needs the capture to
+    // record them (a longer encoding), not a rule here.
+    for (size_t i = start; i < io->pos && ticks <= limit; ++i)
       ticks += io->pulses[i];
-    }
     ok = ticks <= limit;
   }
   if (!ok)

@@ -78,7 +78,9 @@ A test for an open bug is marked `XFAIL("#N: ...")`. It passes the suite
 while it fails, and it **fails the suite once it passes** (XPASS), so the fix
 that closes the issue also has to remove the marker. Open ones:
 
-None at the moment: #2, #4, #8 and #20 started as XFAIL tests and are fixed.
+One: `flux_dropout_between_id_and_orphan_data_does_not_pair_them` (a flux
+dropout under-counted by the 8-bit capture clamp; see the note in
+`find_data_sync`). #2, #4, #8 and #20 started as XFAIL tests and are fixed.
 Every fixed review bug keeps a test that fails on the old firmware:
 
 | Issue | Test |
@@ -100,7 +102,10 @@ Every fixed review bug keeps a test that fails on the old firmware:
 - Bus timing is not simulated: there is no PIO, EXWAIT or ~560 ns window.
   Rules about core1's listen loop still have to be checked on hardware
   (`mzp_probe.py health`, `BUSTEST.MZF`).
-- The drive is ideal unless a test makes it otherwise. It has no weak bits, no
+- Splices leave a 20 µs flux-free junction at each end (write-current ramp,
+  tunnel erase), as on hardware: a decoder rule that rejected such intervals
+  passed CI and failed FDTEST on the machine until this was modelled.
+- Otherwise the drive is ideal unless a test makes it otherwise. It has no weak bits, no
   head-settle noise, and a step always lands. Media effects come from the disk
   image: jitter, bad CRCs, missing fields, wrong IDs.
 - There is no Sharp ROM, so the boot ROM's own floppy code is not run. FDTEST
