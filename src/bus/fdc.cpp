@@ -351,6 +351,7 @@ struct FdcState {
   volatile uint32_t rd_flux_n = 0;      // flux bytes captured for the last read
   volatile uint32_t rd_capture_us = 0;  // wall time spent in the capture window
   volatile uint32_t rd_early = 0;       // reads answered before the window ended (#35)
+  volatile uint32_t cap_overruns = 0;   // captures whose DMA ring was lapped (#5)
   volatile uint32_t rd_search_us = 0;   // wall time spent decoding
   volatile uint8_t rd_ids_seen = 0;     // ID fields decoded in that flux
   volatile uint8_t rd_ids[FDC_IDS_N] = {0}; // sector numbers actually found
@@ -1255,11 +1256,86 @@ static constexpr uint32_t FDC_READ_CAPTURE_TIMEOUT_US = 300000;
 // Measured revolution period per drive, us; 0 = not measured yet. core0 only.
 static uint32_t g_rev_us[FDC_DRIVE_MAX];
 
+// A period is trusted only once it has been seen TWICE (issue #18): a single
+// glitch on ~INDEX ~160 ms after a real edge used to be adopted whole, making
+// the window shorter than a revolution until slow averaging corrected it. The
+// first measurement needs a second within 2 %; after that, a sample within
+// 5 % is averaged in, and a larger change (another drive, a disk swap) is
+// adopted only when it repeats.
+static uint32_t g_rev_pending[FDC_DRIVE_MAX]; // unconfirmed sample, 0 = none
+
+static bool fdc_rev_close(uint32_t a, uint32_t b, uint32_t pct) {
+  uint32_t d = a > b ? a - b : b - a;
+  return d * 100u <= b * pct;
+}
+
 static void fdc_note_rev_period(uint32_t period_us) {
   if (period_us < FDC_REV_US_MIN || period_us > FDC_REV_US_MAX)
     return; // a missed edge (2 revs) or a glitch -- not a period
-  uint32_t &r = g_rev_us[fdc_cur_idx()];
-  r = r ? (r * 3 + period_us) / 4 : period_us;
+  int i = fdc_cur_idx();
+  uint32_t &r = g_rev_us[i];
+  uint32_t &pend = g_rev_pending[i];
+  if (r && fdc_rev_close(period_us, r, 5)) {
+    r = (r * 3 + period_us) / 4;
+    pend = 0;
+    return;
+  }
+  // First measurement, or an outlier: needs a confirming second sample.
+  if (pend && fdc_rev_close(period_us, pend, 2)) {
+    r = (pend + period_us) / 2;
+    pend = 0;
+  } else {
+    pend = period_us;
+  }
+}
+
+// ~INDEX edge detector for the capture loops. An edge counts only once the
+// line has been low for INDEX_MIN_LOW_US -- a real index pulse lasts
+// milliseconds, a coupled glitch microseconds -- and its time is that of the
+// falling edge. Feeds fdc_note_rev_period with edge-to-edge periods.
+static constexpr uint32_t INDEX_MIN_LOW_US = 200;
+struct FdcIndexWatch {
+  bool low = false, counted = false, have_prev = false;
+  uint32_t low_since = 0, e_prev = 0;
+  void start(uint32_t index_t0) {
+    low = !gpio_get(PIN_INDEX);
+    counted = low; // already inside a pulse: not a fresh edge
+    low_since = time_us_32();
+    have_prev = index_t0 != 0;
+    e_prev = index_t0;
+  }
+  void sample(uint32_t now) {
+    bool l = !gpio_get(PIN_INDEX);
+    if (l && !low) {
+      low_since = now;
+      counted = false;
+    }
+    low = l;
+    if (low && !counted && now - low_since >= INDEX_MIN_LOW_US) {
+      counted = true;
+      if (have_prev)
+        fdc_note_rev_period(low_since - e_prev);
+      e_prev = low_since;
+      have_prev = true;
+    }
+  }
+};
+
+// ONE watcher, sampled from everywhere core0 polls anyway: every capture loop
+// iteration and every disk-task pass while the spindle turns. Since reads are
+// answered early (#35) neither a capture nor an idle gap usually spans a
+// revolution, so separate watchers would rarely measure; one continuous one
+// does. A missed edge (core0 blocked longer than a pulse) makes the next
+// period two revolutions -- outside the plausibility band, ignored. Restarted
+// on a drive switch: the other spindle's edges are not this one's.
+static FdcIndexWatch g_iw;
+static int g_iw_drive = -2;
+static void fdc_index_sample(void) {
+  if (g_iw_drive != g_cur_drive) {
+    g_iw.start(0);
+    g_iw_drive = g_cur_drive;
+  }
+  g_iw.sample(time_us_32());
 }
 
 // One sector span plus slack, at the current density: the presync the decoder
@@ -1270,7 +1346,11 @@ static uint32_t fdc_sector_span_us(uint8_t trk) {
   uint32_t sz = fdc_sector_size_for(trk);
   if (sz < 512)
     sz = 512;
-  return (uint32_t)((float)(sz + 128) * 16.0f * fdc_bit_us());
+  // Without a host density declaration the latch can be wrong -- a density
+  // flip re-decodes this same window at the other clock -- so size the margin
+  // for DD, which covers HD too (issue #19).
+  float bit = S.density_host_valid ? fdc_bit_us() : FDC_DD_BIT_US;
+  return (uint32_t)((float)(sz + 128) * 16.0f * bit);
 }
 
 static uint32_t fdc_read_window_us(uint8_t trk) {
@@ -1287,23 +1367,16 @@ static size_t fdc_drain_window(uint8_t *flux, size_t cap, uint32_t window_us,
                                uint32_t index_t0) {
   size_t n = 0;
   uint32_t t0 = time_us_32();
-  uint32_t e_prev = index_t0;
-  bool have_prev = index_t0 != 0;
-  bool last_idx = gpio_get(PIN_INDEX);
+  (void)index_t0; // the continuous watcher (fdc_index_sample) covers it
   while (n < cap) {
     uint32_t now = time_us_32();
     if (now - t0 >= window_us)
       break;
-    bool idx = gpio_get(PIN_INDEX);
-    if (!idx && last_idx) { // falling edge (active low)
-      if (have_prev)
-        fdc_note_rev_period(now - e_prev);
-      e_prev = now;
-      have_prev = true;
-    }
-    last_idx = idx;
+    fdc_index_sample();
     n = rp2040_flux_capture_drain(flux, cap, n, /*store_greaseweazle=*/false);
   }
+  if (rp2040_flux_capture_overrun())
+    S.cap_overruns++; // counted; Verify/READ TRACK treat the result as-is
   return n;
 }
 
@@ -1503,12 +1576,13 @@ static void fdc_capture_window(uint32_t window_us) {
 // sector used to cost a full window after the host had already said stop
 // (#23).
 static constexpr size_t FDC_EARLY_DECODE_BYTES = 1500; // ~8 ms of DD flux
+// Windows a READ SECTOR searches before RNF: 4 x (rev + sector) is ~4.4
+// revolutions, the WD's "until the fifth index pulse" (#35).
+static constexpr int FDC_READ_SEARCH_WINDOWS = 4;
 struct FdcReadCapture {
   uint32_t t0, window_us, gen;
   size_t decoded;
   bool early_ok;
-  bool last_idx, have_prev;
-  uint32_t e_prev;
 };
 static FdcReadCapture g_rc;
 bool g_rc_active = false; // a READ capture is running (g_stream_active too)
@@ -1531,6 +1605,7 @@ static void fdc_read_capture_end(bool complete) {
 
 // Drain once. Returns false when the capture has ended (window over, buffer
 // full, or the command it serves is gone).
+static void fdc_read_capture_start(uint32_t window_us, uint32_t gen);
 static bool fdc_read_capture_pump(void) {
   if (!g_rc_active)
     return false;
@@ -1554,15 +1629,18 @@ static bool fdc_read_capture_pump(void) {
     fdc_read_capture_end(true);
     return false;
   }
-  bool idx = gpio_get(PIN_INDEX);
-  if (!idx && g_rc.last_idx) { // falling edge: measure the spindle as we go
-    if (g_rc.have_prev)
-      fdc_note_rev_period(now - g_rc.e_prev);
-    g_rc.e_prev = now;
-    g_rc.have_prev = true;
-  }
-  g_rc.last_idx = idx;
+  fdc_index_sample(); // measure the spindle as we go
   g_flux_n = rp2040_flux_capture_drain(flux, cap, g_flux_n, false);
+  if (rp2040_flux_capture_overrun()) {
+    // The DMA ring was lapped: the consumer jumped ahead and the buffer now
+    // has a silent hole -- a place where an ID can pair with a later
+    // sector's data (issue #5). Throw the capture away and start over; it
+    // does not count as a search attempt.
+    S.cap_overruns++;
+    uint32_t w = g_rc.window_us, gen = g_rc.gen;
+    fdc_read_capture_start(w, gen);
+    return g_rc_active;
+  }
   return true;
 }
 
@@ -1579,13 +1657,10 @@ static void fdc_read_capture_start(uint32_t window_us, uint32_t gen) {
   g_rc.gen = gen;
   g_flux_gen = gen;
   g_rc.decoded = 0;
-  // Until this drive's revolution has been measured, run the full window: an
-  // early answer rarely leaves time for two index pulses, and the window size
-  // (fdc_read_window_us) depends on that measurement. One full read per drive
-  // per power-up, then every read can be answered early.
-  g_rc.early_ok = g_rev_us[fdc_cur_idx()] != 0;
-  g_rc.last_idx = gpio_get(PIN_INDEX);
-  g_rc.have_prev = false;
+  // Early answers do not wait for the spindle to be measured: the default
+  // window (FDC_REV_US_DEFAULT + a sector) already covers the slowest drive
+  // seen, and any capture that sees two index pulses still measures it.
+  g_rc.early_ok = true;
   g_stream_active = rp2040_flux_capture_start(PIN_INDEX, PIN_RDATA);
   S.rd_capture_ok = g_stream_active;
   g_rc_active = g_stream_active;
@@ -3299,6 +3374,10 @@ void fdc_disk_task(void) {
     }
   }
   fdc_apply_side();
+  // Measure the spindle between operations too (see fdc_index_sample). core0
+  // only -- nothing here touches the bus loop.
+  if (g_applied_motor)
+    fdc_index_sample();
   // Drive DENSEL from the effective density. Best-effort: the target 3.5"
   // drives sense HD from the media hole and most ignore pin 2 entirely, and
   // this board's ~DEN_RDY net is shared/direction-ambiguous between J2 and J3
@@ -4097,20 +4176,19 @@ void fdc_disk_task(void) {
             sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
                                  g_secbuf, sizeof(g_secbuf));
         }
-        // Still not found: grant ONE more revolution before reporting RNF. A
-        // real WD1793 is more patient than a single window -- it keeps
-        // matching ID fields until the FOURTH index pulse. Our single
-        // capture -- then a fixed transition count, see fdc_read_window_us --
-        // missed its sector ~0.5% of the time at HD (measured: 2 RNFs in ~630
-        // format-verify reads, the wanted sector sitting in the window's wrap
-        // region both times), and FORMAT4
-        // aborts the whole format after two closely-spaced misses. A fresh
-        // capture starts at a different rotational phase, so a double miss
-        // is ~0.003%. Costs nothing on the success path; skipped when the
-        // host has already Force-Interrupted (the answer would be dropped)
-        // and on a wrong-cylinder result (another revolution cannot move
-        // the head -- the resync below is the fix for that).
-        if (!sd.found && !sd.cyl_mismatch && S.reading && S.cmd_gen == gen) {
+        // Still not found: keep searching, as a WD does -- it matches ID
+        // fields until the fifth index pulse (4-5 revolutions) before RNF. A
+        // single window used to give one more try at most, and missed a
+        // present sector ~0.5 % of the time at HD; FORMAT4 aborts a format
+        // after two closely spaced misses. Each further window starts at a
+        // new rotational phase. Costs nothing on the success path (a sector
+        // that is there is answered early), ends at once if the host gives up
+        // (Force Interrupt), and is skipped on a wrong-cylinder result:
+        // another revolution cannot move the head -- the resync below is the
+        // fix for that.
+        for (int w = 1; w < FDC_READ_SEARCH_WINDOWS && !sd.found &&
+                        !sd.cyl_mismatch && S.reading && S.cmd_gen == gen;
+             ++w) {
           fdc_apply_side();
           fdc_read_capture_start(fdc_read_window_us(S.track), gen);
           fdc_read_capture_until(want);

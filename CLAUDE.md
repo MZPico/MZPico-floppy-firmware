@@ -352,8 +352,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     window, so the next sector of a READ MULTIPLE is usually already in the
     buffer. Stopping at the first sector made every following one wait a
     revolution, which failed READ MULTIPLE at HD. The window is still the
-    limit for a sector that is not there. The first read on each drive after
-    power-up runs the full window, to measure the spindle.
+    limit for a sector that is not there, and a missing sector is searched for
+    over 4 windows (the WD's "until the fifth index pulse") before RNF. The
+    spindle is measured continuously from ~INDEX: every capture loop and every
+    idle disk-task pass sample one watcher. An edge must be low for 200 us,
+    and a period needs a second agreeing sample (#18). A lapped DMA ring
+    discards the capture and starts again (#5). A data CRC error is reported
+    as on a WD, never retried internally: weak-bit protection depends on it.
   - **3.3 WRITE SECTOR: DONE (hardware-verified) -- CP/M 4.1 on the MZ-800
     writes files to a physical disk and reads them back correct.** Measured over
     two disks (13 and 3 host writes): every write completed, and `wrdiag`

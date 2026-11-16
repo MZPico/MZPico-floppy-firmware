@@ -63,9 +63,11 @@ void rp2040_flux_capture_stop(void);
 // kHz DD transition rate.
 int rp2040_flux_capture_next(uint32_t timeout_us);
 
-// True if, since the capture started, the consumer fell more than 3/4 of the
-// DMA ring behind the disk -- i.e. flux was lost. With the 16 KB ring that is
-// tens of milliseconds of neglect, not the FIFO's 12-24 us.
+// True if, since the capture started, the DMA lapped the consumer -- a whole
+// ring behind, i.e. flux was lost and the consumer was resynced half a ring
+// back from the write position (a hole in the stream). With the 16 KB ring
+// that is tens of milliseconds of neglect, not the FIFO's 12-24 us. The FDC's
+// read capture checks it after every drain and starts over (issue #5).
 bool rp2040_flux_capture_overrun(void);
 
 
