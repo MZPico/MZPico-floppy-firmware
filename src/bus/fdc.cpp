@@ -606,6 +606,8 @@ ALWAYS_INLINE int fdc_cur_idx(void) {
   return (g_cur_drive >= 0 && g_cur_drive < FDC_DRIVE_MAX) ? g_cur_drive : 0;
 }
 
+extern bool g_drive_lock; // defined with its documentation further down
+
 // core0: record ~WPT for the drive it is driving (see wp_unit).
 ALWAYS_INLINE void fdc_note_wp(bool wp) {
   S.write_protect = wp;
@@ -613,7 +615,8 @@ ALWAYS_INLINE void fdc_note_wp(bool wp) {
 }
 // core1: write protection of the unit the HOST has selected, as last sensed.
 ALWAYS_INLINE bool fdc_host_unit_wp(void) {
-  uint8_t d = S.drive_sel;
+  // The unit that will actually be driven: `drvlock` pins everything to 0.
+  uint8_t d = g_drive_lock ? 0 : S.drive_sel;
   return d < 2 ? S.wp_unit[d] : S.write_protect;
 }
 
@@ -3032,8 +3035,12 @@ static void fdc_apply_side(void) {
 // the way a WD ends a command on a drive that is not ready: BUSY drops, and the
 // status shows NOT READY. Leaving it pending kept BUSY up forever.
 static void fdc_end_for_missing_unit(void) {
-  bool pending = S.op_done != S.op_seq || S.reading || S.writing || S.trk_op;
-  S.op_done = S.op_seq;
+  // One read of op_seq: a SEEK core1 publishes after this point (for a unit
+  // that does exist, once re-selected) must stay pending for the next pass,
+  // not be acknowledged here without ever running.
+  uint32_t seq = S.op_seq;
+  bool pending = S.op_done != seq || S.reading || S.writing || S.trk_op;
+  S.op_done = seq;
   S.restore_done = S.restore_req;
   if (!pending)
     return;
@@ -3385,12 +3392,21 @@ void fdc_disk_task(void) {
     // Spin up as the seek block does (a host may format with the motor bit
     // off), and refuse on a drive that shows no index -- no disk, absent drive
     // -- instead of waiting for a pulse that never comes (issue #7).
-    if (plausible && !S.write_protect && !g_applied_motor) {
+    // Re-checked when the last check found no index, too: a disk inserted
+    // after an empty-drive failure must be usable without a motor cycle.
+    if (plausible && !S.write_protect &&
+        (!g_applied_motor || !g_ready[fdc_cur_idx()])) {
       g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
       g_applied_motor = true;
       g_motor_off_at = 0;
     }
     bool ready = g_ready[fdc_cur_idx()];
+    // The spin-up blocks for up to ~1.3 s. If the host issued another command
+    // meanwhile -- in particular another WRITE TRACK, refilling track_buf --
+    // the image validated above is not the one in the buffer any more. Drop
+    // this one; a new WRITE TRACK is collected and validated on its own.
+    if (S.cmd_gen != gen)
+      return;
 
     bool ok = false;
     uint32_t t0 = time_us_32();
@@ -3442,6 +3458,10 @@ void fdc_disk_task(void) {
         // happened to stop. The index pulse cuts the write off at the right
         // place; our job is only to have flux ready to write until it comes.
         n_flux = mfm_encode_gap_fill(flux, n_flux, limit, fdc_bit_us());
+        // The encode read track_buf, which core1 owns again as soon as a new
+        // command arrives: write only if this is still the live command.
+        if (S.cmd_gen != gen)
+          n_flux = 0;
         // use_index: start at the index pulse and stop at the next one. That
         // is what makes this a *track* write rather than a very long splice --
         // there is no timing window to hit, which is why formatting is the

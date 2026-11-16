@@ -1011,3 +1011,22 @@ TEST(write_track_on_empty_drive_fails_instead_of_hanging) {
     CHECK(!(wd::restore() & wd::BUSY));
   });
 }
+
+// #7 follow-up: an empty-drive WRITE TRACK failure must not stick. With the
+// motor still on, insert a disk: the next WRITE TRACK formats it.
+TEST(write_track_works_after_disk_inserted_into_empty_drive) {
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::Xfer f1 = wd::write_track(wd::format_image(0, 0, 9, 2, false), 5000);
+    CHECK(f1.status & (wd::NOTREADY | wd::RNF));
+    g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
+    g_disk[0].t[0][0] = Track{};
+    insert(0, &g_disk[0]);
+    wd::Xfer f2 = wd::write_track(wd::format_image(0, 0, 9, 2, false), 5000);
+    CHECK_EQ(error_bits(f2.status), 0);
+  });
+  CHECK_EQ(count_valid_sectors(g_disk[0].at(0, 0), false), 9);
+}

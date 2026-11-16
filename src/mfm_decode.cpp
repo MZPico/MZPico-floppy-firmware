@@ -32,8 +32,17 @@ static bool find_data_sync(mfm_io_t *io) {
   if (ok) {
     uint32_t ticks = 0;
     uint32_t limit = MFM_DAM_WINDOW_BYTES * 16u * io->T1_nom;
-    for (size_t i = start; i < io->pos && ticks <= limit; ++i)
+    // A byte of 255 is a SATURATED interval: the capture clamps longer gaps
+    // (a dropout, a damaged stretch) to 255, so its true length is unknown and
+    // the sum would under-count. No legal MFM interval comes near it (4T is
+    // 192 ticks at DD), so treat one inside the window as "too far".
+    for (size_t i = start; i < io->pos && ticks <= limit; ++i) {
+      if (io->pulses[i] == 255) {
+        ticks = limit + 1;
+        break;
+      }
       ticks += io->pulses[i];
+    }
     ok = ticks <= limit;
   }
   if (!ok)

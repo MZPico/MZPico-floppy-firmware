@@ -447,11 +447,16 @@ static bool init_write(int wrdata_pin, bool is_apple2) {
   }
   const pio_program_t *program =
       is_apple2 ? &fluxwrite_apple2_struct : &fluxwrite_struct;
-  g_writer.program = program;
-
   if (!allocate_pio_set_program(&g_writer, program)) {
     return false;
   }
+  // AFTER the allocation: allocate_pio_set_program() memsets the whole struct,
+  // so assigning before it left `program` null and free_write() handed
+  // pio_remove_program() a null program on every write -- on the RP2040 that
+  // reads a garbage length out of the boot ROM at address 0 and clears that
+  // many bits of the PIO's instruction-space bookkeeping, which can let a
+  // later program load over another one (e.g. the bus SMs').
+  g_writer.program = program;
 
   uint32_t wrdata_bit = 1u << wrdata_pin;
   pio_gpio_init(g_writer.pio, wrdata_pin);
