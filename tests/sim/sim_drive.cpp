@@ -111,6 +111,25 @@ uint64_t FloppyCable::next_transition(uint64_t t) {
     da = (uint64_t)REV_ANGLE - a + tr.pos.front();
   uint64_t dt = d->ticks_for_angle(da);
   uint64_t next = t + (dt ? dt : 1);
+  if (!tr.weak.empty()) {
+    uint32_t an = (it != tr.pos.end()) ? *it : tr.pos.front();
+    for (const auto &w : tr.weak) {
+      if (an < w.first || an >= w.second)
+        continue;
+      uint64_t rev = d->rev_at(next);
+      bool bad = (rev % 2) == 0;
+      if (d->weak_passes.empty() || d->weak_passes.back().rev != rev)
+        d->weak_passes.push_back({rev, bad, next});
+      if (bad && next > t + 41) {
+        // Weak flux: the transition wanders by up to ~a DD cell, enough to
+        // flip bits (deterministic in time, so a run is reproducible).
+        uint64_t h = (next + 3) * 0x9E3779B97F4A7C15ull;
+        int64_t j = (int64_t)(h >> 58) - 32; // -32..31 ticks
+        next = (uint64_t)((int64_t)next + j);
+      }
+      break;
+    }
+  }
   if (d->reading_marginal(next) && next > t + d->marginal_jitter_ticks + 1) {
     // Shift this transition by a deterministic pseudo-random amount. Only
     // forward-safe shifts (never before t), so the sequence stays ordered.

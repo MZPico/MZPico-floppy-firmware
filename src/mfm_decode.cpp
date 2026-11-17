@@ -178,7 +178,18 @@ SectorRead mfm_read_sector(const uint8_t *flux, size_t n_flux,
         r.deleted = (dmark == MFM_IO_DDAM);
         r.data_crc_ok = (dcrc == 0);
       }
+      // The field ran into the end of the flux: decoded past it as zeros, so
+      // its CRC says nothing about the disk.
+      r.truncated = mfm_io_eof(&io);
+    } else {
+      // No data sync -- but the flux may simply end before the DAM window
+      // does, in which case the field has not been captured yet.
+      uint32_t ticks = 0, limit = MFM_DAM_WINDOW_BYTES * 16u * io.T1_nom;
+      for (size_t i = io.pos; i < n_flux && ticks <= limit; ++i)
+        ticks += flux[i];
+      r.truncated = ticks <= limit;
     }
+    r.end_pos = io.pos;
     return r;
   }
   return r; // .found == false -> Record Not Found

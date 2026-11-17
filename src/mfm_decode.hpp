@@ -45,6 +45,13 @@ struct SectorRead {
   // different responses: this one is a positioning failure, not missing media.
   bool cyl_mismatch;
   uint8_t seen_cyl, seen_head; // the ID bytes that were there instead
+  // Flux index just past the matched sector's data field (or its ID, when it
+  // has none): where a WD looks for the next record of a READ MULTIPLE.
+  size_t end_pos;
+  // The matched sector's data field (or the window it must start in) runs
+  // past the end of the flux: not captured yet, rather than a CRC error or a
+  // missing data field.
+  bool truncated;
 };
 
 // Locate the sector whose IDAM sector-id == `want_sec` (with a valid ID CRC) in

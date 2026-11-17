@@ -214,3 +214,36 @@ TEST(flux_dropout_between_id_and_orphan_data_does_not_pair_them) {
   SectorRead r = mfm_read_sector(g.data(), g.size(), 2.0f, 1, 1, out.data(), 512);
   CHECK(!(r.found && r.has_data && r.data_crc_ok));
 }
+
+// #51: a READ is answered on the first complete copy of its sector, good CRC
+// or bad, so the decoder must tell "the flux ends inside this field" from "the
+// field is there and its CRC is bad".
+TEST(read_sector_reports_a_field_cut_off_by_the_end_of_the_flux) {
+  TrackSpec spec = uniform(3, 0, 9, 2, false);
+  spec.sectors[5].bad_data_crc = true;
+  spec.sectors[7].no_data = true;
+  Track t = encode_track(spec);
+  std::vector<uint8_t> f = deltas(t, 1);
+  std::vector<uint8_t> out(512);
+
+  SectorRead whole = mfm_read_sector(f.data(), f.size(), 2.0f, 3, 3, out.data(), 512);
+  CHECK(whole.found && whole.has_data && whole.data_crc_ok);
+  CHECK(!whole.truncated);
+  CHECK(whole.end_pos > 0 && whole.end_pos < f.size());
+
+  // Cut at several points inside the data field.
+  for (size_t back : {(size_t)20, (size_t)1500, (size_t)3000}) {
+    size_t n = whole.end_pos - back;
+    SectorRead cut = mfm_read_sector(f.data(), n, 2.0f, 3, 3, out.data(), 512);
+    CHECK(cut.found);
+    CHECK(cut.truncated);
+  }
+
+  SectorRead bad = mfm_read_sector(f.data(), f.size(), 2.0f, 6, 3, out.data(), 512);
+  CHECK(bad.found && bad.has_data && !bad.data_crc_ok);
+  CHECK(!bad.truncated);
+
+  SectorRead nodata = mfm_read_sector(f.data(), f.size(), 2.0f, 8, 3, out.data(), 512);
+  CHECK(nodata.found && !nodata.has_data);
+  CHECK(!nodata.truncated);
+}

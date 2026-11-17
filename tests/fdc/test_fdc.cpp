@@ -1484,3 +1484,151 @@ TEST(write_track_abandoned_during_the_head_wait_leaves_no_state) {
     CHECK(matches_pattern(wd::read_sector(5, 3, 512).data, 5, 0, 3));
   });
 }
+
+// ---------------- Weak bits (#51) ----------------
+// A weak sector reads with a bad data CRC on one pass and clean on the next
+// (the simulated disk alternates by revolution). A WD179x takes the first ID
+// match it meets after the command and reports that pass's data field: CRC
+// ERROR when that pass is bad, whatever a later pass would have given. A
+// later good copy must never be handed over in its place: weak-bit copy
+// protection re-reads such a sector and expects exactly the errors.
+namespace {
+
+void make_weak_disk(int cyl, int weak_sector) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  TrackSpec t;
+  for (int r = 1; r <= 9; ++r) {
+    SectorSpec s;
+    s.c = (uint8_t)cyl; s.h = 0; s.r = (uint8_t)r; s.n = 2;
+    s.data.resize(512);
+    for (int i = 0; i < 512; ++i)
+      s.data[i] = pattern_byte(cyl, 0, r, i);
+    s.weak = (r == weak_sector);
+    t.sectors.push_back(s);
+  }
+  g_disk[0].t[cyl][0] = encode_track(t);
+  insert(0, &g_disk[0]);
+  board_boot();
+}
+
+// Ticks from `t` until the head next reaches angle `a`.
+uint64_t ticks_to_angle(const Drive &d, uint64_t t, uint32_t a) {
+  uint32_t fwd = (a + REV_ANGLE - d.angle_at(t)) % REV_ANGLE;
+  return d.ticks_for_angle(fwd);
+}
+
+// The pass of a sector whose ID the head first meets after `t` reads badly?
+// Returns -1 when the ID is too close to `t` to tell (the capture starts a
+// little after the command).
+int first_pass_bad(const Drive &d, uint64_t t, uint32_t id_angle) {
+  uint64_t dt = ticks_to_angle(d, t, id_angle);
+  if (dt < ms(3) || dt > d.rev_ticks - ms(1))
+    return -1;
+  return d.rev_at(t + dt) % 2 == 0;
+}
+
+} // namespace
+
+TEST(weak_sector_read_reports_the_pass_the_head_meets_first) {
+  make_weak_disk(5, 5);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::read_sector(5, 1, 512); // measure the spindle
+    Drive &d = cable().drive[0];
+    uint32_t a5 = g_disk[0].t[5][0].id_at[4];
+    srand(51);
+    int bad = 0, good = 0;
+    for (int i = 0; i < 40; ++i) {
+      wait_us((uint64_t)(rand() % 200000));
+      int exp = first_pass_bad(d, now(), a5);
+      if (exp < 0)
+        continue;
+      wd::Xfer x = wd::read_sector(5, 5, 512);
+      if (exp) {
+        ++bad;
+        CHECK(x.status & wd::CRC);
+      } else {
+        ++good;
+        CHECK_EQ(error_bits(x.status), 0);
+        CHECK(matches_pattern(x.data, 5, 0, 5));
+      }
+    }
+    std::printf("  first pass bad %d, good %d\n", bad, good);
+    CHECK(bad >= 5);
+    CHECK(good >= 5);
+  }, ms(120000));
+}
+
+// READ MULTIPLE 4..6 with 5 weak: a WD reads sector 5 on the pass right after
+// sector 4 -- not a copy of 5 that passed before 4 did, which a decode from
+// the start of the capture buffer would find first.
+TEST(weak_sector_in_read_multiple_is_read_on_the_pass_after_its_predecessor) {
+  make_weak_disk(5, 5);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::read_sector(5, 1, 512); // measure the spindle
+    Drive &d = cable().drive[0];
+    uint32_t a4 = g_disk[0].t[5][0].id_at[3];
+    srand(52);
+    int bad = 0, good = 0;
+    for (int i = 0; i < 40; ++i) {
+      wait_us((uint64_t)(rand() % 200000));
+      // Sector 5 follows 4 within the same revolution on this track.
+      int exp = first_pass_bad(d, now(), a4);
+      if (exp < 0)
+        continue;
+      wd::Xfer x = wd::read_sector(5, 4, 3 * 512, /*multi=*/true, 5000);
+      if (exp) {
+        ++bad;
+        CHECK(x.status & wd::CRC);
+      } else {
+        ++good;
+        CHECK_EQ(error_bits(x.status), 0);
+        CHECK_EQ(x.data.size(), 3u * 512u);
+      }
+    }
+    std::printf("  first pass bad %d, good %d\n", bad, good);
+    CHECK(bad >= 5);
+    CHECK(good >= 5);
+  }, ms(120000));
+}
+
+// A whole HD track by READ MULTIPLE from random phases. The records after the
+// index are read on the capture's second pass, as on a WD, so the capture
+// outlives one revolution -- more flux than the buffer holds at HD, which
+// slides forward behind the last record read.
+TEST(hd_read_multiple_whole_track_at_every_phase) {
+  // Zero-filled: the densest data there is (a transition every bit cell).
+  g_disk[0] = make_filled_disk(Geometry::HD_DATA, 0x00);
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::density(true);
+    wd::select(0);
+    wd::restore();
+    wd::seek(40);
+    wd::side(0);
+    wd::read_sector(40, 1, 512); // measure the spindle
+    srand(53);
+    double worst = 0;
+    for (int i = 0; i < 12; ++i) {
+      wait_us((uint64_t)(rand() % 200000));
+      uint64_t t0 = now();
+      wd::Xfer x = wd::read_sector(40, 1, 18 * 512, /*multi=*/true, 5000);
+      double t_ms = (double)(now() - t0) / ms(1);
+      worst = std::max(worst, t_ms);
+      CHECK_EQ(error_bits(x.status), 0);
+      CHECK_EQ(x.data.size(), 18u * 512u);
+      CHECK(std::all_of(x.data.begin(), x.data.end(), [](uint8_t b) { return b == 0; }));
+    }
+    std::printf("  HD READ MULTIPLE 18 x 512: worst %.0f ms\n", worst);
+    // Rotational latency to sector 1, then one revolution.
+    CHECK(worst < 450);
+  }, ms(120000));
+}

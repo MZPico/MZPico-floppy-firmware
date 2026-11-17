@@ -93,6 +93,8 @@ Every fixed review bug keeps a test that fails on the old firmware:
 | #20 Verify accepts any cylinder | `seek_verify_detects_wrong_cylinder`, `verify_after_lost_steps_...` |
 | #21 size code 4..7 overruns the buffer | `oversized_size_code_cannot_overrun_the_transfer_buffer` |
 | #22 write refused from the other drive's WP | `write_to_writable_drive_right_after_switching_from_protected_one` |
+| #32 reading before the head can | `read_right_after_a_step_is_clean`, `first_read_after_a_cold_spin_up_is_clean` |
+| #51 a later good copy hides a CRC error | `weak_sector_*`, `read_sector_reports_a_field_cut_off_by_the_end_of_the_flux` |
 
 ## Limits
 
@@ -104,9 +106,12 @@ Every fixed review bug keeps a test that fails on the old firmware:
 - Splices leave a 20 µs flux-free junction at each end (write-current ramp,
   tunnel erase), as on hardware: a decoder rule that rejected such intervals
   passed CI and failed FDTEST on the machine until this was modelled.
-- Otherwise the drive is ideal unless a test makes it otherwise. It has no weak bits, no
-  head-settle noise, and a step always lands. Media effects come from the disk
-  image: jitter, bad CRCs, missing fields, wrong IDs.
+- After a step the head rings (noise, then marginal jitter), and data read
+  before the spindle is at speed is garbage (#32).
+- A sector can be marked `weak`: part of its data field reads noisily on even
+  revolutions and cleanly on odd ones, so its CRC alternates by pass (#51).
+- Otherwise the drive is ideal: a step always lands. Media effects come from
+  the disk image: jitter, bad CRCs, missing fields, wrong IDs, weak bits.
 - There is no Sharp ROM, so the boot ROM's own floppy code is not run. FDTEST
   follows its conventions instead (CPL bus, polled DRQ, Force Interrupt after
   READ MULTIPLE, inverted side).

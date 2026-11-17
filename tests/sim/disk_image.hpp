@@ -21,6 +21,7 @@ struct SectorSpec {
   bool bad_data_crc = false;
   bool no_data = false;         // ID field with no data field after it
   bool no_id = false;           // data field with no ID field before it
+  bool weak = false;            // data bytes are weak bits (see Track::weak)
 };
 
 struct TrackSpec {

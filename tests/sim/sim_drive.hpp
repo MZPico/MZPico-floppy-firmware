@@ -11,6 +11,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sim_core.hpp"
@@ -23,6 +24,14 @@ constexpr int MAX_CYL = 84;
 
 struct Track {
   std::vector<uint32_t> pos; // sorted transition angles in [0, REV_ANGLE)
+  // Weak-bit stretches (angle spans, issue #51): read noisily on even
+  // revolutions of the spindle, cleanly on odd ones -- a sector whose data
+  // CRC fails on one pass and passes on the next, as weak-bit copy
+  // protection relies on. Not preserved by a write over them.
+  std::vector<std::pair<uint32_t, uint32_t>> weak;
+  // Angle of each sector's ID sync, in TrackSpec order (encode_track only),
+  // so a test can tell which revolution a pass of the sector falls in.
+  std::vector<uint32_t> id_at;
 };
 
 struct Disk {
@@ -81,6 +90,13 @@ struct Drive {
   // wide: a coupled glitch, not a pulse (issue #18).
   uint64_t index_glitch_after_ticks = 0;
   std::vector<WriteEvent> writes;
+  // Every pass of the head over a weak stretch that a capture read, in order:
+  // its revolution number and whether that pass read noisily (even revs).
+  struct WeakPass { uint64_t rev; bool bad; uint64_t at; };
+  std::vector<WeakPass> weak_passes;
+  uint64_t rev_at(uint64_t now) const {
+    return (now + rev_ticks - phase_ticks % rev_ticks) / rev_ticks;
+  }
 
   bool spinning(uint64_t now) const {
     return motor && disk && now >= motor_on_since + spinup_ticks;
