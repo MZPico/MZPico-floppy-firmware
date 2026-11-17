@@ -130,10 +130,28 @@ bool FloppyDrive::side(int head) {
   return true;
 }
 
+bool FloppyDrive::s_spinup_pending = false;
+uint32_t FloppyDrive::s_motor_on_us = 0;
+
+bool FloppyDrive::head_ready(uint32_t settle_us, uint32_t spinup_us) {
+  uint32_t now = time_us_32();
+  // settle_us == 0 means "don't care about settling for this call" -- it must
+  // not clear the pending settle a later read or write still has to wait for.
+  if (settle_us && _settle_pending && now - _last_step_us >= settle_us)
+    _settle_pending = false;
+  if (s_spinup_pending && now - s_motor_on_us >= spinup_us)
+    s_spinup_pending = false;
+  return (!settle_us || !_settle_pending) && !s_spinup_pending;
+}
+
 bool FloppyDrive::spin_motor(bool motor_on) {
   if (motor_on != _is_motor_spinning) {
     write_pin(_motorpin, !motor_on); // motor on = logic 0
     _is_motor_spinning = motor_on;
+    if (motor_on) {
+      s_motor_on_us = time_us_32();
+      s_spinup_pending = true;
+    }
   }
   if (!motor_on) {
     _is_index_seen = false;
@@ -157,6 +175,10 @@ bool FloppyDrive::spin_motor(bool motor_on) {
 }
 
 void FloppyDrive::motor_raw(bool motor_on) {
+  if (motor_on && !_is_motor_spinning) {
+    s_motor_on_us = time_us_32();
+    s_spinup_pending = true;
+  }
   write_pin(_motorpin, !motor_on); // motor on = logic 0
   _is_motor_spinning = motor_on;
   if (!motor_on)
@@ -173,6 +195,8 @@ void FloppyDrive::step(bool dir, uint8_t times) {
     out_low(_steppin);
     sleep_ms(half);
     out_high(_steppin);
+    _last_step_us = time_us_32();
+    _settle_pending = true;
   }
   sleep_ms(half); // one more for good measure
 }

@@ -1367,3 +1367,120 @@ TEST(bench_head_is_restored_at_the_next_host_operation_not_when_idle) {
     CHECK_EQ(dbg().sec_cyl_mismatch, 0u);
   });
 }
+
+// ---------------- #32: head settle and spin-up ----------------
+
+// A read issued right after a one-cylinder step: the simulated head rings for
+// 12 ms and is marginal for 10 ms more (Drive::settle_*), as real heads are.
+// Every read must still be clean -- a WD does not read until the head has
+// settled. (In this model the early answer usually masks the ringing -- a
+// later pass of the sector is taken -- so this passes without the settle
+// wait too; it guards the combination.)
+TEST(read_right_after_a_step_is_clean) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    srand(21);
+    int bad = 0, n = 0;
+    for (int i = 0; i < 72; ++i) {
+      uint8_t c = (uint8_t)(10 + (i & 1)); // one step every time
+      wd::seek(c);
+      wait_us((uint64_t)(rand() % 3000)); // the host's own small delay
+      uint8_t r = (uint8_t)(1 + (i * 5) % 9);
+      wd::Xfer x = wd::read_sector(c, r, 512);
+      ++n;
+      if (error_bits(x.status) || !matches_pattern(x.data, c, 0, r)) {
+        ++bad;
+        if (bad <= 3)
+          std::fprintf(stderr, "  i=%d c%u r%u st=%02x\n", i, c, r, x.status);
+      }
+    }
+    std::printf("  %d of %d reads after a step failed\n", bad, n);
+    CHECK_EQ(bad, 0);
+  }, ms(120000));
+}
+
+// The first read after a cold spin-up: ~INDEX is there before the spindle is
+// at speed (Drive::speed_stable_ticks), and data read then is garbage.
+TEST(first_read_after_a_cold_spin_up_is_clean) {
+  // Six cold starts in one power-up: the motor is switched off long enough
+  // (past the 3 s deferred motor-off) for the spindle to stop each time.
+  int bad = 0;
+  boot_with(Geometry::MZ_DD_DATA);
+  run([&bad] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    for (int k = 0; k < 6; ++k) {
+      wd::select(0, /*motor=*/false);
+      wait_ms(3600); // past the 3 s deferred motor-off: the spindle stops
+      wait_us((uint64_t)(k * 37000));
+      wd::select(0, /*motor=*/true);
+      wd::Xfer x = wd::read_sector(0, (uint8_t)(1 + k), 512, false, 3000);
+      if (error_bits(x.status) || !matches_pattern(x.data, 0, 0, 1 + k)) {
+        ++bad;
+        std::fprintf(stderr, "  spin-up %d: st=%02x n=%zu\n", k, x.status, x.data.size());
+      }
+    }
+    CHECK_EQ(bad, 0);
+  }, ms(120000));
+}
+
+// A WRITE right behind a STEP + FORCE INTERRUPT (CP/M style, no BUSY waits):
+// the seek's completion must not clear the write's BUSY. When BUSY drops the
+// sector must already be on the media -- the host takes BUSY low as "written"
+// and moves on. (Found while adding the #32 gates: the seek completion
+// cleared BUSY for any pending command but a read.)
+TEST(write_behind_a_step_keeps_busy_until_on_media) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    for (int k = 0; k < 4; ++k) {
+      size_t before = cable().drive[0].writes.size();
+      out(0xD8, 0x50); // STEP IN...
+      wd::force_interrupt();
+      std::vector<uint8_t> v(512, (uint8_t)(0x40 + k));
+      wd::Xfer w = wd::write_sector((uint8_t)(k + 1), 2, v); // ...and WRITE at once
+      CHECK_EQ(error_bits(w.status), 0);
+      CHECK(cable().drive[0].writes.size() > before); // on the media at BUSY low
+      CHECK(wd::read_sector((uint8_t)(k + 1), 2, 512).data == v);
+    }
+  });
+}
+
+// A Force Interrupt during an armed WRITE TRACK's head wait (here: the 500 ms
+// spin-up after a cold motor start) must not leave the track operation armed
+// -- or no later command can drop BUSY. (CodeRabbit on #53.)
+TEST(write_track_abandoned_during_the_head_wait_leaves_no_state) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::select(0, /*motor=*/false);
+    wait_ms(3600); // spindle stops
+    uint64_t motor_on = now();
+    wd::select(0, /*motor=*/true);
+    std::vector<uint8_t> img = wd::format_image(0, 0, 9, 2, false);
+    out(0xD8, 0xF0); // WRITE TRACK
+    for (size_t i = 0; i < img.size(); ++i) {
+      if (wd::status() & wd::DRQ)
+        out(0xDB, img[i]);
+    }
+    // spin_motor() returns ~300 ms + one index after motor-on; the image is
+    // armed on the next pass; the write then waits for the 500 ms readiness
+    // gate. Force Interrupt inside that last stretch.
+    while (now() < motor_on + ms(470))
+      wait_ms(1);
+    wd::force_interrupt();
+    size_t writes = cable().drive[0].writes.size();
+    wait_ms(700);
+    CHECK_EQ(cable().drive[0].writes.size(), writes); // nothing written
+    CHECK(!(wd::seek(5) & wd::BUSY)); // and the controller completes commands
+    CHECK(matches_pattern(wd::read_sector(5, 3, 512).data, 5, 0, 3));
+  });
+}
