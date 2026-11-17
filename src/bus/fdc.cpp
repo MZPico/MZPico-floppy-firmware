@@ -3882,6 +3882,15 @@ void fdc_disk_task(void) {
         if (S.cmd_gen == gen)
           ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
                               /*use_index=*/true);
+        else if (S.trk_op == 2 && S.trk_armed && S.trk_seq == seq) {
+          // Abandoned before it reached the media (a reset, or a Force
+          // Interrupt, leaves an ARMED track write in place because one
+          // already being written must finish). This one never started:
+          // clear it, or trk_op stays set and no later seek can drop BUSY.
+          S.trk_op = 0;
+          S.trk_armed = false;
+          S.drq = false;
+        }
       }
     }
     S.trk_last_us = time_us_32() - t0;

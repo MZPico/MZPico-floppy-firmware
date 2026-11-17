@@ -1451,3 +1451,36 @@ TEST(write_behind_a_step_keeps_busy_until_on_media) {
     }
   });
 }
+
+// A Force Interrupt during an armed WRITE TRACK's head wait (here: the 500 ms
+// spin-up after a cold motor start) must not leave the track operation armed
+// -- or no later command can drop BUSY. (CodeRabbit on #53.)
+TEST(write_track_abandoned_during_the_head_wait_leaves_no_state) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::select(0, /*motor=*/false);
+    wait_ms(3600); // spindle stops
+    uint64_t motor_on = now();
+    wd::select(0, /*motor=*/true);
+    std::vector<uint8_t> img = wd::format_image(0, 0, 9, 2, false);
+    out(0xD8, 0xF0); // WRITE TRACK
+    for (size_t i = 0; i < img.size(); ++i) {
+      if (wd::status() & wd::DRQ)
+        out(0xDB, img[i]);
+    }
+    // spin_motor() returns ~300 ms + one index after motor-on; the image is
+    // armed on the next pass; the write then waits for the 500 ms readiness
+    // gate. Force Interrupt inside that last stretch.
+    while (now() < motor_on + ms(470))
+      wait_ms(1);
+    wd::force_interrupt();
+    size_t writes = cable().drive[0].writes.size();
+    wait_ms(700);
+    CHECK_EQ(cable().drive[0].writes.size(), writes); // nothing written
+    CHECK(!(wd::seek(5) & wd::BUSY)); // and the controller completes commands
+    CHECK(matches_pattern(wd::read_sector(5, 3, 512).data, 5, 0, 3));
+  });
+}
