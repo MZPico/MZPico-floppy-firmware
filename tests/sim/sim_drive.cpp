@@ -195,6 +195,14 @@ void FloppyCable::write_flux(uint64_t t0, const uint8_t *deltas, size_t n,
   std::sort(out.begin(), out.end());
   out.erase(std::unique(out.begin(), out.end()), out.end());
   tr.pos.swap(out);
+  // New flux is not weak: a weak stretch the write touched is gone (they are
+  // short and lie inside one data field, which such a write rewrites).
+  tr.weak.erase(std::remove_if(tr.weak.begin(), tr.weak.end(),
+                               [&](const std::pair<uint32_t, uint32_t> &w) {
+                                 return erased(w.first) || erased(w.second - 1) ||
+                                        (ev.a0 >= w.first && ev.a0 < w.second);
+                               }),
+                tr.weak.end());
   d->writes.push_back(ev);
 }
 

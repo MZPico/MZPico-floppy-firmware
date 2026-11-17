@@ -239,6 +239,11 @@ TEST(read_sector_reports_a_field_cut_off_by_the_end_of_the_flux) {
     CHECK(cut.truncated);
   }
 
+  // Flux ending exactly where the field does: complete, not cut off.
+  SectorRead exact = mfm_read_sector(f.data(), whole.end_pos, 2.0f, 3, 3, out.data(), 512);
+  CHECK(exact.found && exact.has_data && exact.data_crc_ok);
+  CHECK(!exact.truncated);
+
   SectorRead bad = mfm_read_sector(f.data(), f.size(), 2.0f, 6, 3, out.data(), 512);
   CHECK(bad.found && bad.has_data && !bad.data_crc_ok);
   CHECK(!bad.truncated);

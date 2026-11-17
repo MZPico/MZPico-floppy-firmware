@@ -1591,6 +1591,9 @@ TEST(weak_sector_in_read_multiple_is_read_on_the_pass_after_its_predecessor) {
         ++good;
         CHECK_EQ(error_bits(x.status), 0);
         CHECK_EQ(x.data.size(), 3u * 512u);
+        for (int r = 4; r <= 6 && x.data.size() == 3 * 512; ++r)
+          CHECK(matches_pattern(std::vector<uint8_t>(x.data.begin() + (r - 4) * 512,
+                                                     x.data.begin() + (r - 3) * 512), 5, 0, r));
       }
     }
     std::printf("  first pass bad %d, good %d\n", bad, good);
@@ -1604,8 +1607,22 @@ TEST(weak_sector_in_read_multiple_is_read_on_the_pass_after_its_predecessor) {
 // outlives one revolution -- more flux than the buffer holds at HD, which
 // slides forward behind the last record read.
 TEST(hd_read_multiple_whole_track_at_every_phase) {
-  // Zero-filled: the densest data there is (a transition every bit cell).
+  // Zero-filled -- the densest data there is (a transition every bit cell) --
+  // but for each sector's number in its first byte, so every slice can be
+  // told apart (a repeated or reordered record would otherwise pass).
   g_disk[0] = make_filled_disk(Geometry::HD_DATA, 0x00);
+  {
+    TrackSpec t;
+    t.hd = true;
+    for (int r = 1; r <= 18; ++r) {
+      SectorSpec sp;
+      sp.c = 40; sp.h = 1; sp.r = (uint8_t)r; sp.n = 2;
+      sp.data.assign(512, 0x00);
+      sp.data[0] = (uint8_t)r;
+      t.sectors.push_back(sp);
+    }
+    g_disk[0].t[40][1] = encode_track(t);
+  }
   insert(0, &g_disk[0]);
   board_boot();
   run([] {
@@ -1625,10 +1642,57 @@ TEST(hd_read_multiple_whole_track_at_every_phase) {
       worst = std::max(worst, t_ms);
       CHECK_EQ(error_bits(x.status), 0);
       CHECK_EQ(x.data.size(), 18u * 512u);
-      CHECK(std::all_of(x.data.begin(), x.data.end(), [](uint8_t b) { return b == 0; }));
+      for (int r = 1; r <= 18 && x.data.size() == 18 * 512; ++r) {
+        auto b = x.data.begin() + (r - 1) * 512;
+        CHECK_EQ(*b, (uint8_t)r);
+        CHECK(std::all_of(b + 1, b + 512, [](uint8_t v) { return v == 0; }));
+      }
     }
     std::printf("  HD READ MULTIPLE 18 x 512: worst %.0f ms\n", worst);
     // Rotational latency to sector 1, then one revolution.
     CHECK(worst < 450);
   }, ms(120000));
+}
+
+// A field cut off for good -- the disk is pulled while its data field is under
+// the head, so no recapture can complete it -- must not be delivered: its
+// bytes past the cut are the decoder's zeros, not the disk's, and the CRC
+// ERROR they would carry describes the cut.
+TEST(field_cut_off_for_good_delivers_no_bytes) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(3);
+    wd::side(1);
+    wd::read_sector(3, 1, 512); // measure the spindle
+    Drive &d = cable().drive[0];
+    uint32_t a5 = d.disk->at(3, 0).id_at.empty() ? 0 : d.disk->at(3, 0).id_at[4];
+    CHECK(a5 != 0);
+    // Issue the READ ~20 ms before sector 5's ID, pull the disk ~6 ms after it
+    // (inside the 16 ms data field).
+    uint64_t to_id = ticks_to_angle(d, now(), a5);
+    if (to_id < ms(25))
+      to_id += d.rev_ticks;
+    wait_us((to_id - ms(20)) / 24);
+    out(0xD9, 3);
+    out(0xDA, 5);
+    out(0xD8, 0x80);
+    wait_us(ms(26) / 24);
+    d.disk = nullptr;
+    size_t got = 0;
+    uint8_t s = 0;
+    for (uint64_t end = now() + ms(3000); now() < end;) {
+      s = wd::status();
+      if (s & wd::DRQ) {
+        in(0xDB);
+        ++got;
+      } else if (!(s & wd::BUSY))
+        break;
+    }
+    std::printf("  got %zu bytes, status %02x\n", got, s);
+    CHECK_EQ(got, 0u);
+    CHECK(!(s & wd::BUSY));
+    CHECK(!(s & wd::CRC));
+  }, ms(60000));
 }

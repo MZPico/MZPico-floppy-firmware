@@ -58,6 +58,7 @@ struct mfm_io {
   size_t n_pulses; ///< Total size of encoded track data
   size_t pos;      ///< Position within encoded track data
   size_t time;     ///< Total track time in flux units (set by encoder)
+  bool past_end;   ///< MZPico: a symbol was asked for beyond n_pulses
 
   uint8_t *sectors; ///< Pointer to decoded data
   size_t n_sectors; ///< Number of sectors on track
@@ -113,6 +114,7 @@ static int mfm_io_eof(mfm_io_t *io) { return io->pos >= io->n_pulses; }
 
 static mfm_io_symbol_t mfm_io_read_symbol(mfm_io_t *io) {
   if (mfm_io_eof(io)) {
+    io->past_end = true; // MZPico: the caller decoded past the captured flux
     return mfm_io_pulse_10;
   }
   uint8_t pulse_len = io->pulses[io->pos++];

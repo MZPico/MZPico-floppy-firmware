@@ -4396,6 +4396,11 @@ void fdc_disk_task(void) {
           if (S.reading && S.cmd_gen == gen && g_flux_n > 0)
             sd = fdc_decode_sector(want);
         }
+        // Still cut off (the recapture saw no flux, or ended inside the field
+        // too): its bytes are not the disk's. Never deliver them -- search on
+        // below, and RNF if no complete copy turns up.
+        if (sd.truncated)
+          sd.found = sd.has_data = sd.data_crc_ok = false;
         // Nothing AT ALL at the latched density -- not even a wrong-cylinder
         // ID, which would prove the clock is right and the problem positional.
         // Re-decode the same window at the other bit clock before reporting
@@ -4408,8 +4413,11 @@ void fdc_disk_task(void) {
         if (!sd.found && !sd.cyl_mismatch) {
           uint8_t idtmp[6];
           if (!mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
-              fdc_try_other_density(flux, g_flux_n))
+              fdc_try_other_density(flux, g_flux_n)) {
             sd = fdc_decode_sector(want);
+            if (sd.truncated) // as above: never deliver a cut-off field
+              sd.found = sd.has_data = sd.data_crc_ok = false;
+          }
         }
         // Still not found: keep searching, as a WD does -- it matches ID
         // fields until the fifth index pulse (4-5 revolutions) before RNF. A
@@ -4434,8 +4442,11 @@ void fdc_disk_task(void) {
           fdc_read_capture_until(want);
           if (g_rc_active) // found early: no need to hold the rest
             fdc_read_capture_end(false);
-          if (S.reading && S.cmd_gen == gen && g_flux_n > 0)
+          if (S.reading && S.cmd_gen == gen && g_flux_n > 0) {
             sd = fdc_decode_sector(want);
+            if (sd.truncated) // cut off by the window's end: search on
+              sd.found = sd.has_data = sd.data_crc_ok = false;
+          }
         }
       }
       // A look-ahead that was never found, on a track whose last complete
