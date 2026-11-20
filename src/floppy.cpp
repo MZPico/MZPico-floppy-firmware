@@ -131,6 +131,7 @@ bool FloppyDrive::side(int head) {
 }
 
 bool FloppyDrive::s_spinup_pending = false;
+bool FloppyDrive::s_motor_line_on = false;
 uint32_t FloppyDrive::s_motor_on_us = 0;
 
 bool FloppyDrive::head_ready(uint32_t settle_us, uint32_t spinup_us) {
@@ -145,13 +146,18 @@ bool FloppyDrive::head_ready(uint32_t settle_us, uint32_t spinup_us) {
 }
 
 bool FloppyDrive::spin_motor(bool motor_on) {
-  if (motor_on != _is_motor_spinning) {
+  // Driven whenever this object's belief OR the line itself differs from
+  // what is asked: the line is shared, so another object (or a select that
+  // adopted a stale belief) may have left it the other way. In particular
+  // spin_motor(false) must drop a line this object does not think is on.
+  if (motor_on != _is_motor_spinning || motor_on != s_motor_line_on) {
     write_pin(_motorpin, !motor_on); // motor on = logic 0
-    _is_motor_spinning = motor_on;
-    if (motor_on) {
+    if (motor_on && !s_motor_line_on) { // the spindles really start now
       s_motor_on_us = time_us_32();
       s_spinup_pending = true;
     }
+    _is_motor_spinning = motor_on;
+    s_motor_line_on = motor_on;
   }
   if (!motor_on) {
     _is_index_seen = false;
@@ -175,12 +181,13 @@ bool FloppyDrive::spin_motor(bool motor_on) {
 }
 
 void FloppyDrive::motor_raw(bool motor_on) {
-  if (motor_on && !_is_motor_spinning) {
+  if (motor_on && !s_motor_line_on) {
     s_motor_on_us = time_us_32();
     s_spinup_pending = true;
   }
   write_pin(_motorpin, !motor_on); // motor on = logic 0
   _is_motor_spinning = motor_on;
+  s_motor_line_on = motor_on;
   if (!motor_on)
     _is_index_seen = false;
 }
@@ -271,7 +278,9 @@ bool FloppyDrive::goto_track(int track_num) {
 bool FloppyDrive::get_write_protect() {
   if (_protectpin < 0)
     return false;
-  return !read_pin(_protectpin);
+  if (_is_drive_selected) // deselected: the line floats (#56)
+    _last_wp = !read_pin(_protectpin);
+  return _last_wp;
 }
 
 bool FloppyDrive::get_ready_sense() {
@@ -283,7 +292,9 @@ bool FloppyDrive::get_ready_sense() {
 bool FloppyDrive::get_track0_sense() {
   if (_track0pin < 0)
     return track() != 0;
-  return !read_pin(_track0pin);
+  if (_is_drive_selected) // deselected: the line floats (#56)
+    _last_trk00 = !read_pin(_track0pin);
+  return _last_trk00;
 }
 
 bool FloppyDrive::set_density(bool high_density) {

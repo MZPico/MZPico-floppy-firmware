@@ -75,6 +75,14 @@ period and sector-size cache. `~HDSEL` and `~MOTOR_ON` are single wires shared
 by both drives (the motor line reaches every drive on the cable, so it is not
 gated by select).
 
+`~DSn` is released once the host has turned the motor off and the deferred
+motor stop (3 s) has run, and nothing is pending. PC drives light their
+activity LED from drive select, so a select that was never released kept the
+LED on for as long as the machine was attached (#56). The next command, or the
+host turning the motor on, selects the drive again. While deselected, the
+drive's `~TRK00`/`~WPT` float, so `FloppyDrive` reports the values it last
+read while selected.
+
 ## Density (DD / HD)
 
 **The `0xDE` port is the host's density declaration, and its polarity is
@@ -233,7 +241,26 @@ WriteFault · b4 RecordNotFound · b3 CRCError · b2 LostData · b1 DRQ · b0 Bu
   Read Multiple `0x90` / Write Multiple `0xB4`).
 - **Type III:** READ ADDRESS, READ TRACK, WRITE TRACK (format).
 - **Type IV:** FORCE INTERRUPT `0xD0` (the ROM uses it to terminate
-  multi-sector ops).
+  multi-sector ops). Terminating a running command keeps that command's
+  status, which is how the ROM reads a clean `0x00` after READ MULTIPLE. With
+  no command running, STATUS switches to the Type I layout (TRK00, WP, Index),
+  as the datasheet specifies (#58). Two details make that safe here:
+  - "No command running" means the host has **read the command's final
+    STATUS**, not merely that BUSY is clear. The firmware drops BUSY the
+    moment the last data byte is taken; a WD is still busy with the CRC
+    bytes, and the ROM and CP/M send `0xD0` right there and read the status
+    afterwards.
+  - In the Type I view after such a Force Interrupt, the **CRC and RNF bits
+    stay latched** from the data command (bit 4 is that RNF, not an older
+    Seek Error), as in the chip's status register: those two are never erased
+    by the `0xD0` that follows them. The bits that have no Type I twin do
+    change meaning, as on a WD: bit 2 is TRK00 (not LOST DATA), bit 6 is the
+    drive's Write Protect (not a refused write), bit 5 (deleted mark) is gone.
+    The host has read the final status by then.
+  - TRK00 and Write Protect are **live** in that view: the disk task
+    refreshes them on every idle pass while the drive is selected. CP/M's
+    BIOS tests Write Protect with an idle `0xD0` before each write, so a
+    value cached from before a disk swap must not be shown there.
 
 ### ID track compare (all Type II, Verify, and the write splice)
 

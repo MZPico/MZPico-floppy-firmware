@@ -84,6 +84,10 @@ public:
 
   bool drive_is_selected() const { return _is_drive_selected; }
   bool motor_is_spinning() const { return _is_motor_spinning; }
+  // The physical ~MOTOR_ON line. It is ONE wire for every drive on the
+  // cable, so this -- not any one object's belief -- is the truth about
+  // whether the spindles are being driven.
+  static bool motor_line_on() { return s_motor_line_on; }
 
   size_t capture_track(volatile uint8_t *pulses, size_t max_pulses,
                        int32_t *falling_index_offset, bool store_greaseweazle,
@@ -107,11 +111,15 @@ private:
   int _track = -1;
   int _side = -1;
   bool _is_drive_selected = false;
+  // ~TRK00 and ~WPT are only driven by a selected drive; deselected, the
+  // lines float. The senses report the last value read while selected (#56).
+  bool _last_trk00 = false, _last_wp = false;
   bool _is_motor_spinning = false;
   bool _is_index_seen = false;
   bool _track0_crosscheck = true;
   bool _settle_pending = false;
   uint32_t _last_step_us = 0;
   static bool s_spinup_pending; // ~MOTOR_ON is one wire for every drive
+  static bool s_motor_line_on;  // what was last driven onto it, by any object
   static uint32_t s_motor_on_us;
 };

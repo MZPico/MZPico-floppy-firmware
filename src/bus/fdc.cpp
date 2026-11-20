@@ -184,6 +184,17 @@ struct FdcState {
   // `type2` selects the Type II STATUS layout (set by a Type II command, cleared
   // by a Type I command). `reading` = a read transfer is in flight (BUSY held).
   volatile bool type2 = false;
+  // The host has read the final STATUS of the last Type II/III command (a
+  // STATUS read with BUSY clear). Until then a Force Interrupt is treated as
+  // ending that command, whatever BUSY says: we drop BUSY the moment the last
+  // byte is taken, a WD only after the CRC bytes, and the ROM sends its 0xD0
+  // right there and expects the command's own status (#58).
+  volatile bool t2_final_seen = false;
+  // STATUS is in the Type I layout because of an idle Force Interrupt after a
+  // data command: the status register's CRC and RNF bits stay as that command
+  // left them (they are latches; only Index/TRK00/WP go live), and bit 4 is
+  // that RNF, not a Seek Error from some earlier Type I.
+  volatile bool fi_type1 = false;
   volatile bool reading = false;
   volatile bool pending_force_int = false;
   volatile uint32_t last_data_read_us = 0;
@@ -925,6 +936,17 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   //    we know of issues its own RESTORE at startup anyway.
   S.sector = 1;
   S.command = 0;
+  // ...and it clears the status register: no command, so the Type I layout,
+  // with nothing latched from before the reset.
+  S.type2 = false;
+  S.fi_type1 = false;
+  S.t2_final_seen = false;
+  S.err_crc = false;
+  S.err_rnf = false;
+  S.lost_data = false;
+  S.rec_deleted = false;
+  S.err_write_protect = false;
+  S.seek_error = false;
 
   fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
 }
@@ -1039,10 +1061,14 @@ static bool fdc_apply_drive_select(void) {
   // and a stale belief makes side()/spin_motor() short-circuit on a line that
   // is not where the new drive thinks it is. See adopt_shared_lines().
   int side = g_applied_side;
-  bool motor = g_applied_motor;
+  // The motor state handed over is the LINE's, not g_applied_motor (which a
+  // first select deliberately forgets) and not prev's belief: coming back
+  // from a missing unit there is no prev at all, and a stale "off" made the
+  // new drive believe a running spindle stopped -- released, with ~MOTOR_ON
+  // asserted for good (third review of #57).
+  bool motor = FloppyDrive::motor_line_on();
   if (prev) {
     side = prev->get_side();
-    motor = prev->motor_is_spinning();
     prev->select(false);
   }
   next->adopt_shared_lines(side, motor);
@@ -1068,6 +1094,9 @@ static bool fdc_apply_drive_select(void) {
   // is what stops a host that alternates drives paying the ~300 ms spin-up on
   // each swap. See the spin-up quirk: this drive will not step to TRK00
   // reliably until its disk is actually turning.
+  // (Forgetting the applied motor while the line is physically on is why
+  // the disk task's deferred stop keys on the line itself, not only on
+  // g_applied_motor: see the motor block.)
   if (!g_spun[want]) {
     g_spun[want] = true;
     g_applied_motor = false;
@@ -1089,7 +1118,11 @@ static bool fdc_apply_drive_select(void) {
   // the next Type I recalibrates anyway, and stepping here would do it before
   // the spindle is up -- which this drive will not tolerate (see the spin-up
   // quirk in fdc_disk_task).
-  if (prev && g_applied_motor && next->track() >= 0) {
+  // Not when the SAME drive is merely being selected again (after the idle
+  // release, #56, or a bench command): its head only differs from its target
+  // if the bench moved it, and that is fdc_bench_restore_head()'s job, at
+  // the start of the next operation -- idle passes must not move the head.
+  if (prev && prev != next && g_applied_motor && next->track() >= 0) {
     // Apply the FDC step timing before moving: these are per-instance and this
     // drive is still on the flux-capture defaults (12 ms/step), which would
     // turn a full-stroke catch-up into a ~1 s stall inside the disk task.
@@ -2027,9 +2060,12 @@ inline uint8_t compose_status() {
     }
     if (S.at_track0)
       st |= 0x04; // TRACK 00
-    if (S.seek_error)
+    bool fi = S.fi_type1; // see fi_type1: the data command's latched bits
+    if (fi ? S.err_rnf : S.seek_error)
       st |= 0x10; // SEEK ERROR (set when a Verify-flagged seek finds no
-                  // matching ID field on the target track)
+                  // matching ID field on the target track) / latched RNF
+    if (fi && S.err_crc)
+      st |= 0x08; // latched CRC ERROR
     if (S.write_protect)
       st |= 0x40; // WRITE PROTECT
   }
@@ -2094,6 +2130,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     if ((cmd & 0x80) == 0) {
       // ---- Type I (seek family) ----
       S.type2 = false; // STATUS reverts to the Type I layout
+      S.fi_type1 = false;
       S.read_addr = false;
       // Abandon any half-collected write. The head is about to move, and a
       // buffer collected for one cylinder must never be spliced onto another;
@@ -2194,10 +2231,22 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // The ROM terminates a multi-sector read with 0xD0, then reads STATUS and
       // requires the true value == 0x00 for success — so we must not touch the
       // Type II error flags (a CRC/RNF seen mid-read must survive to be reported)
-      // nor `type2` (the status layout follows the last data command).
+      // nor, for a command still running, `type2` (see idle_fi below).
       // ...but only once the host has started on that sector. A published
       // look-ahead sector nobody has taken a byte of is not a transfer in
       // progress: a WD drops BUSY/DRQ at once (#23).
+      //
+      // With NO command running, though, a WD's STATUS reverts to the Type I
+      // layout (datasheet: "Status reflects the Type I commands"), so a host
+      // can read TRK00 / WP / Index with an idle 0xD0 after a data command
+      // (#58). "No command running" is NOT just BUSY clear here: we drop BUSY
+      // the moment the last data byte is taken, where a WD is still busy
+      // with the CRC bytes, and both the ROM and CP/M send 0xD0 right there
+      // and read the command's own status afterwards -- a CRC error must not
+      // turn into 0x00. So the command counts as over only once the host has
+      // read its final STATUS (t2_final_seen); and even then the CRC and RNF
+      // bits stay latched in the Type I view (fi_type1).
+      bool idle_fi = !S.busy && !S.reading && !S.writing && !S.trk_op;
       if (S.reading && S.drq && S.xfer_pos > 0 && S.xfer_pos < S.xfer_len) {
         // If Force Interrupt arrives while bytes are still being drained from
         // the published sector buffer, defer completion until that buffer is
@@ -2235,6 +2284,10 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // Force Interrupt still drops host-visible BUSY at once (above); core0
         // finishes the motion and clears BUSY again, which is idempotent.
       }
+      if (idle_fi && S.type2 && S.t2_final_seen) {
+        S.fi_type1 = true;
+        S.type2 = false;
+      }
       // Type IV interrupt conditions. Bit3 (I3) = interrupt immediately; the
       // MZ-800 boot ROM uses 0xD8, i.e. it has been asking for INTRQ all along
       // and merely polls as well. 0xD0 (no condition bits) terminates silently.
@@ -2254,6 +2307,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // command ends at once with NOT READY (compose_status reports it for
       // units 2/3). Nothing is queued for core0. Issue #8.
       S.type2 = true;
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.reading = false;
       S.read_addr = false;
       fdc_note_write_abandoned();
@@ -2267,6 +2322,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     } else if ((cmd & 0xC0) == 0x80) {
       // ---- Type II (sector data): 0x80..0xBF ----
       S.type2 = true;
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.read_addr = false;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.err_write_protect = false; // cleared by the next Type II/III command
@@ -2347,6 +2404,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // work out which cylinder the head is actually on (STEP-IN/OUT then
       // READ ADDRESS); returning nothing makes it step blindly and give up.
       S.type2 = true;
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.err_write_protect = false; // cleared by the next Type II/III command
       fdc_note_write_abandoned();
@@ -2373,6 +2432,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     } else {
       // ---- Type III READ TRACK (0xEX) / WRITE TRACK (0xFX) ----
       S.type2 = true; // both report in the Type II status layout
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.reading = false;
       fdc_note_write_abandoned();
       S.writing = false;
@@ -2600,7 +2661,15 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
       S.force_int_latched = false;
       fdc_refresh_int_line();
     }
-    return (uint8_t)~compose_status(); // STATUS (driven CPL'd)
+    {
+      // Composed once: the "host has seen the final status" flag is taken
+      // from the very byte handed over, so core0 dropping BUSY between a
+      // separate test and the compose cannot leave the two disagreeing.
+      uint8_t st = compose_status();
+      if (!(st & 0x01))
+        S.t2_final_seen = true;
+      return (uint8_t)~st; // STATUS (driven CPL'd)
+    }
   case 0xD9:
     return (uint8_t)~S.track; // inverted like the other registers
   case 0xDA:
@@ -3327,7 +3396,7 @@ void fdc_bench_done(void) {
   g_rc_active = false;
   g_flux_n = 0;
   g_flux_complete = false;
-  g_applied_motor = DRV ? DRV->motor_is_spinning() : false;
+  g_applied_motor = FloppyDrive::motor_line_on();
   g_bench_head_dirty = true;
 }
 
@@ -3455,6 +3524,30 @@ static void fdc_apply_side(void) {
   g_flux_complete = false;
 }
 
+// The deferred motor stop for passes that end with no drive resolved (the
+// host has unit 2/3 selected): the motor block further down is never reached
+// then, and ~MOTOR_ON is one wire for every drive, so the spindles ran for as
+// long as the host left that unit selected. Any drive object can drop the
+// line.
+static void fdc_stop_motor_without_drive(bool motor_on) {
+  if (motor_on || !FloppyDrive::motor_line_on() || g_ndrives < 1 || !g_drives[0]) {
+    if (motor_on)
+      g_motor_off_at = 0;
+    return;
+  }
+  if (g_motor_off_at == 0) {
+    g_motor_off_at = now_ms() + FDC_MOTOR_OFF_DELAY_MS;
+  } else if (now_ms() >= g_motor_off_at) {
+    g_drives[0]->spin_motor(false);
+    g_applied_motor = false;
+    g_motor_off_at = 0;
+    if (g_stream_active) {
+      rp2040_flux_capture_stop();
+      g_stream_active = false;
+    }
+  }
+}
+
 // The host has selected a unit that does not exist while work is still queued
 // for core0 (queued before the switch). No drive will ever run it, so end it
 // the way a WD ends a command on a drive that is not ready: BUSY drops, and the
@@ -3536,15 +3629,52 @@ void fdc_disk_task(void) {
   // used to wedge the controller for good once a host had named unit 2/3 with
   // a command pending -- every later command BUSY forever, even after it
   // re-selected drive 0 (issue #8).
-  if ((!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) ||
-      !DRV) {
+  bool idle = !S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq;
+  // ONE read of the host's motor bit for the whole pass. The deselect decision
+  // here and the spin-up below must agree: read twice, a motor-on landing
+  // between the two spun up a drive this pass had just deselected -- ~INDEX
+  // is gated by the select, so the index wait timed out and NOT READY stuck
+  // (review of #57).
+  bool motor_on = S.motor_on;
+  if (idle && DRV && !motor_on && !g_applied_motor &&
+      !FloppyDrive::motor_line_on()) {
+    // Nothing to do and the spindle has stopped (the deferred motor stop
+    // below has run): release ~DSn. PC drives light their LED from drive
+    // select, not from the motor, so a select held for good kept the LED on
+    // for as long as the MZ-800 was attached (#56). The next operation, or the
+    // host turning the motor on, selects the drive again through
+    // fdc_apply_drive_select(). While deselected the drive's ~TRK00/~WPT
+    // float; FloppyDrive reports the last values it read.
+    if (g_applied_select) {
+      DRV->select(false);
+      g_applied_select = false;
+    }
+  } else if (idle || !DRV) {
     if (!fdc_apply_drive_select()) {
       fdc_end_for_missing_unit();
+      fdc_stop_motor_without_drive(motor_on);
       return; // no such unit; STATUS already reports NOT READY
     }
   }
-  if (!DRV)
+  if (!DRV) {
+    fdc_stop_motor_without_drive(motor_on);
     return; // selected unit never resolved (only reachable before the first one)
+  }
+
+  // Between operations, keep the Type I status bits live, as a WD's are:
+  // ~TRK00 and ~WPT are the drive's own lines. They used to be refreshed only
+  // at a select, at the end of a seek and inside a write -- which was enough
+  // while a host could only see them right after a Type I. An idle Force
+  // Interrupt now shows them after a data command too (#58), and CP/M's BIOS
+  // tests Write Protect exactly that way before every write: a stale bit from
+  // before a disk swap failed the write five times with no recovery, since
+  // nothing on that path moves the head (review of #59). Only while the
+  // drive is selected -- released, its lines float.
+  if (g_applied_select && !S.reading && !S.writing && S.trk_op == 0 &&
+      S.op_done == S.op_seq) {
+    S.at_track0 = DRV->get_track0_sense();
+    fdc_note_wp(DRV->get_write_protect());
+  }
 
 
 
@@ -3565,16 +3695,28 @@ void fdc_disk_task(void) {
   }
   // Motor with a spin-down delay: spin up on request (spin_motor waits for
   // index = disk really turning), but defer stop so retries keep the spin-up.
-  if (S.motor_on) {
+  if (motor_on) {
     g_motor_off_at = 0; // cancel any pending stop
     if (!g_applied_motor) {
+      // Never spin up a deselected drive (see `motor_on` above): with an
+      // operation pending the idle gate did not run, and the drive may still
+      // be released from the last motor stop.
+      if (!g_applied_select && (!fdc_apply_drive_select() || !DRV)) {
+        fdc_end_for_missing_unit();
+        return;
+      }
       // The return value is the index sighting -- i.e. "is a disk actually
       // turning in this unit". Keep it: it is what separates an empty or absent
       // drive from a working one, and STATUS has no other source for NOT READY.
       g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
       g_applied_motor = true;
     }
-  } else if (g_applied_motor) {
+  } else if (g_applied_motor || FloppyDrive::motor_line_on()) {
+    // ...or the line is physically on although the bookkeeping forgot it: a
+    // first select of a unit (fdc_apply_drive_select clears g_applied_motor
+    // to force a spin-up and an index sighting) with the host's motor bit
+    // off. Keyed on g_applied_motor alone, that left ~MOTOR_ON asserted for
+    // good (review of #57).
     if (g_motor_off_at == 0)
       g_motor_off_at = now_ms() + FDC_MOTOR_OFF_DELAY_MS;
     else if (now_ms() >= g_motor_off_at) {

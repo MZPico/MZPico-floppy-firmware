@@ -9,6 +9,7 @@
 #include <cstdlib>
 
 #include "board.hpp"
+#include "board_config.h"
 #include "floppy.hpp"
 #include "testfw.hpp"
 
@@ -1695,6 +1696,668 @@ TEST(field_cut_off_for_good_delivers_no_bytes) {
     CHECK(!(s & wd::BUSY));
     CHECK(!(s & wd::CRC));
   }, ms(60000));
+}
+
+// ---------------- Drive select follows the spindle (#56) ----------------
+// PC drives light their LED from ~DSn. Once the host has turned the motor off
+// and the spindle has stopped, the drive is deselected; the next command
+// selects it again. While deselected, ~TRK00/~WPT float, so STATUS must keep
+// the last sense rather than read the open lines.
+TEST(drive_is_deselected_after_the_motor_stops_and_reselected_on_use) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(0, 1, 512).status), 0);
+    CHECK(!pin_level(PIN_DS0)); // selected (active low)
+    wd::select(0, /*motor=*/false);
+    wait_ms(1000);
+    CHECK(!pin_level(PIN_DS0)); // still inside the motor-off delay
+    wait_ms(3000);
+    CHECK(pin_level(PIN_DS0)); // spindle stopped: released
+    CHECK(!cable().drive[0].motor);
+    // Deselected, ~TRK00 floats high; the held sense still says track 0.
+    wait_ms(50);
+    CHECK_EQ(dbg().at_track0, 1);
+    // The host comes back: motor on, read -- selected again, and it works.
+    wd::select(0);
+    wait_ms(10);
+    CHECK(!pin_level(PIN_DS0));
+    wd::Xfer x = wd::read_sector(0, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 2));
+    // (A seek with the motor bit still off is its own test, below.)
+    wd::seek(5);
+    CHECK(!pin_level(PIN_DS0));
+    CHECK_EQ(cable().drive[0].cyl, 5);
+  }, ms(60000));
+}
+
+// Write protect is read while selected and held across the deselected stretch:
+// a protected disk must still refuse a write issued right after the reselect.
+TEST(write_protect_survives_the_deselected_stretch) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    wait_ms(50);
+    CHECK(dbg().flags & 0x02); // write protect still held
+    wd::select(0);
+    std::vector<uint8_t> d(512, 0xA5);
+    uint8_t st = wd::write_sector(0, 3, d).status;
+    CHECK(st & wd::WPROT);
+    CHECK(cable().drive[0].writes.empty() || cable().drive[0].writes.back().refused_wp);
+  }, ms(60000));
+}
+
+// Found by review of #57.
+TEST(motor_on_landing_in_the_deselect_pass_does_not_latch_not_ready) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(0, 1, 512).status), 0);
+    wd::select(0, /*motor=*/false);
+    wait_ms(2900);
+    int guard = 0;
+    while (!pin_level(PIN_DS0) && guard++ < 400000)
+      wait_us(1);
+    wd::select(0); // motor on, right as the deselect pass is in select()'s delay
+    wait_ms(2000);
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::NOTREADY));
+    wd::Xfer x = wd::read_sector(0, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    wait_ms(500);
+    CHECK(!(wd::status() & wd::NOTREADY));
+  }, ms(60000));
+}
+
+TEST(seek_with_the_motor_bit_off_reselects_and_releases_again) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    uint32_t steps0 = cable().drive[0].steps;
+    wd::seek(5);
+    CHECK_EQ(cable().drive[0].cyl, 5);
+    wait_ms(5000);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(!cable().drive[0].motor);
+  }, ms(60000));
+}
+
+TEST(first_select_of_unit1_with_motor_off_still_stops_the_spindle) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]);
+  insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1, false); // first ever select of unit 1, motor bit off
+    wait_ms(8000);
+    CHECK(!cable().drive[0].motor);
+  }, ms(60000));
+}
+
+TEST(switching_units_while_deselected_selects_nothing_until_used) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  g_disk[1].write_protect = true;
+  insert(0, &g_disk[0]);
+  insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(7);
+    wd::side(1);
+    wd::read_sector(7, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    wd::select(1, false);
+    wait_ms(100);
+    wd::select(2, false);
+    wait_ms(100);
+    CHECK(wd::seek(3) & wd::NOTREADY); // unit 2 does not exist
+    wd::select(1);
+    wd::restore();
+    CHECK_EQ(cable().drive[1].cyl, 0);
+    CHECK_EQ(cable().drive[0].cyl, 7); // unit 0's head has not moved
+    std::vector<uint8_t> d(512, 0xA5);
+    uint8_t w = wd::write_sector(0, 3, d).status;
+    CHECK(w & wd::WPROT);
+    wd::select(0);
+    wd::Xfer x = wd::read_sector(7, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 7, 0, 2));
+  }, ms(60000));
+}
+
+// The held senses themselves: no FDC path samples ~TRK00/~WPT while the drive
+// is deselected today, so this drives FloppyDrive directly.
+TEST(deselected_drive_reports_its_last_senses) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    CHECK(!fdc_host_busy());
+    FloppyDrive *d = fdc_bench_drive();
+    REQUIRE(d != nullptr);
+    CHECK(d->get_track0_sense());
+    CHECK(d->get_write_protect());
+    d->select(false);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(d->get_track0_sense());  // the lines float now; the values are held
+    CHECK(d->get_write_protect());
+    d->select(true);
+    d->goto_track(3);
+    CHECK(!d->get_track0_sense()); // and refreshed once selected again
+    fdc_bench_release();
+    fdc_bench_done();
+  });
+}
+
+// Second review pass of #57: the spun/ready bookkeeping.
+static uint8_t unit_flags(int unit) {
+  int t = 0, tg = 0; uint8_t f = 0;
+  fdc_drive_state(unit, &t, &tg, &f);
+  return f;
+}
+// Control: empty unit 1 first selected with the motor bit ON -> NOT READY.
+TEST(empty_unit1_first_selected_with_motor_on_is_not_ready) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1);
+    wait_ms(2500);
+    CHECK(wd::status() & wd::NOTREADY);
+  }, ms(60000));
+}
+// Empty unit 1 first selected with the motor bit OFF while the spindle line is
+// still asserted (deferred-stop window), then motor on: NOT READY never earned.
+TEST(empty_unit1_first_selected_with_motor_off_then_on_is_not_ready) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1, false);
+    wait_ms(100);
+    wd::select(1);
+    wait_ms(2500);
+    CHECK(wd::status() & wd::NOTREADY);
+    CHECK(!(unit_flags(1) & 0x01)); // g_ready[1] must be false
+  }, ms(60000));
+}
+// Same, via a motor-off seek on a released drive (seek block spins it).
+TEST(unit_first_spun_by_a_motor_off_seek_still_gets_its_catch_up_seek) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]); insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    wd::select(1, false);
+    wd::restore();
+    wd::seek(5);
+    CHECK_EQ(cable().drive[1].cyl, 5);
+    wd::select(1);
+    wait_ms(50);
+    CHECK(unit_flags(1) & 0x02); // spun
+    // Dropped-step catch-up at the next switch back to unit 1.
+    wd::select(0);
+    wait_ms(50);
+    // fold a STEP-IN into unit 1's target while core0 has unit 0 selected
+    out(0xDB, 30); out(0xD8, 0x10); wait_ms(10);
+    out(0xDC, 0x85); out(0xD8, 0x50); out(0xDC, 0x84);
+    wd::wait_ready();
+    wait_ms(50);
+    int t = 0, tg = 0; uint8_t f = 0;
+    fdc_drive_state(1, &t, &tg, &f);
+    wd::select(1);
+    wait_ms(20);
+    wait_ms(1500);
+    fdc_drive_state(1, &t, &tg, &f);
+    CHECK_EQ(cable().drive[1].cyl, tg);
+  }, ms(60000));
+}
+// First select of unit 1 from an operation block (core0 busy), motor bit
+// dropped before the next pass: is ~MOTOR_ON ever released?
+TEST(first_select_from_an_operation_then_motor_off_stops_the_spindle) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]); insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    out(0xDB, 40); out(0xD8, 0x10); wait_ms(10); // core0 busy stepping unit 0
+    wd::select(1);
+    wd::Xfer x = wd::read_address(3000);
+    wd::select(1, false);
+    wait_ms(8000);
+    CHECK(!cable().drive[0].motor);
+    CHECK(pin_level(PIN_DS1));
+  }, ms(60000));
+}
+
+// Third review pass of #57: ~MOTOR_ON is one wire; its state must survive a
+// detour through a unit that does not exist.
+// 40d9789: the "physical line" is the current DRV's belief. A detour through a
+// missing unit (DRV = null) loses it.
+TEST(motor_stops_after_a_detour_through_a_missing_unit) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]); insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1, false); // first select of unit 1, motor bit off, line on
+    wait_ms(100);
+    wd::select(2, false); // no such unit
+    wait_ms(100);
+    wd::select(0, false);
+    wait_ms(8000);
+    CHECK(pin_level(PIN_MOTOR)); // high = off
+    CHECK(pin_level(PIN_DS0));
+    CHECK(pin_level(PIN_DS1));
+  }, ms(60000));
+}
+
+// Pre-existing: a missing unit selected with the motor bit off.
+TEST(motor_stops_while_a_missing_unit_stays_selected) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(2, false);
+    wait_ms(8000);
+    CHECK(pin_level(PIN_MOTOR));
+  }, ms(60000));
+}
+
+// Control for the above two: plain motor off -> stop + release.
+TEST(motor_off_stops_the_spindle_and_releases_the_drive) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(8000);
+    CHECK(pin_level(PIN_MOTOR));
+    CHECK(pin_level(PIN_DS0));
+  }, ms(60000));
+}
+
+// ---------------- Force Interrupt with nothing running (#58) ----------------
+// WD179x: a Force Interrupt received while no command is executing leaves
+// STATUS in the Type I layout (b2 TRK00, b6 WP). One that terminates a
+// running command keeps that command's status -- the ROM's READ MULTIPLE +
+// 0xD0 needs a clean 0x00 afterwards.
+TEST(idle_force_interrupt_shows_type1_status) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(0, 1, 512).status), 0);
+    // Type II layout after the read: b2 is LOST DATA, clear.
+    CHECK(!(wd::status() & 0x04));
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(st & wd::TRK0);        // b2 = TRACK 00 now
+    CHECK(st & wd::WPROT);       // b6 = WRITE PROTECT
+  });
+}
+
+TEST(force_interrupt_ending_read_multiple_still_reads_clean) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    // read_sector(..., multi) ends the command with Force Interrupt once it
+    // has its bytes, while the look-ahead is still BUSY.
+    wd::Xfer x = wd::read_sector(0, 1, 3 * 512, /*multi=*/true, 5000);
+    CHECK_EQ(x.data.size(), 3u * 512u);
+    CHECK_EQ(x.status, 0);
+    CHECK_EQ(wd::status(), 0); // on cylinder 0: a Type I layout would show TRK00
+  });
+}
+
+TEST(force_interrupt_cutting_a_read_short_keeps_type2_status) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512); // measure the spindle
+    out(0xD9, 0);
+    out(0xDA, 5);
+    out(0xD8, 0x80);
+    wait_ms(20); // still searching: BUSY
+    CHECK(wd::status() & wd::BUSY);
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(!(st & wd::TRK0)); // Type II layout kept: b2 is LOST DATA, clear
+  });
+}
+
+// A command that has ended by itself (CRC, RNF) keeps its error through the
+// host's Force Interrupt -- the ROM and CP/M read STATUS only after it. Found
+// by review of #59: BUSY drops here the moment the last byte is taken, so an
+// "idle" test on BUSY alone turned these into 0x00.
+static void crc_disk() {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
+  TrackSpec t;
+  for (int r = 1; r <= 9; ++r) {
+    SectorSpec s;
+    s.c = 3; s.h = 0; s.r = (uint8_t)r; s.n = 2;
+    s.data.assign(512, 0x11);
+    s.bad_data_crc = (r == 6);
+    t.sectors.push_back(s);
+  }
+  g_disk[0].t[3][0] = encode_track(t);
+  insert(0, &g_disk[0]);
+  board_boot();
+}
+TEST(crc_on_the_last_sector_of_a_read_multiple_survives_force_interrupt) {
+  crc_disk();
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(3); wd::side(1);
+    wd::Xfer x = wd::read_sector(3, 5, 2 * 512, true, 5000);
+    std::printf("  multi 5..6 (6 bad): bytes=%zu status after FI=%02x\n", x.data.size(), x.status);
+    CHECK(x.status & wd::CRC);
+  });
+}
+TEST(crc_ending_a_read_multiple_survives_a_later_force_interrupt) {
+  crc_disk();
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(3); wd::side(1);
+    wd::Xfer x = wd::read_sector(3, 5, 4 * 512, true, 5000);
+    std::printf("  multi 5..8 (6 bad): bytes=%zu status at BUSY drop=%02x\n", x.data.size(), x.status);
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    std::printf("    after FI=%02x\n", st);
+    CHECK(st & wd::CRC);
+  });
+}
+TEST(crc_of_a_single_read_survives_force_interrupt) {
+  crc_disk();
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(3); wd::side(1);
+    uint8_t s0 = wd::read_sector(3, 6, 512).status;
+    wd::force_interrupt(8);
+    uint8_t st = wd::status();
+    std::printf("  single CRC: before FI=%02x after FI=%02x\n", s0, st);
+    CHECK(st & wd::CRC);
+  });
+}
+TEST(rnf_survives_force_interrupt) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(7); wd::side(1);
+    uint8_t s0 = wd::read_sector(7, 12, 512, true, 5000).status;
+    wd::force_interrupt(8);
+    uint8_t st = wd::status();
+    std::printf("  RNF: before FI=%02x after FI=%02x\n", s0, st);
+    CHECK(st & wd::RNF);
+  });
+}
+TEST(write_rnf_survives_force_interrupt) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(8); wd::side(1);
+    wd::Xfer w = wd::write_sector(9, 3, std::vector<uint8_t>(512, 0x77));
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    std::printf("  write RNF: before FI=%02x after FI=%02x\n", w.status, st);
+    CHECK(st & wd::RNF);
+  });
+}
+TEST(write_refused_by_wp_then_force_interrupt_shows_wp) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(8); wd::side(1);
+    wd::read_sector(8, 1, 512);
+    wd::Xfer w = wd::write_sector(8, 3, std::vector<uint8_t>(512, 0x77));
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    std::printf("  write WP: before FI=%02x after FI=%02x\n", w.status, st);
+    CHECK(st & wd::WPROT);
+  });
+}
+TEST(idle_force_interrupt_after_a_clean_read_shows_no_stale_seek_error) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(10); wait_ms(100);
+    cable().drive[0].cyl = 12;
+    wd::side(1);
+    uint8_t s1 = wd::seek(10, true);
+    wait_ms(200);
+    wd::Xfer x = wd::read_sector(10, 5, 512);
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    std::printf("  stale seekerr: seek=%02x read=%02x after FI=%02x\n", s1, x.status, st);
+    CHECK(!(st & 0x10));
+  });
+}
+TEST(force_interrupt_right_after_the_last_byte_keeps_the_read_status) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    out(0xD9, 0); out(0xDA, 1); wd::command(0x80);
+    int n = 0;
+    while (n < 512) { if (wd::status() & wd::DRQ) { in(0xDB); ++n; } }
+    wd::force_interrupt(8);   // no STATUS poll between last byte and FI
+    uint8_t st = wd::status();
+    std::printf("  single read cyl0, FI right after last byte: %02x\n", st);
+    CHECK_EQ(st, 0);
+  });
+}
+TEST(read_address_then_force_interrupt) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::Xfer x = wd::read_address();
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    std::printf("  read address: before=%02x after FI=%02x\n", x.status, st);
+    CHECK(!(st & (wd::BUSY | wd::CRC | wd::RNF)));
+  });
+}
+
+// ======================= re-review of #59 (repro tests) =======================
+void sim_fire_gpio_irq(void);
+namespace sim { void pin_set_input(int pin, bool level); }
+
+// R1. CP/M BIOS write path (local image, routine at F9F8): seek (no step when
+// already there), Force Interrupt, wait !BUSY, read STATUS and test bit 6
+// (write protect); if set -> retry up to 5x WITHOUT recalibrating. Else WRITE,
+// and on a bad status recalibrate (STEP+FI, READ ADDRESS) and retry.
+static bool cpm_bios_write(uint8_t trk, uint8_t sec, int *precheck_wp, int *cmd_refused) {
+  for (int tries = 0; tries < 5; ++tries) {
+    wd::force_interrupt();
+    wd::wait_ready();
+    uint8_t st = wd::status();
+    if (st & wd::WPROT) { ++*precheck_wp; continue; }
+    wd::Xfer w = wd::write_sector(trk, sec, std::vector<uint8_t>(512, 0x5A));
+    wait_ms(1);
+    if (wd::status() == 0) return true;
+    ++*cmd_refused;
+    // recalibrate: STEP IN + FI, READ ADDRESS, Track := id; then step back
+    wd::command(0x58); wd::force_interrupt(); wd::wait_ready();
+    wd::Xfer a = wd::read_address();
+    wd::wait_ready();
+    if (a.data.size() >= 1) out(0xD9, a.data[0]);
+    wd::command(0x78); wd::force_interrupt(); wd::wait_ready();
+  }
+  return false;
+}
+TEST(cpm_write_precheck_sees_live_write_protect_after_a_disk_swap) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(2); wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(2, 1, 512).status), 0);
+    g_disk[0].write_protect = false;       // user opens the tab, same disk back in
+    CHECK_EQ(error_bits(wd::read_sector(2, 1, 512).status), 0); // directory read, no step
+    int pre = 0, ref = 0;
+    bool ok = cpm_bios_write(2, 3, &pre, &ref);
+    std::printf("  CP/M write after WP removed: ok=%d precheck_wp=%d cmd_refused=%d\n", ok, pre, ref);
+    CHECK(ok);
+  });
+}
+
+// R2. Clean single read on cylinder 0, host polls until !BUSY (as CP/M's
+// read does), then an idle Force Interrupt, then STATUS.
+TEST(idle_force_interrupt_on_cylinder_0_reads_trk00_only) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::Xfer x = wd::read_sector(0, 1, 512);
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    CHECK_EQ(x.status, 0);
+    CHECK_EQ(st, wd::TRK0); // Type I view: track 0, nothing else
+    wd::Xfer a = wd::read_address();
+    wd::force_interrupt();
+    CHECK_EQ(a.status, 0);
+    CHECK_EQ(wd::status(), wd::TRK0);
+  });
+}
+
+// R3. Bus RESET with the Type I-after-FI view active.
+TEST(bus_reset_clears_the_status_register) {
+  crc_disk();
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(3); wd::side(1);
+    uint8_t s0 = wd::read_sector(3, 6, 512).status;
+    wd::force_interrupt();
+    uint8_t s1 = wd::status();
+    sim::pin_set_input(29, true);  sim_fire_gpio_irq();
+    wait_us(65);
+    sim::pin_set_input(29, false); sim_fire_gpio_irq();
+    uint8_t s2 = wd::status();
+    std::printf("  read=%02x after FI=%02x after bus RESET=%02x\n", s0, s1, s2);
+    CHECK(!(s2 & wd::CRC));
+  });
+}
+
+// R4. LOST DATA / refusal by the wren switch: Type II bits with no Type I twin.
+TEST(lost_data_and_refused_write_bits_change_meaning_in_the_type1_view) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(5); wd::side(1);
+    wd::read_sector(5, 1, 512);
+    out(0xD9, 5); out(0xDA, 2); wd::command(0x80);
+    uint8_t s0 = wd::wait_ready();           // never take a byte: LOST DATA
+    wd::force_interrupt();
+    uint8_t s1 = wd::status();
+    CHECK(s0 & wd::LOST);   // the host saw LOST DATA in the final status...
+    CHECK(!(s1 & wd::TRK0)); // ...and bit 2 is TRK00 afterwards (cylinder 5)
+    fdc_set_write_enable(false);
+    wd::Xfer w = wd::write_sector(5, 3, std::vector<uint8_t>(512, 1));
+    wd::force_interrupt();
+    CHECK(w.status & wd::WPROT);       // refused: reported once...
+    CHECK(!(wd::status() & wd::WPROT)); // ...then bit 6 is the drive's own WP
+    fdc_set_write_enable(true);
+  });
+}
+
+// R5 (not this PR; Disk BASIC WRITE MULTIPLE ends with FI straight after the
+// last byte of the last sector, A39FA).
+TEST(write_multiple_cut_by_force_interrupt_after_the_last_byte_is_all_or_nothing) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::seek(6); wd::side(1);
+    wd::read_sector(6, 1, 512);
+    out(0xD9, 6); out(0xDA, 4); wd::command(0xB4);
+    int n = 0;
+    while (n < 512) { if (wd::status() & wd::DRQ) { out(0xDB, 0xC3); ++n; } }
+    uint8_t sp = wd::status();
+    wd::force_interrupt();
+    uint8_t st = wd::wait_ready();
+    wait_ms(500);
+    wd::Xfer r = wd::read_sector(6, 4, 512);
+    int same = 0; for (uint8_t b : r.data) same += (b == 0xC3);
+    (void)sp;
+    CHECK_EQ(st, 0);
+    // Whether the sector lands depends on whether core0 had begun the splice
+    // when the Force Interrupt arrived (on a WD this sequence cuts the write
+    // short, so no host relies on it). What must hold: all or nothing, with
+    // valid CRC either way -- never a half-written sector.
+    CHECK_EQ(error_bits(r.status), 0);
+    CHECK(same == 512 || matches_pattern(r.data, 6, 0, 4));
+  });
+}
+
+// R6. A: write-protected, B: not. Read A, select B (no step), CP/M pre-check.
+TEST(write_protect_precheck_follows_the_selected_drive) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]);
+  insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(1); wd::restore(); wd::seek(2); wd::side(1);
+    wd::read_sector(2, 1, 512);
+    wd::select(0); wd::restore(); wd::seek(2); wd::side(1);
+    for (int us : {0, 50, 100, 300, 1000}) {
+      wd::select(0);
+      wait_ms(5);
+      CHECK_EQ(error_bits(wd::read_sector(2, 1, 512).status), 0);
+      wd::select(1);
+      out(0xD9, 2);
+      if (us) wait_us((uint32_t)us);
+      wd::force_interrupt();
+      uint8_t st = wd::status();
+      CHECK(!(st & wd::WPROT)); // B is writable: A's sense must not show
+    }
+  });
 }
 
 // #25: the write block snapshots the command generation before the drive
