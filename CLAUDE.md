@@ -475,9 +475,13 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     with it, the DD boot ROM must not see it. A host WRITE TRACK trusts the
     declaration outright and falls back to the image's sector census only
     when none exists. DENSEL is driven best-effort (the ALPS DF354H090F and
-    Mitsumi D359M3 both sense HD from the media hole and ignore pin 2, which
-    is also why a DD boot track on HD media is marginal on these drives: HD
-    disks are data disks here, not boot disks). Buffers are HD-sized.
+    Mitsumi D359M3 both sense HD from the media hole and ignore pin 2). **A DD
+    track on HD media is unreadable on these drives** (#41, measured): their
+    HD read channel puts spurious pulses inside ~2 % of the 8 µs intervals,
+    so nearly every sector of FORMAT4's DD boot track fails its CRC. The
+    spurious pulses fall on the bit grid, so no decoder can tell them from
+    data, and a real WD fails the same way: HD disks are data disks here, not
+    boot disks. See docs/hardware-notes.md §2c. Buffers are HD-sized.
     **Verified on hardware:** HD `FORMAT4` (all 160 tracks), HD reads (CP/M
     runs from B:), HD single-drive host writes (`SAVE` to B: 143/143), bench
     `wrsoak`/`wrverify` byte-exact at HD.
