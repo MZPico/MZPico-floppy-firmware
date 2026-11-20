@@ -811,6 +811,7 @@ int main(void) {
     puts("WRITES NEAR THE HUB. Y=GO? ");
     if (getkey() != 'Y') {
       puts("CANCELLED\n");
+      declare_density(0); /* as on the normal exit, below */
       return 0;
     }
   }
