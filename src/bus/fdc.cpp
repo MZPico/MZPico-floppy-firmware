@@ -3278,7 +3278,19 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
 const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
 
 uint32_t fdc_bench_capture_ms(uint8_t track) {
-  return (fdc_read_window_us(track) + 999u) / 1000u;
+  // The margin is sized for DD whatever the host has declared: a bench scan
+  // names its own density, and a DD-sized sector span covers HD too. (The
+  // live read window keeps following the declaration, see
+  // fdc_sector_span_us.)
+  uint32_t sz = fdc_sector_size_for(track);
+  if (sz < 512)
+    sz = 512;
+  uint32_t span = (uint32_t)((float)(sz + 128) * 16.0f * FDC_DD_BIT_US);
+  uint32_t rev = g_rev_us[fdc_cur_idx()];
+  uint32_t w = (rev ? rev : FDC_REV_US_DEFAULT) + span;
+  if (w > FDC_READ_CAPTURE_TIMEOUT_US)
+    w = FDC_READ_CAPTURE_TIMEOUT_US;
+  return (w + 999u) / 1000u;
 }
 
 // True while the MZ-800 has a command in flight. Bench commands (USB) must

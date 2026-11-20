@@ -519,10 +519,12 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
   // Refills stop at the end of the buffer: past it greaseunpack() returns
   // 0xffff, and queueing those wrote a few long garbage pulses after the
   // image (#25).
+  unsigned last_ticks = 0; // length of the newest pulse queued, in 24 MHz ticks
   while (pulses != pulse_end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
     unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
     if (value == 0xffff && pulses == pulse_end)
       break; // a truncated greaseweazle record, not a pulse
+    last_ticks = value;
     value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
     pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
   }
@@ -540,6 +542,7 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
       unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
       if (value == 0xffff && pulses == pulse_end)
         break;
+      last_ticks = value;
       value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
       pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
     }
@@ -550,7 +553,7 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
     // would drop whatever is still queued -- the last bytes of the image --
     // so let the FIFO drain and the last pulse reach the head first, as the
     // splice does. Never past the index, though: that is the start of the
-    // track (#25).
+    // track, so both waits end at its falling edge (#25).
     while (!pio_sm_is_tx_fifo_empty(g_writer.pio, g_writer.sm)) {
       bool index_state = gpio_get(index_pin);
       if (old_index_state && !index_state) {
@@ -559,8 +562,18 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
       }
       old_index_state = index_state;
     }
-    if (!at_index)
-      busy_wait_us_32(32); // the pulse in the OSR (4T at DD is 8 us)
+    // FIFO empty means the last pulse is in the OSR, not that it is out: it
+    // still runs for its own length (the output clock is 24 MHz, so ticks/24
+    // is us; a greaseweazle interval can be far longer than MFM's 8 us).
+    // Wait that long, plus a margin for the pulse before it finishing.
+    uint32_t tail_us = last_ticks / 24u + 16u;
+    uint32_t t_tail = time_us_32();
+    while (!at_index && time_us_32() - t_tail < tail_us) {
+      bool index_state = gpio_get(index_pin);
+      if (old_index_state && !index_state)
+        at_index = true;
+      old_index_state = index_state;
+    }
   }
   restore_interrupts(irq);
 

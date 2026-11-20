@@ -275,7 +275,8 @@ def do_streamscan(s, track, side, dens, capture_ms):
         return
     ns, nflux = hdr[2], int.from_bytes(hdr[3:7], "little")
     print(f"[streaming] track {track} side {side} dens {dens} "
-          f"capture_ms {capture_ms}: {ns} sectors, {nflux} flux transitions\n")
+          f"capture_ms {capture_ms if capture_ms else 'auto (rev + sector span)'}: "
+          f"{ns} sectors, {nflux} flux transitions\n")
     good = print_sectors(s, ns)
     print(f"\n{good}/{ns} sectors fully valid (ID+data CRC).")
 
