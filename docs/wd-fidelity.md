@@ -244,8 +244,15 @@ WriteFault · b4 RecordNotFound · b3 CRCError · b2 LostData · b1 DRQ · b0 Bu
     afterwards.
   - In the Type I view after such a Force Interrupt, the **CRC and RNF bits
     stay latched** from the data command (bit 4 is that RNF, not an older
-    Seek Error), as in the chip's status register. An error is never erased
-    by the `0xD0` that follows it.
+    Seek Error), as in the chip's status register: those two are never erased
+    by the `0xD0` that follows them. The bits that have no Type I twin do
+    change meaning, as on a WD: bit 2 is TRK00 (not LOST DATA), bit 6 is the
+    drive's Write Protect (not a refused write), bit 5 (deleted mark) is gone.
+    The host has read the final status by then.
+  - TRK00 and Write Protect are **live** in that view: the disk task
+    refreshes them on every idle pass while the drive is selected. CP/M's
+    BIOS tests Write Protect with an idle `0xD0` before each write, so a
+    value cached from before a disk swap must not be shown there.
 
 ### ID track compare (all Type II, Verify, and the write splice)
 

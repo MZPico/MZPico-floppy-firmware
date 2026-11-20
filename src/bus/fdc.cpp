@@ -935,6 +935,17 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   //    we know of issues its own RESTORE at startup anyway.
   S.sector = 1;
   S.command = 0;
+  // ...and it clears the status register: no command, so the Type I layout,
+  // with nothing latched from before the reset.
+  S.type2 = false;
+  S.fi_type1 = false;
+  S.t2_final_seen = false;
+  S.err_crc = false;
+  S.err_rnf = false;
+  S.lost_data = false;
+  S.rec_deleted = false;
+  S.err_write_protect = false;
+  S.seek_error = false;
 
   fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
 }
@@ -3567,6 +3578,21 @@ void fdc_disk_task(void) {
   }
   if (!DRV)
     return; // selected unit never resolved (only reachable before the first one)
+
+  // Between operations, keep the Type I status bits live, as a WD's are:
+  // ~TRK00 and ~WPT are the drive's own lines. They used to be refreshed only
+  // at a select, at the end of a seek and inside a write -- which was enough
+  // while a host could only see them right after a Type I. An idle Force
+  // Interrupt now shows them after a data command too (#58), and CP/M's BIOS
+  // tests Write Protect exactly that way before every write: a stale bit from
+  // before a disk swap failed the write five times with no recovery, since
+  // nothing on that path moves the head (review of #59). Only while the
+  // drive is selected -- released, its lines float.
+  if (g_applied_select && !S.reading && !S.writing && S.trk_op == 0 &&
+      S.op_done == S.op_seq) {
+    S.at_track0 = DRV->get_track0_sense();
+    fdc_note_wp(DRV->get_write_protect());
+  }
 
 
 
