@@ -1971,3 +1971,52 @@ TEST(first_select_from_an_operation_then_motor_off_stops_the_spindle) {
     CHECK(pin_level(PIN_DS1));
   }, ms(60000));
 }
+
+// Third review pass of #57: ~MOTOR_ON is one wire; its state must survive a
+// detour through a unit that does not exist.
+// 40d9789: the "physical line" is the current DRV's belief. A detour through a
+// missing unit (DRV = null) loses it.
+TEST(motor_stops_after_a_detour_through_a_missing_unit) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]); insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1, false); // first select of unit 1, motor bit off, line on
+    wait_ms(100);
+    wd::select(2, false); // no such unit
+    wait_ms(100);
+    wd::select(0, false);
+    wait_ms(8000);
+    CHECK(pin_level(PIN_MOTOR)); // high = off
+    CHECK(pin_level(PIN_DS0));
+    CHECK(pin_level(PIN_DS1));
+  }, ms(60000));
+}
+
+// Pre-existing: a missing unit selected with the motor bit off.
+TEST(motor_stops_while_a_missing_unit_stays_selected) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(2, false);
+    wait_ms(8000);
+    CHECK(pin_level(PIN_MOTOR));
+  }, ms(60000));
+}
+
+// Control for the above two: plain motor off -> stop + release.
+TEST(motor_off_stops_the_spindle_and_releases_the_drive) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(8000);
+    CHECK(pin_level(PIN_MOTOR));
+    CHECK(pin_level(PIN_DS0));
+  }, ms(60000));
+}

@@ -1038,10 +1038,14 @@ static bool fdc_apply_drive_select(void) {
   // and a stale belief makes side()/spin_motor() short-circuit on a line that
   // is not where the new drive thinks it is. See adopt_shared_lines().
   int side = g_applied_side;
-  bool motor = g_applied_motor;
+  // The motor state handed over is the LINE's, not g_applied_motor (which a
+  // first select deliberately forgets) and not prev's belief: coming back
+  // from a missing unit there is no prev at all, and a stale "off" made the
+  // new drive believe a running spindle stopped -- released, with ~MOTOR_ON
+  // asserted for good (third review of #57).
+  bool motor = FloppyDrive::motor_line_on();
   if (prev) {
     side = prev->get_side();
-    motor = prev->motor_is_spinning();
     prev->select(false);
   }
   next->adopt_shared_lines(side, motor);
@@ -3315,7 +3319,7 @@ void fdc_bench_done(void) {
   g_rc_active = false;
   g_flux_n = 0;
   g_flux_complete = false;
-  g_applied_motor = DRV ? DRV->motor_is_spinning() : false;
+  g_applied_motor = FloppyDrive::motor_line_on();
   g_bench_head_dirty = true;
 }
 
@@ -3443,6 +3447,30 @@ static void fdc_apply_side(void) {
   g_flux_complete = false;
 }
 
+// The deferred motor stop for passes that end with no drive resolved (the
+// host has unit 2/3 selected): the motor block further down is never reached
+// then, and ~MOTOR_ON is one wire for every drive, so the spindles ran for as
+// long as the host left that unit selected. Any drive object can drop the
+// line.
+static void fdc_stop_motor_without_drive(bool motor_on) {
+  if (motor_on || !FloppyDrive::motor_line_on() || g_ndrives < 1 || !g_drives[0]) {
+    if (motor_on)
+      g_motor_off_at = 0;
+    return;
+  }
+  if (g_motor_off_at == 0) {
+    g_motor_off_at = now_ms() + FDC_MOTOR_OFF_DELAY_MS;
+  } else if (now_ms() >= g_motor_off_at) {
+    g_drives[0]->spin_motor(false);
+    g_applied_motor = false;
+    g_motor_off_at = 0;
+    if (g_stream_active) {
+      rp2040_flux_capture_stop();
+      g_stream_active = false;
+    }
+  }
+}
+
 // The host has selected a unit that does not exist while work is still queued
 // for core0 (queued before the switch). No drive will ever run it, so end it
 // the way a WD ends a command on a drive that is not ready: BUSY drops, and the
@@ -3531,7 +3559,8 @@ void fdc_disk_task(void) {
   // is gated by the select, so the index wait timed out and NOT READY stuck
   // (review of #57).
   bool motor_on = S.motor_on;
-  if (idle && DRV && !motor_on && !g_applied_motor && !DRV->motor_is_spinning()) {
+  if (idle && DRV && !motor_on && !g_applied_motor &&
+      !FloppyDrive::motor_line_on()) {
     // Nothing to do and the spindle has stopped (the deferred motor stop
     // below has run): release ~DSn. PC drives light their LED from drive
     // select, not from the motor, so a select held for good kept the LED on
@@ -3546,11 +3575,14 @@ void fdc_disk_task(void) {
   } else if (idle || !DRV) {
     if (!fdc_apply_drive_select()) {
       fdc_end_for_missing_unit();
+      fdc_stop_motor_without_drive(motor_on);
       return; // no such unit; STATUS already reports NOT READY
     }
   }
-  if (!DRV)
+  if (!DRV) {
+    fdc_stop_motor_without_drive(motor_on);
     return; // selected unit never resolved (only reachable before the first one)
+  }
 
 
 
@@ -3587,7 +3619,7 @@ void fdc_disk_task(void) {
       g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
       g_applied_motor = true;
     }
-  } else if (g_applied_motor || DRV->motor_is_spinning()) {
+  } else if (g_applied_motor || FloppyDrive::motor_line_on()) {
     // ...or the line is physically on although the bookkeeping forgot it: a
     // first select of a unit (fdc_apply_drive_select clears g_applied_motor
     // to force a spin-up and an index sighting) with the host's motor bit
