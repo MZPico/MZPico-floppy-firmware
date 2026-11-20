@@ -1060,10 +1060,14 @@ static bool fdc_apply_drive_select(void) {
   // and a stale belief makes side()/spin_motor() short-circuit on a line that
   // is not where the new drive thinks it is. See adopt_shared_lines().
   int side = g_applied_side;
-  bool motor = g_applied_motor;
+  // The motor state handed over is the LINE's, not g_applied_motor (which a
+  // first select deliberately forgets) and not prev's belief: coming back
+  // from a missing unit there is no prev at all, and a stale "off" made the
+  // new drive believe a running spindle stopped -- released, with ~MOTOR_ON
+  // asserted for good (third review of #57).
+  bool motor = FloppyDrive::motor_line_on();
   if (prev) {
     side = prev->get_side();
-    motor = prev->motor_is_spinning();
     prev->select(false);
   }
   next->adopt_shared_lines(side, motor);
@@ -1089,6 +1093,9 @@ static bool fdc_apply_drive_select(void) {
   // is what stops a host that alternates drives paying the ~300 ms spin-up on
   // each swap. See the spin-up quirk: this drive will not step to TRK00
   // reliably until its disk is actually turning.
+  // (Forgetting the applied motor while the line is physically on is why
+  // the disk task's deferred stop keys on the line itself, not only on
+  // g_applied_motor: see the motor block.)
   if (!g_spun[want]) {
     g_spun[want] = true;
     g_applied_motor = false;
@@ -1110,7 +1117,11 @@ static bool fdc_apply_drive_select(void) {
   // the next Type I recalibrates anyway, and stepping here would do it before
   // the spindle is up -- which this drive will not tolerate (see the spin-up
   // quirk in fdc_disk_task).
-  if (prev && g_applied_motor && next->track() >= 0) {
+  // Not when the SAME drive is merely being selected again (after the idle
+  // release, #56, or a bench command): its head only differs from its target
+  // if the bench moved it, and that is fdc_bench_restore_head()'s job, at
+  // the start of the next operation -- idle passes must not move the head.
+  if (prev && prev != next && g_applied_motor && next->track() >= 0) {
     // Apply the FDC step timing before moving: these are per-instance and this
     // drive is still on the flux-capture defaults (12 ms/step), which would
     // turn a full-stroke catch-up into a ~1 s stall inside the disk task.
@@ -3366,7 +3377,7 @@ void fdc_bench_done(void) {
   g_rc_active = false;
   g_flux_n = 0;
   g_flux_complete = false;
-  g_applied_motor = DRV ? DRV->motor_is_spinning() : false;
+  g_applied_motor = FloppyDrive::motor_line_on();
   g_bench_head_dirty = true;
 }
 
@@ -3494,6 +3505,30 @@ static void fdc_apply_side(void) {
   g_flux_complete = false;
 }
 
+// The deferred motor stop for passes that end with no drive resolved (the
+// host has unit 2/3 selected): the motor block further down is never reached
+// then, and ~MOTOR_ON is one wire for every drive, so the spindles ran for as
+// long as the host left that unit selected. Any drive object can drop the
+// line.
+static void fdc_stop_motor_without_drive(bool motor_on) {
+  if (motor_on || !FloppyDrive::motor_line_on() || g_ndrives < 1 || !g_drives[0]) {
+    if (motor_on)
+      g_motor_off_at = 0;
+    return;
+  }
+  if (g_motor_off_at == 0) {
+    g_motor_off_at = now_ms() + FDC_MOTOR_OFF_DELAY_MS;
+  } else if (now_ms() >= g_motor_off_at) {
+    g_drives[0]->spin_motor(false);
+    g_applied_motor = false;
+    g_motor_off_at = 0;
+    if (g_stream_active) {
+      rp2040_flux_capture_stop();
+      g_stream_active = false;
+    }
+  }
+}
+
 // The host has selected a unit that does not exist while work is still queued
 // for core0 (queued before the switch). No drive will ever run it, so end it
 // the way a WD ends a command on a drive that is not ready: BUSY drops, and the
@@ -3575,15 +3610,37 @@ void fdc_disk_task(void) {
   // used to wedge the controller for good once a host had named unit 2/3 with
   // a command pending -- every later command BUSY forever, even after it
   // re-selected drive 0 (issue #8).
-  if ((!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) ||
-      !DRV) {
+  bool idle = !S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq;
+  // ONE read of the host's motor bit for the whole pass. The deselect decision
+  // here and the spin-up below must agree: read twice, a motor-on landing
+  // between the two spun up a drive this pass had just deselected -- ~INDEX
+  // is gated by the select, so the index wait timed out and NOT READY stuck
+  // (review of #57).
+  bool motor_on = S.motor_on;
+  if (idle && DRV && !motor_on && !g_applied_motor &&
+      !FloppyDrive::motor_line_on()) {
+    // Nothing to do and the spindle has stopped (the deferred motor stop
+    // below has run): release ~DSn. PC drives light their LED from drive
+    // select, not from the motor, so a select held for good kept the LED on
+    // for as long as the MZ-800 was attached (#56). The next operation, or the
+    // host turning the motor on, selects the drive again through
+    // fdc_apply_drive_select(). While deselected the drive's ~TRK00/~WPT
+    // float; FloppyDrive reports the last values it read.
+    if (g_applied_select) {
+      DRV->select(false);
+      g_applied_select = false;
+    }
+  } else if (idle || !DRV) {
     if (!fdc_apply_drive_select()) {
       fdc_end_for_missing_unit();
+      fdc_stop_motor_without_drive(motor_on);
       return; // no such unit; STATUS already reports NOT READY
     }
   }
-  if (!DRV)
+  if (!DRV) {
+    fdc_stop_motor_without_drive(motor_on);
     return; // selected unit never resolved (only reachable before the first one)
+  }
 
   // Between operations, keep the Type I status bits live, as a WD's are:
   // ~TRK00 and ~WPT are the drive's own lines. They used to be refreshed only
@@ -3619,16 +3676,28 @@ void fdc_disk_task(void) {
   }
   // Motor with a spin-down delay: spin up on request (spin_motor waits for
   // index = disk really turning), but defer stop so retries keep the spin-up.
-  if (S.motor_on) {
+  if (motor_on) {
     g_motor_off_at = 0; // cancel any pending stop
     if (!g_applied_motor) {
+      // Never spin up a deselected drive (see `motor_on` above): with an
+      // operation pending the idle gate did not run, and the drive may still
+      // be released from the last motor stop.
+      if (!g_applied_select && (!fdc_apply_drive_select() || !DRV)) {
+        fdc_end_for_missing_unit();
+        return;
+      }
       // The return value is the index sighting -- i.e. "is a disk actually
       // turning in this unit". Keep it: it is what separates an empty or absent
       // drive from a working one, and STATUS has no other source for NOT READY.
       g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
       g_applied_motor = true;
     }
-  } else if (g_applied_motor) {
+  } else if (g_applied_motor || FloppyDrive::motor_line_on()) {
+    // ...or the line is physically on although the bookkeeping forgot it: a
+    // first select of a unit (fdc_apply_drive_select clears g_applied_motor
+    // to force a spin-up and an index sighting) with the host's motor bit
+    // off. Keyed on g_applied_motor alone, that left ~MOTOR_ON asserted for
+    // good (review of #57).
     if (g_motor_off_at == 0)
       g_motor_off_at = now_ms() + FDC_MOTOR_OFF_DELAY_MS;
     else if (now_ms() >= g_motor_off_at) {

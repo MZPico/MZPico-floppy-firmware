@@ -75,6 +75,14 @@ period and sector-size cache. `~HDSEL` and `~MOTOR_ON` are single wires shared
 by both drives (the motor line reaches every drive on the cable, so it is not
 gated by select).
 
+`~DSn` is released once the host has turned the motor off and the deferred
+motor stop (3 s) has run, and nothing is pending. PC drives light their
+activity LED from drive select, so a select that was never released kept the
+LED on for as long as the machine was attached (#56). The next command, or the
+host turning the motor on, selects the drive again. While deselected, the
+drive's `~TRK00`/`~WPT` float, so `FloppyDrive` reports the values it last
+read while selected.
+
 ## Density (DD / HD)
 
 **The `0xDE` port is the host's density declaration, and its polarity is
