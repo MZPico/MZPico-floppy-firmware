@@ -27,7 +27,7 @@
  */
 #include <stdint.h>
 
-#define VERSION "1.4"
+#define VERSION "1.5"
 
 /* ---- WD179x ---- */
 #define P_CMD 0xD8
@@ -811,6 +811,7 @@ int main(void) {
     puts("WRITES NEAR THE HUB. Y=GO? ");
     if (getkey() != 'Y') {
       puts("CANCELLED\n");
+      declare_density(0); /* as on the normal exit, below */
       return 0;
     }
   }
@@ -820,6 +821,11 @@ int main(void) {
     write_tests();
   else if (k != '1')
     puts("WRITE TESTS SKIPPED (READ FAILED)\n");
+  /* Leave the controller as power-up found it: DD. The boot ROM and Disk
+   * BASIC never write DEh, so an HD declaration left behind by an HD run
+   * outlives the program and the next boot reads its DD disk at HD
+   * (FD:Loading error until a bus RESET clears it). */
+  declare_density(0);
   wout(P_DRV, 0); /* motor off */
   puts("FDTEST RESULT: ");
   puts(n_fail ? "FAIL" : "PASS");
