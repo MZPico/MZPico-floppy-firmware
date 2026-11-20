@@ -2795,3 +2795,320 @@ TEST(seek_and_write_sector_during_a_track_write_do_not_format_the_new_cylinder) 
     CHECK(matches_pattern(r.data, 6, 0, 4));
   });
 }
+
+// ======== Integration review: #57 x #59 x #60 combined scenarios ========
+namespace {
+void integ_release_drive0() {
+  wd::select(0);
+  wd::restore();
+  wd::side(1);
+  CHECK_EQ(error_bits(wd::read_sector(0, 1, 512).status), 0);
+  wd::select(0, /*motor=*/false);
+  wait_ms(4000);
+  CHECK(pin_level(PIN_DS0)); // released
+  CHECK(!cable().drive[0].motor);
+}
+size_t integ_feed(uint8_t cmd, const std::vector<uint8_t> &d, uint32_t budget_ms) {
+  out(0xD8, cmd);
+  size_t fed = 0;
+  for (uint64_t end = now() + ms(budget_ms); now() < end && fed < d.size();) {
+    if (wd::status() & wd::DRQ)
+      out(0xDB, d[fed++]);
+  }
+  return fed;
+}
+} // namespace
+
+// (a) released -> motor-on + READ at once -> Force Interrupt during the
+// spin-up -> new READ.
+TEST(integ_a_read_abandoned_during_spinup_of_a_released_drive) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    integ_release_drive0();
+    wd::select(0);
+    out(0xD9, 0);
+    out(0xDA, 2);
+    out(0xD8, 0x80);
+    wait_ms(100); // inside spin_motor()'s 300 ms
+    wd::force_interrupt();
+    CHECK(!(wd::status() & wd::BUSY));
+    wd::Xfer x = wd::read_sector(0, 3, 512);
+    CHECK(!x.timed_out);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 3));
+    CHECK(!pin_level(PIN_DS0));
+    CHECK(cable().drive[0].motor);
+    // idle FI after the status was read: Type I view, TRK00 set, no errors
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    CHECK(st & wd::TRK0);
+    CHECK(!(st & (wd::BUSY | wd::CRC | wd::SEEKERR | wd::NOTREADY)));
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(!cable().drive[0].motor);
+  });
+}
+
+// (a2) the same, Force Interrupt at many offsets through spin-up and capture.
+TEST(integ_a2_force_interrupt_swept_through_spinup_of_a_released_drive) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    integ_release_drive0();
+    for (int off = 0; off < 800; off += 37) {
+      wd::select(0);
+      out(0xD9, 0);
+      out(0xDA, 2);
+      out(0xD8, 0x80);
+      wait_ms(off);
+      wd::force_interrupt();
+      wait_us(50);
+      CHECK(!(wd::status() & wd::BUSY));
+      wd::Xfer x = wd::read_sector(0, 4, 512);
+      CHECK(!x.timed_out);
+      CHECK_EQ(error_bits(x.status), 0);
+      CHECK(matches_pattern(x.data, 0, 0, 4));
+      CHECK(!pin_level(PIN_DS0));
+      wd::select(0, false);
+      wait_ms(4000);
+      CHECK(pin_level(PIN_DS0));
+      CHECK(!cable().drive[0].motor);
+    }
+  }, ms(200000));
+}
+
+// (b) WRITE SECTOR armed while released (motor bit off), then Force Interrupt.
+TEST(integ_b_write_armed_on_released_drive_then_force_interrupt) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    integ_release_drive0();
+    size_t w0 = cable().drive[0].writes.size();
+    out(0xD9, 0);
+    out(0xDA, 3);
+    CHECK_EQ(integ_feed(0xA0, std::vector<uint8_t>(512, 0x5A), 3000), 512u);
+    wd::force_interrupt();
+    CHECK(!(wd::status() & wd::BUSY));
+    wait_ms(1500);
+    CHECK(!(wd::status() & wd::BUSY));
+    CHECK_EQ(cable().drive[0].writes.size(), w0);
+    wait_ms(5000);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(!cable().drive[0].motor);
+    wd::select(0);
+    wd::Xfer x = wd::read_sector(0, 3, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 3));
+  });
+}
+
+// (b2) half-fed write on a released drive, Force Interrupt, released again.
+TEST(integ_b2_half_fed_write_on_released_drive_then_force_interrupt) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    integ_release_drive0();
+    size_t w0 = cable().drive[0].writes.size();
+    out(0xD9, 0);
+    out(0xDA, 3);
+    CHECK_EQ(integ_feed(0xA0, std::vector<uint8_t>(100, 0x5A), 3000), 100u);
+    wd::force_interrupt();
+    wait_ms(100);
+    CHECK(!(wd::status() & wd::BUSY));
+    wait_ms(5000);
+    CHECK_EQ(cable().drive[0].writes.size(), w0);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(!cable().drive[0].motor);
+  });
+}
+
+// (b3) write with the motor bit off on a released drive, left to run.
+TEST(integ_b3_write_with_motor_bit_off_on_released_drive_terminates) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    integ_release_drive0();
+    wd::Xfer w = wd::write_sector(0, 3, std::vector<uint8_t>(512, 0x5A), false, 8000);
+    CHECK(!w.timed_out);
+    std::printf("    b3: status %02X writes %zu\n", w.status, cable().drive[0].writes.size());
+    wait_ms(6000);
+    CHECK(!(wd::status() & wd::BUSY));
+    CHECK(pin_level(PIN_DS0));
+    CHECK(!cable().drive[0].motor);
+  });
+}
+
+// (c) released drive, bench moves the head, host READ with the motor bit OFF.
+TEST(integ_c_bench_move_while_released_then_read_with_motor_bit_off) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(10);
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(10, 1, 512).status), 0);
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    FloppyDrive *d = fdc_bench_drive();
+    REQUIRE(d != nullptr);
+    d->goto_track(70);
+    fdc_bench_release();
+    fdc_bench_done();
+    wait_ms(50);
+    CHECK_EQ(cable().drive[0].cyl, 70);
+    CHECK(pin_level(PIN_DS0)); // idle passes neither move nor select
+    wd::Xfer x = wd::read_sector(10, 2, 512, false, 5000);
+    std::printf("    c: status %02X cyl %d\n", x.status, cable().drive[0].cyl);
+    CHECK(!x.timed_out);
+    // motor bit off = NOT READY in STATUS by design; nothing else may be set
+    CHECK_EQ(error_bits(x.status) & ~wd::NOTREADY, 0);
+    CHECK(matches_pattern(x.data, 10, 0, 2));
+    CHECK_EQ(cable().drive[0].cyl, 10);
+    wait_ms(5000);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(!cable().drive[0].motor);
+    // and with the motor on
+    wd::select(0);
+    x = wd::read_sector(10, 3, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 10, 0, 3));
+  });
+}
+
+// (d) CRC error, status polled, idle Force Interrupt, motor off 4 s, motor on
+// + READ of a good sector.
+TEST(integ_d_latched_crc_does_not_survive_release_and_next_read) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
+  TrackSpec t;
+  for (int r = 1; r <= 9; ++r) {
+    SectorSpec s;
+    s.c = 3; s.h = 0; s.r = (uint8_t)r; s.n = 2;
+    s.data.assign(512, 0x11);
+    s.bad_data_crc = (r == 6);
+    t.sectors.push_back(s);
+  }
+  g_disk[0].t[3][0] = encode_track(t);
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(3);
+    wd::side(1);
+    uint8_t st = wd::read_sector(3, 6, 512).status;
+    CHECK(st & wd::CRC);
+    CHECK(wd::status() & wd::CRC);
+    wd::force_interrupt(); // idle: Type I view, CRC stays latched
+    st = wd::status();
+    CHECK(st & wd::CRC);
+    CHECK(!(st & wd::BUSY));
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    st = wd::status(); // still the Type I view with the latched CRC, released
+    CHECK(st & wd::CRC);
+    CHECK(st & wd::NOTREADY); // motor bit off = NOT READY, by design
+    wd::select(0);
+    wd::Xfer x = wd::read_sector(3, 5, 512);
+    CHECK_EQ(x.status, 0);
+    CHECK_EQ(x.data.size(), 512u);
+    CHECK(!pin_level(PIN_DS0));
+    wd::force_interrupt();
+    st = wd::status();
+    CHECK(!(st & (wd::CRC | wd::SEEKERR | wd::BUSY)));
+    // FI with motor-on + READ at once on a released drive, after a CRC
+    wd::read_sector(3, 6, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    wd::select(0);
+    out(0xD9, 3);
+    out(0xDA, 5);
+    out(0xD8, 0x80);
+    wait_ms(50);
+    wd::force_interrupt();
+    st = wd::status();
+    CHECK(!(st & (wd::CRC | wd::BUSY | wd::RNF)));
+    x = wd::read_sector(3, 5, 512);
+    CHECK_EQ(x.status, 0);
+  });
+}
+
+// (e) WRITE TRACK with the motor bit off on a released drive: the image is
+// armed, the track block spins the drive up (blocking), and the host gives up
+// with a Force Interrupt during that spin-up.
+TEST(integ_e_write_track_abandoned_during_its_own_spinup) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    integ_release_drive0();
+    size_t w0 = cable().drive[0].writes.size();
+    std::vector<uint8_t> img = wd::format_image(0, 0, 9, 2, false);
+    CHECK_EQ(integ_feed(0xF0, img, 3000), img.size());
+    // silence arms the image; then the track block's spin_motor() blocks
+    for (uint64_t end = now() + ms(500); now() < end && !cable().drive[0].motor;)
+      wait_us(100);
+    CHECK(cable().drive[0].motor);
+    wait_ms(50);
+    wd::force_interrupt();
+    wait_ms(2000);
+    FdcDebug d = dbg();
+    std::printf("    e: trk_op %d armed %d writes +%zu\n", d.trk_op, d.trk_armed,
+                cable().drive[0].writes.size() - w0);
+    CHECK_EQ(cable().drive[0].writes.size(), w0);
+    CHECK_EQ(d.trk_op, 0);
+    CHECK(!(wd::seek(5) & wd::BUSY));
+    wd::Xfer x = wd::read_sector(5, 3, 512);
+    CHECK(!x.timed_out);
+    CHECK(matches_pattern(x.data, 5, 0, 3));
+    wd::select(0, false);
+    wait_ms(5000);
+    CHECK(pin_level(PIN_DS0)); // released again
+  });
+}
+
+// (e2) WRITE TRACK on an empty drive; the host gives up before the ~1.3 s
+// index wait is over.
+TEST(integ_e2_write_track_on_empty_drive_abandoned_early) {
+  board_boot(); // no disk
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::Xfer f = wd::write_track(wd::format_image(0, 0, 9, 2, false), 400);
+    std::printf("    e2: timed_out %d status %02X trk_op %d\n", f.timed_out, f.status, dbg().trk_op);
+    wait_ms(3000);
+    CHECK_EQ(dbg().trk_op, 0);
+    CHECK(!(wd::restore() & wd::BUSY));
+    g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
+    insert(0, &g_disk[0]);
+    wd::select(0, false);
+    wait_ms(4000);
+    wd::select(0);
+    wd::Xfer x = wd::read_sector(0, 3, 512);
+    CHECK(!x.timed_out);
+    CHECK_EQ(error_bits(x.status), 0);
+    wd::select(0, false);
+    wait_ms(5000);
+    CHECK(pin_level(PIN_DS0));
+  });
+}
+// (e3) RESTORE (Type I) instead of Force Interrupt as the host's give-up.
+TEST(integ_e3_write_track_on_empty_drive_then_restore) {
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    std::vector<uint8_t> img = wd::format_image(0, 0, 9, 2, false);
+    out(0xD8, 0xF0);
+    size_t fed = 0;
+    for (uint64_t end = now() + ms(3000); now() < end && fed < img.size();)
+      if (wd::status() & wd::DRQ)
+        out(0xDB, img[fed++]);
+    wait_ms(300);
+    uint8_t st = wd::restore();
+    wait_ms(3000);
+    std::printf("    integ_e3: restore st %02X trk_op %d\n", st, dbg().trk_op);
+    CHECK_EQ(dbg().trk_op, 0);
+    CHECK(!(wd::status() & wd::BUSY));
+  });
+}
