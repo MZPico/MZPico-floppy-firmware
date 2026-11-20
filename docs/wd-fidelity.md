@@ -236,7 +236,16 @@ WriteFault · b4 RecordNotFound · b3 CRCError · b2 LostData · b1 DRQ · b0 Bu
   multi-sector ops). Terminating a running command keeps that command's
   status, which is how the ROM reads a clean `0x00` after READ MULTIPLE. With
   no command running, STATUS switches to the Type I layout (TRK00, WP, Index),
-  as the datasheet specifies (#58).
+  as the datasheet specifies (#58). Two details make that safe here:
+  - "No command running" means the host has **read the command's final
+    STATUS**, not merely that BUSY is clear. The firmware drops BUSY the
+    moment the last data byte is taken; a WD is still busy with the CRC
+    bytes, and the ROM and CP/M send `0xD0` right there and read the status
+    afterwards.
+  - In the Type I view after such a Force Interrupt, the **CRC and RNF bits
+    stay latched** from the data command (bit 4 is that RNF, not an older
+    Seek Error), as in the chip's status register. An error is never erased
+    by the `0xD0` that follows it.
 
 ### ID track compare (all Type II, Verify, and the write splice)
 
