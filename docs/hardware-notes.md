@@ -180,6 +180,42 @@ capture ring with absolute-counter overrun detection, `fwver`, `health`,
 `firstfail`, the failed-write and track-write rings, `bustest` +
 `BUSTEST.MZF`, `fdcseek`, `wrburst`, and the density/idxbit/densel controls.
 
+### 2c. A DD track on HD media is unreadable on these drives (#41, 2026-11)
+
+CP/M 4.1's `FORMAT4 /1440` writes cylinder 0 / head 1 at DD (16×256, so the
+DD-only boot ROM can read it) on HD media. On the ALPS DF354H090F and Mitsumi
+D359M3 that track reads back with CRC errors in almost every sector, so
+FORMAT4 reports `Verify error 1` and FDTEST fails the boot cylinder. Both
+drives select their read channel from the media's density hole and ignore
+pin 2 (DENSEL), so they play the DD track back through the HD channel.
+
+Measured from a `gw read --revs 5` capture, decoded offline with the
+firmware's decoder and an independent one:
+
+- The flux timing is clean: tight groups at 4 / 6 / 8 µs, no drift, no
+  dropouts. A healthy HD track on the same disk decodes 18/18 on every
+  revolution.
+- About 2 % of the **4T (8 µs) intervals** come back with one or two
+  spurious pulses inside them (`[97, 30, 65]` where the disk holds `[192]`
+  ticks at 24 MHz), the first one near the middle. That is the HD channel
+  playing back the longer DD wavelength: the readback pulse is wide enough to
+  show a second peak. A 256-byte sector holds ~256 such intervals, so nearly
+  every one takes a hit: 6 of 74 data fields passed their CRC over 5
+  revolutions.
+
+**Not firmware-fixable, deliberately.** The first spurious pulse sits on the
+bit grid (2T into a 4T), so timing cannot tell 4T from 2T+2T, and glitch
+merging (48–80-tick thresholds) changed nothing. A WD179x data separator would
+accept the pulse too, so a Sharp card with this drive and disk fails the same
+way. The only decoder-side "fix", CRC-guided repair of glitch clusters, would
+turn a real CRC error into clean data, which is what weak-bit fidelity (#51)
+forbids.
+
+**So HD disks are data disks here, not boot disks.** Boot from a DD disk, or
+use a drive that can take its density from pin 2 (some have a jumper for it).
+The firmware already drives DENSEL from the effective density. Taping the HD
+hole makes the boot track readable but the HD data tracks not.
+
 ### 3. MZ-800 bus side — mostly right, three additions
 
 The bus side is already sound in principle: `SN74LVC245A` at 3V3 has 5.5 V
