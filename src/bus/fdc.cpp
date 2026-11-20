@@ -3517,8 +3517,20 @@ void fdc_disk_task(void) {
   // used to wedge the controller for good once a host had named unit 2/3 with
   // a command pending -- every later command BUSY forever, even after it
   // re-selected drive 0 (issue #8).
-  if ((!S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq) ||
-      !DRV) {
+  bool idle = !S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq;
+  if (idle && DRV && !S.motor_on && !g_applied_motor) {
+    // Nothing to do and the spindle has stopped (the deferred motor stop
+    // below has run): release ~DSn. PC drives light their LED from drive
+    // select, not from the motor, so a select held for good kept the LED on
+    // for as long as the MZ-800 was attached (#56). The next operation, or the
+    // host turning the motor on, selects the drive again through
+    // fdc_apply_drive_select(). While deselected the drive's ~TRK00/~WPT
+    // float; FloppyDrive reports the last values it read.
+    if (g_applied_select) {
+      DRV->select(false);
+      g_applied_select = false;
+    }
+  } else if (idle || !DRV) {
     if (!fdc_apply_drive_select()) {
       fdc_end_for_missing_unit();
       return; // no such unit; STATUS already reports NOT READY

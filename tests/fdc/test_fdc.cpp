@@ -9,6 +9,7 @@
 #include <cstdlib>
 
 #include "board.hpp"
+#include "board_config.h"
 #include "floppy.hpp"
 #include "testfw.hpp"
 
@@ -1694,5 +1695,70 @@ TEST(field_cut_off_for_good_delivers_no_bytes) {
     CHECK_EQ(got, 0u);
     CHECK(!(s & wd::BUSY));
     CHECK(!(s & wd::CRC));
+  }, ms(60000));
+}
+
+// ---------------- Drive select follows the spindle (#56) ----------------
+// PC drives light their LED from ~DSn. Once the host has turned the motor off
+// and the spindle has stopped, the drive is deselected; the next command
+// selects it again. While deselected, ~TRK00/~WPT float, so STATUS must keep
+// the last sense rather than read the open lines.
+TEST(drive_is_deselected_after_the_motor_stops_and_reselected_on_use) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(0, 1, 512).status), 0);
+    CHECK(!pin_level(PIN_DS0)); // selected (active low)
+    wd::select(0, /*motor=*/false);
+    wait_ms(1000);
+    CHECK(!pin_level(PIN_DS0)); // still inside the motor-off delay
+    wait_ms(3000);
+    CHECK(pin_level(PIN_DS0)); // spindle stopped: released
+    CHECK(!cable().drive[0].motor);
+    // Deselected, ~TRK00 floats high; the held sense still says track 0.
+    wait_ms(50);
+    CHECK_EQ(dbg().at_track0, 1);
+    // The host comes back: motor on, read -- selected again, and it works.
+    wd::select(0);
+    wait_ms(10);
+    CHECK(!pin_level(PIN_DS0));
+    wd::Xfer x = wd::read_sector(0, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 2));
+    // ...and a seek without a motor command first also reselects.
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    wd::select(0);
+    wd::seek(5);
+    CHECK(!pin_level(PIN_DS0));
+    CHECK_EQ(cable().drive[0].cyl, 5);
+  }, ms(60000));
+}
+
+// Write protect is read while selected and held across the deselected stretch:
+// a protected disk must still refuse a write issued right after the reselect.
+TEST(write_protect_survives_the_deselected_stretch) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    wait_ms(50);
+    CHECK(dbg().flags & 0x02); // write protect still held
+    wd::select(0);
+    std::vector<uint8_t> d(512, 0xA5);
+    uint8_t st = wd::write_sector(0, 3, d).status;
+    CHECK(st & wd::WPROT);
+    CHECK(cable().drive[0].writes.empty() || cable().drive[0].writes.back().refused_wp);
   }, ms(60000));
 }

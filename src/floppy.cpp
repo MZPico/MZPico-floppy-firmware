@@ -271,7 +271,9 @@ bool FloppyDrive::goto_track(int track_num) {
 bool FloppyDrive::get_write_protect() {
   if (_protectpin < 0)
     return false;
-  return !read_pin(_protectpin);
+  if (_is_drive_selected) // deselected: the line floats (#56)
+    _last_wp = !read_pin(_protectpin);
+  return _last_wp;
 }
 
 bool FloppyDrive::get_ready_sense() {
@@ -283,7 +285,9 @@ bool FloppyDrive::get_ready_sense() {
 bool FloppyDrive::get_track0_sense() {
   if (_track0pin < 0)
     return track() != 0;
-  return !read_pin(_track0pin);
+  if (_is_drive_selected) // deselected: the line floats (#56)
+    _last_trk00 = !read_pin(_track0pin);
+  return _last_trk00;
 }
 
 bool FloppyDrive::set_density(bool high_density) {

@@ -107,6 +107,9 @@ private:
   int _track = -1;
   int _side = -1;
   bool _is_drive_selected = false;
+  // ~TRK00 and ~WPT are only driven by a selected drive; deselected, the
+  // lines float. The senses report the last value read while selected (#56).
+  bool _last_trk00 = false, _last_wp = false;
   bool _is_motor_spinning = false;
   bool _is_index_seen = false;
   bool _track0_crosscheck = true;
