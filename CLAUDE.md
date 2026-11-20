@@ -142,7 +142,7 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 - **Head position is ours, the Track register is the host's:** ✅ core1 folds each
   Type I step into a **clamped absolute** `head_target` (our model of the head);
   core0 drives the head there. The two must be free to disagree — that is the
-  basis of the recalibrate-via-READ-ADDRESS idiom. Three rules fall out of how
+  basis of the recalibrate-via-READ-ADDRESS idiom. These rules fall out of how
   the host actually behaves (CP/M 4.1 fires STEP/`FORCE-INT`/READ bursts µs
   apart and never waits for BUSY, while our steps take ms):
   1. never drop a queued Type I — several arrive while core0 is blocked in a
@@ -156,7 +156,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
      command write, Force Interrupt included. The per-kind `*_seq` counters
      only see commands of their own kind (#1, #3). Side and drive select are
      re-applied at the start of every operation block, not just once per pass
-     (#2).
+     (#2);
+  5. take the `cmd_gen` snapshot **before** anything in an operation block
+     that can block — the drive select (catch-up seek), the bench-head
+     restore, a spin-up — and re-check it after. Snapshotted after them, a
+     command that arrived meanwhile was adopted as "the one this work
+     serves": a sector was spliced after the host's Force Interrupt, and a
+     READ for the other side came back CRC-clean with the first side's data
+     (#25). An armed WRITE TRACK carries the generation it was armed under
+     (`trk_gen`), because Force Interrupt and RESET leave an armed format in
+     place, and a superseded one is dropped before the seek block.
 - **WD ID track compare:** ✅ a read matches an ID only when **both** its sector
   and its cylinder byte agree with the Sector/Track registers; a sector-number
   match on the wrong cylinder is RNF, not data. This is real WD179x behaviour and
@@ -181,9 +190,12 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   HD** and a host declaration now outranks the auto-detect latch. The Disk
   BASIC ROM still never writes it, which is why the per-drive latch remains
   the boot-time fallback. DENSEL is driven best-effort from the same model.
-- **HD support: read, format and data-disk use verified; two-drive host
-  writes not reliable.** Full account — the two firmware bugs fixed, what was
-  ruled out by measurement, the exact resumption plan — in the HD status
+- **HD support: read, format and data-disk use verified; two-drive
+  positioning still throws the odd wrong-cylinder read (#31).** A re-test on
+  fw-eb7f2dc was clean (128/128 writes, `PIP [V]` twice), but the fw-2a1d1c5
+  round saw one more wrong-cylinder read on drive 1, with the head position
+  unknown at that moment. Full account — the two firmware bugs fixed, what
+  was ruled out by measurement, the exact resumption plan — in the HD status
   bullet under Phase 3 below and in
   [docs/hardware-notes.md](docs/hardware-notes.md) §2b.
 - ~~**`~EXWAIT` budget**~~ — ✅ resolved: core1 comfortably services a register
@@ -197,18 +209,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   stays unimplemented until a drive or media actually misbehaves. What is still
   worth doing: a long soak (hours, not minutes) and a second drive/disk, since
   the +2-byte splice bias has only met one spindle.
-- **Rare `FD:Loading error` on boot** (~1 in 20; everything else reads clean).
-  The **first-failure latch** it needed now exists (`mzp_probe.py firstfail`):
-  it holds the first RNF/CRC/wrong-cylinder/Verify failure since power-up in
-  full, with the whole position chain sampled at that instant, so a host's
-  successful retry can no longer erase the evidence. Still to do: catch one.
-  `at_ms` is the discriminator — under ~3 s points at a capture taken before the
-  spindle was stable rather than at the decode path; the suspects otherwise are
-  the 5 ms `settle_delay_ms` right after a seek. **Prime suspect since
-  2026-11: the read-window bug fixed below** (the old window was shorter than
-  one revolution on any dense directory track, and the boot reads exactly
-  that track) — re-measure the boot error rate on the fixed build before
-  chasing anything else.
+- ~~**Rare `FD:Loading error` on boot**~~ (~1 in 20) — ✅ fixed in
+  fw-6cc2c50 (#32). The **first-failure latch** (`mzp_probe.py firstfail`)
+  caught one: a data CRC on the right ID with garbage IDs around it, 2.5 s
+  after reset with the spindle cold. The read was taken before the drive
+  could deliver. A capture or a write now waits until the motor has run
+  500 ms and the head has settled 20 ms after a step
+  (`FloppyDrive::head_ready`); the simulator models spin-up garbage and
+  post-step ringing and reproduces the signature without the gate. Not seen
+  since. `firstfail` stays the tool for the next one: `at_ms` says whether a
+  failure follows a motor start or a seek.
 - ~~**`goto_track()` assumes the head arrived**~~ — ✅ addressed, two ways.
   `goto_track()` now cross-checks its belief against the TRK00 sense on every
   call and forces a recalibrate when they disagree (the belief is derived from
@@ -254,6 +264,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   needed to be 1 — check the union of the observed `last_raw_write` values
   before believing it. (ADDRESS bits 6/7 always read stuck high: every port we
   own, 0xD8–0xDF, has both set.)
+
+- **Get an independent review of every PR, and of every fix to it.** The
+  fw-2a1d1c5 round ran three passes of separate review agents over three
+  PRs. Every pass found real bugs, most of them in the previous pass's
+  fixes: a CRC error reported as a clean read, a read answered from the
+  wrong side, a controller wedged for good by an abandoned format. The
+  reviewer gets the diff and the code, not the author's conclusions, and is
+  asked for a reproducing test; its tests go into the suite (68 → 123
+  controller tests in that round). Review the PRs merged together as well:
+  that is the build that gets flashed.
 
 ## Testing (CI) — reproduce on the host before the bench
 
@@ -382,6 +402,18 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     and a period needs a second agreeing sample (#18). A lapped DMA ring
     discards the capture and starts again (#5). A data CRC error is reported
     as on a WD, never retried internally: weak-bit protection depends on it.
+  - **Force Interrupt and the STATUS layout (#58).** With no command running,
+    a `0xD0` puts STATUS in the Type I layout (TRK00, Write Protect, Index),
+    as on a WD. "No command running" is **not** "BUSY clear": the firmware
+    drops BUSY the moment the last data byte is taken, where a WD is still
+    busy with the CRC bytes, and both the ROM and CP/M send `0xD0` right
+    there and read the command's own status afterwards. Judged on BUSY
+    alone, a CRC error became `0x00`. So the layout switches only once the
+    host has read the command's final STATUS, CRC and RNF stay latched in
+    the Type I view, and TRK00/WP are refreshed on idle passes — CP/M's BIOS
+    tests Write Protect with an idle `0xD0` before every write, and a value
+    cached from before a disk swap failed the write with no recovery. Bus
+    RESET clears the status register.
   - **3.3 WRITE SECTOR: DONE (hardware-verified) -- CP/M 4.1 on the MZ-800
     writes files to a physical disk and reads them back correct.** Measured over
     two disks (13 and 3 host writes): every write completed, and `wrdiag`
@@ -455,7 +487,25 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     - `~MOTOR_ON` reaches every drive on the cable (J3 wires it to floppy pins
       10 *and* 16), so it is **not** gated by drive select: selecting an absent
       drive still spins the present one. Not a bug — one spindle cannot be run
-      without the other on this board.
+      without the other on this board. Because it is one wire, its state is
+      tracked **once** (`FloppyDrive::motor_line_on()`), not as each drive
+      object's belief: per-object, a detour through a missing unit lost it
+      and the motor ran on with the drive released (#57).
+    - **`~DSn` is released when idle (#56).** PC drives light their LED from
+      drive select, so a select held for good kept the LED on. Once the host's
+      motor bit is off, the 3 s deferred stop has run and nothing is pending,
+      the disk task releases the select; the next command, or motor-on,
+      selects the drive again. Two things follow: nothing may step, capture or
+      sense with the drive released (every operation block selects first, and
+      the motor block selects before a spin-up — `~INDEX` is gated by the
+      select, so a spin-up on a released drive times out and latches NOT
+      READY); and the host's motor bit is read **once per pass**. A released
+      drive's `~TRK00`/`~WPT` float; `FloppyDrive` reports the values it last
+      read while selected.
+    - The catch-up seek on select runs only on a real drive **switch**. A
+      re-select of the same drive must not move the head on an idle pass;
+      after a bench command `fdc_bench_restore_head()` puts it back at the
+      next operation.
     - **Bench commands must go through `fdc_bench_drive()`.** `scan`/`streamscan`
       originally used the greaseweazle drive object, hardwired to `~DS0`, so
       `drive 1; scan` silently read drive 0 — and `fmtverify` would have
@@ -500,8 +550,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
        only while the host's Track register equals our position, and by this
        design they are free to disagree (CP/M rewrites the Track register on
        a drive switch). Fix: SEEK folds the absolute cylinder.
-    **Open item — HD two-drive copies (A: DD → B: HD) under CP/M are not
-    reliable, and this is where work stopped.** Two symptoms, both
+    **Open item (#31) — HD two-drive use under CP/M: the positioning symptom
+    is rarer but not gone.** A re-test on fw-eb7f2dc passed (128/128 writes,
+    0 RNF, 0 wrong-cylinder, `PIP [V]` twice), and the issue was closed. It
+    was reopened on fw-2a1d1c5: one wrong-cylinder read on drive 1 (host
+    wanted track 2, disk said 3), rejected and repaired, with
+    `head_target=0` and the head position **unknown** — i.e. an earlier
+    recalibrate on that drive had not seen TRK00. Not reproduced in the
+    simulator, and a link to that release's select/motor changes is not
+    ruled out (compare against fw-6e1f7b4). Worth latching the moment a
+    recalibrate fails. The original account follows; two symptoms, both
     characterised, neither root-caused:
     - ~1.5 % of positioning bursts to the directory track leave the head
       physically short (host wants track 2, disk says 4..15) — identical rate
@@ -535,6 +593,10 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     **Do not host-write HD disks you care about** until this is resolved; a
     corrupted CP/M image during this bring-up masqueraded as a firmware
     regression until the image was rewritten (media, not code).
-- **Phase 4 (robustness):** write-precomp if needed, error handling, long soak
-  testing (the `wrsoak` run so far is minutes, not hours, and has met only one
-  spindle), catching the rare boot `FD:Loading error` with `firstfail`.
+- **Phase 4 (robustness):** write-precomp if needed, long soak testing (the
+  `wrsoak` run so far is minutes, not hours, and has met only one spindle,
+  #33), the HD positioning event (#31), and the two protocol-level items left
+  from the November review: the cross-core windows when core0 publishes
+  BUSY/DRQ/`~INT` (#61) and `bus.pio`'s full-FIFO / late-verdict pairing
+  (#62). Flux dropouts need 32-bit capture samples (#45: the 15-bit PIO
+  counter aliases any gap over 1.36 ms).
