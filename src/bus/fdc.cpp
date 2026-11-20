@@ -2193,10 +2193,18 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // The ROM terminates a multi-sector read with 0xD0, then reads STATUS and
       // requires the true value == 0x00 for success — so we must not touch the
       // Type II error flags (a CRC/RNF seen mid-read must survive to be reported)
-      // nor `type2` (the status layout follows the last data command).
+      // nor, for a command still running, `type2` (see idle_fi below).
       // ...but only once the host has started on that sector. A published
       // look-ahead sector nobody has taken a byte of is not a transfer in
       // progress: a WD drops BUSY/DRQ at once (#23).
+      //
+      // With NO command running, though, a WD's STATUS reverts to the Type I
+      // layout (datasheet: "Status reflects the Type I commands"), so a host
+      // can read TRK00 / WP / Index with an idle 0xD0 after a data command
+      // (#58). The ROM's READ MULTIPLE + 0xD0 is not that case: its 0xD0
+      // terminates a command that is still BUSY (the look-ahead), and keeps
+      // that command's status.
+      bool idle_fi = !S.busy && !S.reading && !S.writing && !S.trk_op;
       if (S.reading && S.drq && S.xfer_pos > 0 && S.xfer_pos < S.xfer_len) {
         // If Force Interrupt arrives while bytes are still being drained from
         // the published sector buffer, defer completion until that buffer is
@@ -2236,6 +2244,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // Force Interrupt still drops host-visible BUSY at once (above); core0
         // finishes the motion and clears BUSY again, which is idempotent.
       }
+      if (idle_fi)
+        S.type2 = false;
       // Type IV interrupt conditions. Bit3 (I3) = interrupt immediately; the
       // MZ-800 boot ROM uses 0xD8, i.e. it has been asking for INTRQ all along
       // and merely polls as well. 0xD0 (no condition bits) terminates silently.

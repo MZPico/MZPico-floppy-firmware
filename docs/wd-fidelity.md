@@ -233,7 +233,10 @@ WriteFault · b4 RecordNotFound · b3 CRCError · b2 LostData · b1 DRQ · b0 Bu
   Read Multiple `0x90` / Write Multiple `0xB4`).
 - **Type III:** READ ADDRESS, READ TRACK, WRITE TRACK (format).
 - **Type IV:** FORCE INTERRUPT `0xD0` (the ROM uses it to terminate
-  multi-sector ops).
+  multi-sector ops). Terminating a running command keeps that command's
+  status, which is how the ROM reads a clean `0x00` after READ MULTIPLE. With
+  no command running, STATUS switches to the Type I layout (TRK00, WP, Index),
+  as the datasheet specifies (#58).
 
 ### ID track compare (all Type II, Verify, and the write splice)
 

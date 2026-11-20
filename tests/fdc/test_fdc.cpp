@@ -1696,3 +1696,62 @@ TEST(field_cut_off_for_good_delivers_no_bytes) {
     CHECK(!(s & wd::CRC));
   }, ms(60000));
 }
+
+// ---------------- Force Interrupt with nothing running (#58) ----------------
+// WD179x: a Force Interrupt received while no command is executing leaves
+// STATUS in the Type I layout (b2 TRK00, b6 WP). One that terminates a
+// running command keeps that command's status -- the ROM's READ MULTIPLE +
+// 0xD0 needs a clean 0x00 afterwards.
+TEST(idle_force_interrupt_shows_type1_status) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(0, 1, 512).status), 0);
+    // Type II layout after the read: b2 is LOST DATA, clear.
+    CHECK(!(wd::status() & 0x04));
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(st & wd::TRK0);        // b2 = TRACK 00 now
+    CHECK(st & wd::WPROT);       // b6 = WRITE PROTECT
+  });
+}
+
+TEST(force_interrupt_ending_read_multiple_still_reads_clean) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    // read_sector(..., multi) ends the command with Force Interrupt once it
+    // has its bytes, while the look-ahead is still BUSY.
+    wd::Xfer x = wd::read_sector(0, 1, 3 * 512, /*multi=*/true, 5000);
+    CHECK_EQ(x.data.size(), 3u * 512u);
+    CHECK_EQ(x.status, 0);
+    CHECK_EQ(wd::status(), 0); // on cylinder 0: a Type I layout would show TRK00
+  });
+}
+
+TEST(force_interrupt_cutting_a_read_short_keeps_type2_status) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512); // measure the spindle
+    out(0xD9, 0);
+    out(0xDA, 5);
+    out(0xD8, 0x80);
+    wait_ms(20); // still searching: BUSY
+    CHECK(wd::status() & wd::BUSY);
+    wd::force_interrupt();
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(!(st & wd::TRK0)); // Type II layout kept: b2 is LOST DATA, clear
+  });
+}
