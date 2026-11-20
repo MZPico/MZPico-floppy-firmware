@@ -3594,6 +3594,23 @@ void fdc_disk_task(void) {
   // clock-agnostic, the density only tells the decoder how to read them.
   fdc_apply_densel();
 
+  // An armed WRITE TRACK the host has since moved on from -- any command, or
+  // a bus RESET, after the image was armed (trk_gen) and before core0 began
+  // laying it down. It must not be written (that is what trk_gen is for), and
+  // it must not linger either: Force Interrupt, the Type I/II handlers and
+  // the reset ISR all leave an ARMED track op in place, because one already
+  // on the media has to finish, so nothing else would ever clear it. Left
+  // set, the track block returns before the read and write blocks, the seek
+  // block never drops BUSY, and not even a RESET recovers the controller
+  // (second review of #60). Dropped here, BEFORE the seek block, so that the
+  // command which superseded it completes normally in this same pass.
+  if (S.trk_op == 2 && S.trk_armed && S.trk_done != S.trk_seq &&
+      S.trk_gen != S.cmd_gen) {
+    S.trk_done = S.trk_seq;
+    S.trk_armed = false;
+    S.trk_op = 0;
+  }
+
   // Execute a pending physical seek.
   if (S.op_done != S.op_seq) {
     uint32_t seq = S.op_seq;   // snapshot
@@ -3775,7 +3792,7 @@ void fdc_disk_task(void) {
     if (!S.trk_armed) {
       // The host is still shifting the image in. It stops when the image ends,
       // not when we say so, so silence is the end-of-image signal.
-      if (S.trk_pos > 0 &&
+      if (S.trk_pos > 0 && S.cmd_gen == gen0 &&
           fdc_since(S.last_data_read_us) > FDC_TRACK_IDLE_US) {
         S.trk_len = S.trk_pos;
         S.drq = false;
@@ -3989,9 +4006,17 @@ void fdc_disk_task(void) {
       else if (live)
         S.err_rnf = true;
     }
-    if (live) {
+    // The track op is over whether or not the host still cares about it: a
+    // command or a RESET during the physical write makes the RESULT stale
+    // (nothing host-visible is published), but leaving trk_op set wedged the
+    // controller for good -- a RESET pressed during a format left the boot
+    // ROM's RESTORE BUSY forever (second review of #60; on main too). A new
+    // WRITE TRACK issued meanwhile has its own trk_seq and is left alone.
+    if (S.trk_op == 2 && S.trk_seq == seq) {
       S.trk_op = 0;
       S.trk_armed = false;
+    }
+    if (live) {
       S.drq = false;
       S.busy = false;
       fdc_refresh_int_line();

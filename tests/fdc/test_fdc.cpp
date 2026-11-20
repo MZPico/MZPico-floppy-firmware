@@ -1811,3 +1811,126 @@ TEST(read_behind_a_step_issued_during_the_pre_capture_restore_waits_for_it) {
     CHECK(matches_pattern(b.data, 11, 0, 5));
   });
 }
+
+// ---- re-review of #60: armed WRITE TRACK superseded before core0 writes ----
+namespace {
+// Feed a padded image until the firmware stops asking (buffer-full arming on
+// core1), returning right after the last accepted byte.
+void feed_track_until_armed(const std::vector<uint8_t> &img) {
+  out(0xD8, 0xF0);
+  size_t i = 0;
+  for (uint64_t end = now() + ms(3000); now() < end;) {
+    if (!(wd::status() & wd::DRQ)) {
+      if (i > 0) break;
+      continue;
+    }
+    out(0xDB, i < img.size() ? img[i] : 0x4E);
+    ++i;
+    if (dbg().trk_armed) break;
+  }
+  CHECK(dbg().trk_armed);
+}
+void report(const char *what) {
+  FdcDebug d = dbg();
+  std::fprintf(stderr, "  %s: status %02x trk_op=%d armed=%d\n", what, wd::status(),
+               (int)d.trk_op, (int)d.trk_armed);
+}
+}
+
+// A: Force Interrupt immediately after the last image byte, motor running.
+TEST(force_interrupt_during_the_track_write_leaves_the_controller_usable) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    CHECK(matches_pattern(wd::read_sector(5, 3, 512).data, 5, 0, 3));
+    size_t writes = cable().drive[0].writes.size();
+    feed_track_until_armed(wd::format_image(5, 0, 9, 2, false));
+    out(0xD8, 0xD0);
+    wait_ms(700);
+    report("after FI");
+    // core0 is already in the track write (waiting for the index) by the time
+    // the Force Interrupt lands: a write under way cannot be recalled, on a
+    // WD either. What must hold is that the controller stays usable.
+    CHECK(cable().drive[0].writes.size() <= writes + 1);
+    CHECK_EQ(dbg().trk_op, 0);
+    CHECK(!(wd::seek(6) & wd::BUSY));
+    CHECK(matches_pattern(wd::read_sector(6, 3, 512).data, 6, 0, 3));
+    CHECK(matches_pattern(wd::read_sector(6, 4, 512).data, 6, 0, 4));
+  });
+}
+
+// B: motor bit off -> the track block spins up in-block (blocks ~300 ms+);
+// Force Interrupt inside that.
+TEST(force_interrupt_superseding_an_armed_write_track_formats_nothing) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::select(0, false);
+    wait_ms(3600);
+    size_t writes = cable().drive[0].writes.size();
+    feed_track_until_armed(wd::format_image(5, 0, 9, 2, false));
+    wait_ms(100);
+    out(0xD8, 0xD0);
+    wait_ms(1500);
+    report("after FI");
+    CHECK_EQ(cable().drive[0].writes.size(), writes);
+    CHECK_EQ(dbg().trk_op, 0);
+    wd::select(0);
+    CHECK(!(wd::seek(6) & wd::BUSY));
+    CHECK(matches_pattern(wd::read_sector(6, 3, 512).data, 6, 0, 3));
+  });
+}
+
+// C: Type I (STEP IN) in the same window.
+TEST(step_superseding_an_armed_write_track_completes_and_formats_nothing) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::select(0, false);
+    wait_ms(3600);
+    size_t writes = cable().drive[0].writes.size();
+    feed_track_until_armed(wd::format_image(5, 0, 9, 2, false));
+    wait_ms(100);
+    out(0xD8, 0x50);
+    uint8_t st = wd::wait_ready(3000);
+    report("after STEP");
+    std::fprintf(stderr, "  st=%02x cyl=%d writes+%zu\n", st, cable().drive[0].cyl,
+                 cable().drive[0].writes.size() - writes);
+    CHECK(!(st & wd::BUSY));
+    CHECK_EQ(dbg().trk_op, 0);
+    wd::select(0);
+    CHECK(matches_pattern(wd::read_sector(6, 3, 512).data, 6, 0, 3));
+  });
+}
+
+// D: a READ SECTOR in the same window.
+TEST(read_superseding_an_armed_write_track_is_served) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::select(0, false);
+    wait_ms(3600);
+    size_t writes = cable().drive[0].writes.size();
+    feed_track_until_armed(wd::format_image(5, 0, 9, 2, false));
+    wait_ms(100);
+    wd::select(0);
+    wd::Xfer r = wd::read_sector(5, 3, 512);
+    report("after READ");
+    std::fprintf(stderr, "  st=%02x n=%zu to=%d writes+%zu\n", r.status, r.data.size(),
+                 (int)r.timed_out, cable().drive[0].writes.size() - writes);
+    CHECK(!r.timed_out);
+    CHECK_EQ(dbg().trk_op, 0);
+  });
+}
