@@ -20,7 +20,7 @@ MZ-800  <== expansion bus ==>  RP2040  <== 34-pin cable ==>  floppy drive(s)
 |---|---|
 | Boot from the MZ-800 ROM, CP/M 4.1 | works, DD |
 | Read, write, format (FORMAT4), two drives | works, DD |
-| HD (500 kbit/s) | reads, formats and writes work as data disks. Two-drive use still throws an occasional wrong-cylinder read, which is rejected and retried ([#31](https://github.com/MZPico/MZPico-floppy-firmware/issues/31)): don't host-write HD disks you care about. HD disks can't be boot disks on drives that sense density from the media hole ([hardware notes §2c](docs/hardware-notes.md)) |
+| HD (500 kbit/s) | reads, formats and writes work as data disks. Two-drive use still throws an occasional wrong-cylinder read, which is rejected and retried ([#31](https://github.com/MZPico/MZPico-floppy-firmware/issues/31)); until that is closed, don't host-write HD disks you care about. HD disks can't be boot disks on drives that sense density from the media hole ([hardware notes §2c](docs/hardware-notes.md)) |
 | Greaseweazle-compatible flux access over USB | works (`gw`, fluxengine) |
 
 The design, the hard-won rules and the detailed status are in

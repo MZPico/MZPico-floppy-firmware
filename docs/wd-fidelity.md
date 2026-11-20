@@ -429,7 +429,8 @@ and stops at the first ID, bounded at 40 ms, because CP/M polls for only
 - **Data pacing** is the host's, not the disk's (see the handshake section).
 - **Weak bits** are reproduced by the real disk per command; only
   perfectly-exact analog reproduction is out of scope.
-- **HD two-drive host writes under CP/M are not reliable yet** — see the HD
+- **HD two-drive use under CP/M still throws an occasional wrong-cylinder
+  read** (#31), rejected by the ID track compare and retried — see the HD
   status in CLAUDE.md and [hardware-notes.md](hardware-notes.md) §2b.
 
 ## Open items

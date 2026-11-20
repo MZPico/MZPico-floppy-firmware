@@ -191,10 +191,11 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   BASIC ROM still never writes it, which is why the per-drive latch remains
   the boot-time fallback. DENSEL is driven best-effort from the same model.
 - **HD support: read, format and data-disk use verified; two-drive
-  positioning still throws the odd wrong-cylinder read (#31).** A re-test on
-  fw-eb7f2dc was clean (128/128 writes, `PIP [V]` twice), but the fw-2a1d1c5
-  round saw one more wrong-cylinder read on drive 1, with the head position
-  unknown at that moment. Full account — the two firmware bugs fixed, what
+  positioning still throws the odd wrong-cylinder read (#31).** The re-test
+  on fw-eb7f2dc was clean on the write side (128/128 writes, 0 RNF,
+  `PIP [V]` twice) but had one wrong-cylinder read in 4016, and the
+  fw-2a1d1c5 round saw another on drive 1, with the head position unknown at
+  that moment. Each was rejected and retried; none reached the host as data. Full account — the two firmware bugs fixed, what
   was ruled out by measurement, the exact resumption plan — in the HD status
   bullet under Phase 3 below and in
   [docs/hardware-notes.md](docs/hardware-notes.md) §2b.
@@ -215,10 +216,12 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   after reset with the spindle cold. The read was taken before the drive
   could deliver. A capture or a write now waits until the motor has run
   500 ms and the head has settled 20 ms after a step
-  (`FloppyDrive::head_ready`); the simulator models spin-up garbage and
-  post-step ringing and reproduces the signature without the gate. Not seen
-  since. `firstfail` stays the tool for the next one: `at_ms` says whether a
-  failure follows a motor start or a seek.
+  (`FloppyDrive::head_ready`; READ ADDRESS waits for the spin-up only); the
+  simulator models spin-up garbage and post-step ringing and reproduces the
+  signature without the gate. The fix rests on that one captured instance:
+  the error has not been seen in daily use since, but no dedicated boot
+  series was run. `firstfail` stays the tool if it returns: `at_ms` says
+  whether a failure follows a motor start or a seek.
 - ~~**`goto_track()` assumes the head arrived**~~ — ✅ addressed, two ways.
   `goto_track()` now cross-checks its belief against the TRK00 sense on every
   call and forces a recalibrate when they disagree (the belief is derived from
@@ -267,7 +270,7 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
 
 - **Get an independent review of every PR, and of every fix to it.** The
   fw-2a1d1c5 round ran three passes of separate review agents over three
-  PRs. Every pass found real bugs, most of them in the previous pass's
+  PRs. Each pass found real bugs, several of them in the previous pass's
   fixes: a CRC error reported as a clean read, a read answered from the
   wrong side, a controller wedged for good by an abandoned format. The
   reviewer gets the diff and the code, not the author's conclusions, and is
@@ -510,8 +513,9 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
       originally used the greaseweazle drive object, hardwired to `~DS0`, so
       `drive 1; scan` silently read drive 0 — and `fmtverify` would have
       formatted one disk and verified another.
-  - **HD (500 kbit/s) support — read, format and data-disk use verified;
-    two-drive host writes NOT reliable. Left in as a documented base.** Target
+  - **HD (500 kbit/s) support — read, format, write and data-disk use
+    verified; two-drive positioning not fully reliable (#31, see the open
+    item at the end of this bullet).** Target
     is 3.5" HD at 300 rpm — the revolution time is unchanged, only the bit
     clock halves. Density (`mzp_probe.py density dd|hd|auto|detect`, default
     auto): a valid host `0xDE` declaration decides (polarity observed from
@@ -551,8 +555,9 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
        design they are free to disagree (CP/M rewrites the Track register on
        a drive switch). Fix: SEEK folds the absolute cylinder.
     **Open item (#31) — HD two-drive use under CP/M: the positioning symptom
-    is rarer but not gone.** A re-test on fw-eb7f2dc passed (128/128 writes,
-    0 RNF, 0 wrong-cylinder, `PIP [V]` twice), and the issue was closed. It
+    is rarer but not gone.** A re-test on fw-eb7f2dc passed on the write side
+    (128/128 writes, 0 RNF and 0 wrong-cylinder on writes, `PIP [V]` twice;
+    one wrong-cylinder read in 4016 sectors), and the issue was closed. It
     was reopened on fw-2a1d1c5: one wrong-cylinder read on drive 1 (host
     wanted track 2, disk said 3), rejected and repaired, with
     `head_target=0` and the head position **unknown** — i.e. an earlier

@@ -502,7 +502,7 @@ BUSY-polling covers latency instead, per the ROM driver).
     - **The catch-up seek on select** only fires when `head_target` diverges
       from the head, and only core1 sets `head_target` — from real host Type I
       commands. Bench seeks drive the head directly and never create that
-      divergence. It is covered in the simulator
+      divergence. It is exercised in the simulator
       (`unit_first_spun_by_a_motor_off_seek_still_gets_its_catch_up_seek`: a
       STEP folded for unit 1 while unit 0 is selected is caught up on the
       switch back) and still not observed on hardware (#34). Since #57 it runs
