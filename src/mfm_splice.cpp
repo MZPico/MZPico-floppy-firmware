@@ -194,10 +194,6 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
     uint16_t crc = live_receive(&l, idam, sizeof(idam));
     if (l.dead)
       break;
-    // Timestamp the end of the ID field immediately: everything from here is
-    // measured against it, and the checks below cost microseconds.
-    uint32_t t_id = time_us_32();
-
     if (idam[0] != MFM_IO_IDAM || crc != 0)
       continue; // not an ID field, or unreadable -> wait for the next one
     r.ids_seen++;
@@ -235,7 +231,15 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
     // this is zero or one transition -- the search consumes them as fast as
     // they arrive -- but it is exactly the error that would put the splice in
     // the wrong place, and it costs one drain to remove.
+    //
+    // The wait is measured from the moment the drain has emptied the ring,
+    // not from when the ID was decoded: the backlog is disk time from the
+    // ID's end up to the newest transition, which is (to within one interval)
+    // now. Measured from the decode, the flux that arrived between the decode
+    // and the drain was counted twice -- once as elapsed time, once in the
+    // backlog -- and WGATE came on early by that much (#25).
     uint32_t backlog_us = rp2040_flux_capture_backlog() / (GW_SF / 1000000u);
+    uint32_t t_drained = time_us_32();
     rp2040_flux_capture_disable(); // silence the reader for the write
 
     if (backlog_us + 64 >= gap_us) {
@@ -245,7 +249,7 @@ SpliceResult mfm_write_sector(uint8_t want_sec, int want_cyl,
       break;
     }
     uint32_t wait_us = gap_us - backlog_us;
-    while ((time_us_32() - t_id) < wait_us) {
+    while ((time_us_32() - t_drained) < wait_us) {
     }
 
     r.wrote = rp2040_flux_write_now(PIN_WGATE, g_splice_flux, n_flux);
