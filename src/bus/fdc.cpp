@@ -2646,9 +2646,15 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
       S.force_int_latched = false;
       fdc_refresh_int_line();
     }
-    if (!S.busy) // the host has now seen the last command's final status
-      S.t2_final_seen = true;
-    return (uint8_t)~compose_status(); // STATUS (driven CPL'd)
+    {
+      // Composed once: the "host has seen the final status" flag is taken
+      // from the very byte handed over, so core0 dropping BUSY between a
+      // separate test and the compose cannot leave the two disagreeing.
+      uint8_t st = compose_status();
+      if (!(st & 0x01))
+        S.t2_final_seen = true;
+      return (uint8_t)~st; // STATUS (driven CPL'd)
+    }
   case 0xD9:
     return (uint8_t)~S.track; // inverted like the other registers
   case 0xDA:
