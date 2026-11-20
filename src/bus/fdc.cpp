@@ -1067,12 +1067,10 @@ static bool fdc_apply_drive_select(void) {
   // is what stops a host that alternates drives paying the ~300 ms spin-up on
   // each swap. See the spin-up quirk: this drive will not step to TRK00
   // reliably until its disk is actually turning.
-  // ...but only when the host wants the motor on. Forgetting the applied
-  // motor with the motor bit off left ~MOTOR_ON asserted for good: the
-  // deferred stop only runs while g_applied_motor is set (first select of
-  // unit 1 with the motor bit clear; review of #57). The disk task marks the
-  // unit spun when it does run spin_motor() for it.
-  if (!g_spun[want] && S.motor_on) {
+  // (Forgetting the applied motor while the line is physically on is why
+  // the disk task's deferred stop keys on the line itself, not only on
+  // g_applied_motor: see the motor block.)
+  if (!g_spun[want]) {
     g_spun[want] = true;
     g_applied_motor = false;
   }
@@ -3533,7 +3531,7 @@ void fdc_disk_task(void) {
   // is gated by the select, so the index wait timed out and NOT READY stuck
   // (review of #57).
   bool motor_on = S.motor_on;
-  if (idle && DRV && !motor_on && !g_applied_motor) {
+  if (idle && DRV && !motor_on && !g_applied_motor && !DRV->motor_is_spinning()) {
     // Nothing to do and the spindle has stopped (the deferred motor stop
     // below has run): release ~DSn. PC drives light their LED from drive
     // select, not from the motor, so a select held for good kept the LED on
@@ -3587,10 +3585,14 @@ void fdc_disk_task(void) {
       // turning in this unit". Keep it: it is what separates an empty or absent
       // drive from a working one, and STATUS has no other source for NOT READY.
       g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
-      g_spun[fdc_cur_idx()] = true;
       g_applied_motor = true;
     }
-  } else if (g_applied_motor) {
+  } else if (g_applied_motor || DRV->motor_is_spinning()) {
+    // ...or the line is physically on although the bookkeeping forgot it: a
+    // first select of a unit (fdc_apply_drive_select clears g_applied_motor
+    // to force a spin-up and an index sighting) with the host's motor bit
+    // off. Keyed on g_applied_motor alone, that left ~MOTOR_ON asserted for
+    // good (review of #57).
     if (g_motor_off_at == 0)
       g_motor_off_at = now_ms() + FDC_MOTOR_OFF_DELAY_MS;
     else if (now_ms() >= g_motor_off_at) {

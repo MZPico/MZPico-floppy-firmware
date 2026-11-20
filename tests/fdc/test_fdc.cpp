@@ -1880,3 +1880,94 @@ TEST(deselected_drive_reports_its_last_senses) {
     fdc_bench_done();
   });
 }
+
+// Second review pass of #57: the spun/ready bookkeeping.
+static uint8_t unit_flags(int unit) {
+  int t = 0, tg = 0; uint8_t f = 0;
+  fdc_drive_state(unit, &t, &tg, &f);
+  return f;
+}
+// Control: empty unit 1 first selected with the motor bit ON -> NOT READY.
+TEST(empty_unit1_first_selected_with_motor_on_is_not_ready) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1);
+    wait_ms(2500);
+    CHECK(wd::status() & wd::NOTREADY);
+  }, ms(60000));
+}
+// Empty unit 1 first selected with the motor bit OFF while the spindle line is
+// still asserted (deferred-stop window), then motor on: NOT READY never earned.
+TEST(empty_unit1_first_selected_with_motor_off_then_on_is_not_ready) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1, false);
+    wait_ms(100);
+    wd::select(1);
+    wait_ms(2500);
+    CHECK(wd::status() & wd::NOTREADY);
+    CHECK(!(unit_flags(1) & 0x01)); // g_ready[1] must be false
+  }, ms(60000));
+}
+// Same, via a motor-off seek on a released drive (seek block spins it).
+TEST(unit_first_spun_by_a_motor_off_seek_still_gets_its_catch_up_seek) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]); insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    wd::select(1, false);
+    wd::restore();
+    wd::seek(5);
+    CHECK_EQ(cable().drive[1].cyl, 5);
+    wd::select(1);
+    wait_ms(50);
+    CHECK(unit_flags(1) & 0x02); // spun
+    // Dropped-step catch-up at the next switch back to unit 1.
+    wd::select(0);
+    wait_ms(50);
+    // fold a STEP-IN into unit 1's target while core0 has unit 0 selected
+    out(0xDB, 30); out(0xD8, 0x10); wait_ms(10);
+    out(0xDC, 0x85); out(0xD8, 0x50); out(0xDC, 0x84);
+    wd::wait_ready();
+    wait_ms(50);
+    int t = 0, tg = 0; uint8_t f = 0;
+    fdc_drive_state(1, &t, &tg, &f);
+    wd::select(1);
+    wait_ms(20);
+    wait_ms(1500);
+    fdc_drive_state(1, &t, &tg, &f);
+    CHECK_EQ(cable().drive[1].cyl, tg);
+  }, ms(60000));
+}
+// First select of unit 1 from an operation block (core0 busy), motor bit
+// dropped before the next pass: is ~MOTOR_ON ever released?
+TEST(first_select_from_an_operation_then_motor_off_stops_the_spindle) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]); insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0); wd::restore(); wd::side(1);
+    wd::read_sector(0, 1, 512);
+    out(0xDB, 40); out(0xD8, 0x10); wait_ms(10); // core0 busy stepping unit 0
+    wd::select(1);
+    wd::Xfer x = wd::read_address(3000);
+    wd::select(1, false);
+    wait_ms(8000);
+    CHECK(!cable().drive[0].motor);
+    CHECK(pin_level(PIN_DS1));
+  }, ms(60000));
+}
