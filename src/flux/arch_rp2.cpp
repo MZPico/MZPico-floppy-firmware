@@ -525,25 +525,51 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
   pio_sm_set_enabled(g_writer.pio, g_writer.sm, false);
   pio_sm_clear_fifos(g_writer.pio, g_writer.sm);
   pio_sm_exec(g_writer.pio, g_writer.sm, g_writer.offset);
-  while (!pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
+  // Refills stop at the end of the buffer: past it greaseunpack() returns
+  // 0xffff, and queueing those wrote a few long garbage pulses after the
+  // image (#25).
+  while (pulses != pulse_end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
     unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
+    if (value == 0xffff && pulses == pulse_end)
+      break; // a truncated greaseweazle record, not a pulse
     value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
     pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
   }
   pio_sm_set_enabled(g_writer.pio, g_writer.sm, true);
 
   bool old_index_state = false;
+  bool at_index = false;
   while (pulses != pulse_end) {
     bool index_state = gpio_get(index_pin);
     if (old_index_state && !index_state) {
+      at_index = true;
       break; // falling edge of index pin
     }
-    while (!pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
+    while (pulses != pulse_end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
       unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
+      if (value == 0xffff && pulses == pulse_end)
+        break;
       value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
       pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
     }
     old_index_state = index_state;
+  }
+  if (!at_index) {
+    // The image ran out before the index. Disabling the state machine now
+    // would drop whatever is still queued -- the last bytes of the image --
+    // so let the FIFO drain and the last pulse reach the head first, as the
+    // splice does. Never past the index, though: that is the start of the
+    // track (#25).
+    while (!pio_sm_is_tx_fifo_empty(g_writer.pio, g_writer.sm)) {
+      bool index_state = gpio_get(index_pin);
+      if (old_index_state && !index_state) {
+        at_index = true;
+        break;
+      }
+      old_index_state = index_state;
+    }
+    if (!at_index)
+      busy_wait_us_32(32); // the pulse in the OSR (4T at DD is 8 us)
   }
   restore_interrupts(irq);
 
