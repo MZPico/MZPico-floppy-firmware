@@ -13,7 +13,7 @@ Usage:
     python mzp_probe.py PORT fdcseek [track] [param_ms] [mode]  # bench seek; mode 1=spin_motor 0=raw
     python mzp_probe.py PORT fdcread <track> <sector> [side] [dens]  # bench READ SECTOR via the FDC
     python mzp_probe.py PORT rdsoak <track> <sector> [side] [n] [legacy]  # n reads via the LIVE window at random phases; legacy=1 = old 45700-transition window
-    python mzp_probe.py PORT streamscan <track> <side> [dens] [capture_ms]  # A/B: streaming vs batch capture
+    python mzp_probe.py PORT streamscan <track> <side> [dens] [capture_ms]  # A/B: streaming vs batch capture (capture_ms default: rev + sector span)
     python mzp_probe.py PORT bustestreset                 # reset controller-side 0xDF bus-test counters
     python mzp_probe.py PORT bustest                      # 0xDF loopback + I/O-cycle timing diagnostics
     python mzp_probe.py PORT rddiag                       # why the last Type II read succeeded / RNF'd
@@ -1874,7 +1874,9 @@ def main():
             side = int(sys.argv[4])
             dens = (int(sys.argv[5]) if len(sys.argv) > 5
                     else effective_density(s))
-            capture_ms = int(sys.argv[6]) if len(sys.argv) > 6 else 220
+            # 0 = the firmware's read window (one measured revolution + a
+            # sector span), as scan/fdcread/readtrack use.
+            capture_ms = int(sys.argv[6]) if len(sys.argv) > 6 else 0
             do_streamscan(s, track, side, dens, capture_ms)
         elif cmd == "pindrive":
             # Bench C0..C7 pad-drive test (MZP_CMD_DRIVE). This was `drive`

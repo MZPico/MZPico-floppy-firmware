@@ -3032,7 +3032,8 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
   uint8_t *flux = mzp_flux_buffer(&cap);
   int32_t idx = 0;
   size_t nflux = DRV->capture_track(flux, cap, &idx, /*store_greaseweazle=*/false,
-                                    /*capture_ms=*/220, /*index_wait_ms=*/250);
+                                    /*capture_ms=*/fdc_bench_capture_ms(track),
+                                    /*index_wait_ms=*/250);
 
   float bt = density ? 1.0f : FDC_DD_BIT_US;
   SectorRead sd =
@@ -3278,7 +3279,8 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
   int32_t idx = 0;
   size_t nflux = DRV->capture_track(flux_buf, flux_cap, &idx,
                                     /*store_greaseweazle=*/false,
-                                    /*capture_ms=*/220, /*index_wait_ms=*/250);
+                                    /*capture_ms=*/fdc_bench_capture_ms(track),
+                                    /*index_wait_ms=*/250);
   size_t n = mfm_read_track_raw(flux_buf, nflux, fdc_bit_us(),
                                 (uint8_t *)S.track_buf, FDC_TRACK_IMAGE_MAX);
   S.trk_last_bytes = (uint16_t)n;
@@ -3286,6 +3288,10 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
 }
 
 const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
+
+uint32_t fdc_bench_capture_ms(uint8_t track) {
+  return (fdc_read_window_us(track) + 999u) / 1000u;
+}
 
 // True while the MZ-800 has a command in flight. Bench commands (USB) must
 // not touch the drive then: they share the drive, the flux buffer and the

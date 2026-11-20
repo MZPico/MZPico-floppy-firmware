@@ -46,6 +46,11 @@ uint8_t fdc_get_drive(void);
 // merely mislead, it makes fmtverify format one disk and verify another.
 // Release it with fdc_bench_release() so the FDC re-selects from scratch.
 FloppyDrive *fdc_bench_drive(void);
+// Capture length for the bench's whole-track reads (scan, fdcread, readtrack):
+// the read window -- one measured revolution plus a sector span -- in ms, so
+// every sector on the track is caught whole once. A fixed 220 ms was only
+// 1.3 ms longer than the slowest spindle seen (#25).
+uint32_t fdc_bench_capture_ms(uint8_t track);
 void fdc_bench_release(void);
 // True while the MZ-800 has a command in flight: bench drive commands must
 // then be refused (#15).

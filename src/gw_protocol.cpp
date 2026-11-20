@@ -710,7 +710,7 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
     uint32_t nflux = floppy->capture_track(flux_transitions,
                                            sizeof(flux_transitions), &idx,
                                            /*store_greaseweazle=*/false,
-                                           /*capture_ms=*/220,
+                                           /*capture_ms=*/fdc_bench_capture_ms(track),
                                            /*index_wait_ms=*/250);
     int ns = mfm_scan_track(flux_transitions, nflux, bt, g_scan_sectors,
                             MZP_MAX_SECTORS, g_scan_scratch,
@@ -759,7 +759,7 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
     uint8_t dens = cmd_buffer[4];
     uint16_t capture_ms = (uint16_t)cmd_buffer[5] | ((uint16_t)cmd_buffer[6] << 8);
     if (capture_ms == 0)
-      capture_ms = 220;
+      capture_ms = (uint16_t)fdc_bench_capture_ms(track);
     float bt = dens ? 1.0f : 2.0f;
 
     floppy->select(true);
