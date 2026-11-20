@@ -37,8 +37,8 @@ disk live. This is what preserves fidelity:
   either. A cache would defeat this.
 
 What *is* reused: within one READ MULTIPLE, the remaining sectors of the track
-come out of the capture that command is already running (that is still one
-pass of the real disk, exactly what a WD sees).
+come out of the capture that command is already running, each from the pass
+that follows the previous record, which is exactly what a WD sees.
 
 A cache may return later only as an *optional* read-ahead, disabled whenever
 fidelity matters.
@@ -269,27 +269,37 @@ adopts the cylinder the disk reported and drives the head back to
 - **Decoded while capturing; answered early.** The capture fills a DMA ring
   (`arch_rp2.cpp`, 16 KB, with absolute-counter overrun detection), so the
   disk task can decode between drains. Each decode covers the newest flux plus
-  one sector span of overlap, and the READ is answered the moment the
-  requested sector is in the buffer whole with a **good data CRC** — on
-  average about half a revolution after the command, not a fixed window. A
-  ring overrun throws the capture away and restarts it (not counted as a
-  search attempt).
-- **The capture keeps running for READ MULTIPLE.** It is not stopped when the
-  first sector is found; it runs on for the rest of its window, so the next
-  sector is normally already in the buffer when the host asks for it. A
-  sector not yet captured starts a fresh window. The capture ends at once when
-  the command is aborted or superseded (Force Interrupt, any new command).
+  one sector span of overlap, and the READ is answered the moment the first
+  copy of the requested sector the head meets is in the buffer **whole, good
+  CRC or bad**: on average about half a revolution after the command, not a
+  fixed window. A copy cut off by the end of the flux is "not captured yet",
+  never an answer (the decoder reports it as `truncated`); once its ID has
+  matched, the window is stretched until its data field is in, since a WD
+  that has matched an ID reads the field whatever the time. A ring overrun
+  throws the capture away and restarts it (not counted as a search attempt).
+- **READ MULTIPLE searches forward, as a WD does.** Each record after the
+  first is looked for from the end of the previous one, so sector N+1 is read
+  on the pass that follows N, never a copy that passed the head before N did
+  (with weak bits those passes differ, #51). The capture is not stopped when a
+  record is found: every record published stretches it to a whole window past
+  that record, so the records after a wrap past the index come from the
+  capture's second pass. When the buffer runs low (one revolution of HD flux
+  is most of it) it slides forward, dropping the flux behind the last record.
+  A record not captured all the same starts a fresh window. The capture ends
+  at once when the command is aborted or superseded (Force Interrupt, any new
+  command). A whole track therefore takes the WD's time: the latency to its
+  first record, then about one revolution.
 - **A missing sector is searched for over 4 windows** (~4.4 revolutions, the
   WD's "until the fifth index pulse") before RNF, each starting at a new
   rotational phase. A wrong-cylinder result skips the extra windows (another
   revolution cannot move the head; the resync is the fix).
-- **A data CRC error is reported, never retried internally.** If no good copy
-  turns up inside the window, the first copy of the sector in the capture is
-  delivered with CRC ERROR set, exactly as read; no further window is spent on
-  it. (The early-answer path can only pick a later, good copy when the one
-  window happens to hold two whole passes of the sector — i.e. its first pass
-  began right at the window start.) CRC ERROR is sticky across a READ MULTIPLE
-  and ends it, as on a WD.
+- **A data CRC error is reported, never retried internally.** The first
+  copy the head meets is delivered with CRC ERROR set, exactly as read; no
+  later copy and no further window is spent on it. A weak-bit sector
+  therefore reads bad or good according to the one pass a WD would have read
+  (`weak_sector_*` tests, with a simulated disk whose weak stretch alternates
+  by revolution). CRC ERROR is sticky across a READ MULTIPLE and ends it, as
+  on a WD.
 - Deleted data marks set the record-type bit.
 
 ### READ ADDRESS

@@ -365,12 +365,16 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     random phases through the live window): old window 7/200 failures, new
     200/200. A count-based window must never come back.
     **Since #35 a READ is answered early:** the capture is decoded as it
-    arrives, and the sector is published as soon as it is whole with a good
-    CRC. That averages ~140 ms at a random rotational phase instead of the
-    whole ~225 ms window. The capture keeps running for the rest of its
-    window, so the next sector of a READ MULTIPLE is usually already in the
-    buffer. Stopping at the first sector made every following one wait a
-    revolution, which failed READ MULTIPLE at HD. The window is still the
+    arrives, and the first copy of the sector the head meets is published as
+    soon as it is whole, good CRC or bad (#51: waiting for a good copy turned
+    a weak sector's CRC error into clean data). That averages ~140 ms at a
+    random rotational phase instead of the whole ~225 ms window. The capture
+    keeps running, so the next sector of a READ MULTIPLE is usually already in
+    the buffer; each record is searched for **forward from the previous one**,
+    as on a WD, and every record read stretches the capture a window further
+    (the buffer slides when it runs low at HD). Stopping at the first sector
+    made every following one wait a revolution, which failed READ MULTIPLE at
+    HD. The window is still the
     limit for a sector that is not there, and a missing sector is searched for
     over 4 windows (the WD's "until the fifth index pulse") before RNF. The
     spindle is measured continuously from ~INDEX: every capture loop and every

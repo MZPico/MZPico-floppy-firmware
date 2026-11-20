@@ -94,6 +94,7 @@ Track encode_track(const TrackSpec &t, uint32_t jitter, uint32_t seed) {
   gap(50);           // gap 1
   for (const SectorSpec &s : t.sectors) {
     uint16_t crc;
+    out.id_at.push_back((uint32_t)w.t());
     if (!s.no_id) {
       zeros(12);
       crc = 0xFFFF;
@@ -125,7 +126,12 @@ Track encode_track(const TrackSpec &t, uint32_t jitter, uint32_t seed) {
       w.byte(mark);
       crc = crc16_ccitt(crc, mark);
       size_t len = (size_t)128 << (s.n & 3);
+      uint32_t weak_a0 = 0;
       for (size_t i = 0; i < len; ++i) {
+        if (s.weak && i == len / 4)
+          weak_a0 = (uint32_t)w.t();
+        if (s.weak && i == len / 4 + 16)
+          out.weak.push_back({weak_a0, (uint32_t)w.t()});
         uint8_t b = i < s.data.size() ? s.data[i] : 0;
         w.byte(b);
         crc = crc16_ccitt(crc, b);

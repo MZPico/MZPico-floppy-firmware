@@ -1659,6 +1659,23 @@ bool g_rc_active = false; // a READ capture is running (g_stream_active too)
 // landing between the fresh-capture check and the decode must not be served
 // from the previous command's flux (another drive, side or cylinder).
 uint32_t g_flux_gen = 0;
+// Where in the buffer the next record of the command is looked for: just past
+// the previous one, as on a WD -- a READ MULTIPLE reads sector N+1 on the
+// pass that follows N, never a copy that went by before N did. With weak bits
+// those two passes differ (#51). 0 for the first record of a capture.
+static size_t g_rd_from = 0;
+
+static SectorRead fdc_decode_sector(uint8_t want) {
+  size_t cap = 0;
+  uint8_t *flux = mzp_flux_buffer(&cap);
+  if (g_rd_from > g_flux_n) // the buffer was reset under us
+    g_rd_from = 0;
+  SectorRead sd = mfm_read_sector(flux + g_rd_from, g_flux_n - g_rd_from,
+                                  fdc_bit_us(), want, S.track, g_secbuf,
+                                  sizeof(g_secbuf));
+  sd.end_pos += g_rd_from;
+  return sd;
+}
 
 static void fdc_read_capture_end(bool complete) {
   if (g_stream_active) {
@@ -1688,6 +1705,17 @@ static bool fdc_read_capture_pump(void) {
   if (!S.reading || S.cmd_gen != g_rc.gen) {
     fdc_read_capture_end(false); // nobody wants the rest
     return false;
+  }
+  // A READ MULTIPLE that has worked its way into the buffer no longer needs
+  // the flux behind its last record (see g_rd_from): slide the buffer so the
+  // capture can keep going. One revolution of HD flux is most of the buffer,
+  // and the records after a wrap past the index are on the second pass.
+  if (g_rd_from > 0 && g_flux_n > cap - cap / 4) {
+    size_t shift = g_rd_from;
+    memmove(flux, flux + shift, g_flux_n - shift);
+    g_flux_n -= shift;
+    g_rc.decoded = g_rc.decoded > shift ? g_rc.decoded - shift : 0;
+    g_rd_from = 0;
   }
   bool at_end = now - g_rc.t0 >= g_rc.window_us || g_flux_n >= cap;
   if (!at_end)
@@ -1729,6 +1757,7 @@ static void fdc_read_capture_start(uint32_t window_us, uint32_t gen) {
   g_rc.window_us = window_us;
   g_rc.gen = gen;
   g_flux_gen = gen;
+  g_rd_from = 0;
   g_rc.decoded = 0;
   // Early answers do not wait for the spindle to be measured: the default
   // window (FDC_REV_US_DEFAULT + a sector) already covers the slowest drive
@@ -1767,10 +1796,24 @@ static void fdc_read_capture_until(uint8_t want) {
          g_rc.decoded != 0))
       continue;
     size_t from = g_rc.decoded > back ? g_rc.decoded - back : 0;
+    if (from < g_rd_from && g_rd_from <= g_flux_n)
+      from = g_rd_from; // never before the previous record (see g_rd_from)
     SectorRead sd = mfm_read_sector(flux + from, g_flux_n - from, bit, want,
                                     S.track, g_secbuf, sizeof(g_secbuf));
     g_rc.decoded = g_flux_n;
-    if (sd.found && sd.has_data && sd.data_crc_ok) {
+    // An ID matched, its data field still arriving: a WD that has matched an
+    // ID reads the field, whatever the time. Without this the window can end
+    // mid-field and the record waits a revolution for its next pass.
+    if (sd.found && sd.truncated && g_rc_active) {
+      uint32_t need = (time_us_32() - g_rc.t0) + fdc_sector_span_us(S.track);
+      if (need > g_rc.window_us)
+        g_rc.window_us = need;
+    }
+    // The first complete copy is the answer, good CRC or bad: a WD reads the
+    // first ID match it meets and reports that data field. Waiting for a
+    // better copy turned a weak-bit sector's CRC error into clean data, or
+    // into a CRC error a revolution late (#51).
+    if (sd.found && sd.has_data && !sd.truncated) {
       S.rd_early++;
       S.rd_capture_us = time_us_32() - g_rc.t0;
       S.rd_flux_n = g_flux_n;
@@ -4335,14 +4378,15 @@ void fdc_disk_task(void) {
         // ring overrun -- is pumped by the not-captured-yet path below, not
         // reported as RNF.)
         // WD ID track compare against the Track register -- see MFM_ANY_CYL.
-        sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
-                             g_secbuf, sizeof(g_secbuf));
+        sd = fdc_decode_sector(want);
         // A buffer that stopped early (fdc_read_capture_until) holds the track only
         // up to the previous sector. Not finding this one there -- or finding
         // it cut off at the buffer's end -- means "not captured yet": capture
         // for it now. This is the normal path for every sector of a READ
         // MULTIPLE after the first, and it does not count as an attempt.
-        if (!(sd.found && sd.has_data && sd.data_crc_ok) && !g_flux_complete &&
+        // A record cut off by the end of a finished buffer is the same case:
+        // its CRC describes the cut, not the disk.
+        if ((sd.truncated || (!(sd.found && sd.has_data) && !g_flux_complete)) &&
             S.reading && S.cmd_gen == gen) {
           if (!g_rc_active || g_rc.gen != gen) { // stopped short: start again
             fdc_apply_side();
@@ -4350,9 +4394,13 @@ void fdc_disk_task(void) {
           }
           fdc_read_capture_until(want);
           if (S.reading && S.cmd_gen == gen && g_flux_n > 0)
-            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
-                                 g_secbuf, sizeof(g_secbuf));
+            sd = fdc_decode_sector(want);
         }
+        // Still cut off (the recapture saw no flux, or ended inside the field
+        // too): its bytes are not the disk's. Never deliver them -- search on
+        // below, and RNF if no complete copy turns up.
+        if (sd.truncated)
+          sd.found = sd.has_data = sd.data_crc_ok = false;
         // Nothing AT ALL at the latched density -- not even a wrong-cylinder
         // ID, which would prove the clock is right and the problem positional.
         // Re-decode the same window at the other bit clock before reporting
@@ -4365,9 +4413,11 @@ void fdc_disk_task(void) {
         if (!sd.found && !sd.cyl_mismatch) {
           uint8_t idtmp[6];
           if (!mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
-              fdc_try_other_density(flux, g_flux_n))
-            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
-                                 g_secbuf, sizeof(g_secbuf));
+              fdc_try_other_density(flux, g_flux_n)) {
+            sd = fdc_decode_sector(want);
+            if (sd.truncated) // as above: never deliver a cut-off field
+              sd.found = sd.has_data = sd.data_crc_ok = false;
+          }
         }
         // Still not found: keep searching, as a WD does -- it matches ID
         // fields until the fifth index pulse (4-5 revolutions) before RNF. A
@@ -4392,9 +4442,11 @@ void fdc_disk_task(void) {
           fdc_read_capture_until(want);
           if (g_rc_active) // found early: no need to hold the rest
             fdc_read_capture_end(false);
-          if (S.reading && S.cmd_gen == gen && g_flux_n > 0)
-            sd = mfm_read_sector(flux, g_flux_n, fdc_bit_us(), want, S.track,
-                                 g_secbuf, sizeof(g_secbuf));
+          if (S.reading && S.cmd_gen == gen && g_flux_n > 0) {
+            sd = fdc_decode_sector(want);
+            if (sd.truncated) // cut off by the window's end: search on
+              sd.found = sd.has_data = sd.data_crc_ok = false;
+          }
         }
       }
       // A look-ahead that was never found, on a track whose last complete
@@ -4477,6 +4529,15 @@ void fdc_disk_task(void) {
           // (see FDC_SIZE_CACHE_N). The ID track compare has already confirmed
           // sd.cyl == the Track register, so either indexes the same entry.
           fdc_note_size_code(sd.cyl, sd.size_n);
+          g_rd_from = sd.end_pos; // the next record is searched for after it
+          // ...for up to a whole window from here, as a WD keeps looking: the
+          // window counted from the capture's start would cut off the second
+          // pass, which is where the records after a wrap past the index are.
+          if (S.multi && g_rc_active && g_rc.gen == gen) {
+            uint32_t need = (time_us_32() - g_rc.t0) + fdc_read_window_us(S.track);
+            if (need > g_rc.window_us)
+              g_rc.window_us = need;
+          }
           S.last_id_cyl = sd.cyl;
           S.last_id_head = sd.head;
           S.last_trk_reg = S.track;
