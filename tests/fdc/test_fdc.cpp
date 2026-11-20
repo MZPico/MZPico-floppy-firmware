@@ -1727,11 +1727,7 @@ TEST(drive_is_deselected_after_the_motor_stops_and_reselected_on_use) {
     wd::Xfer x = wd::read_sector(0, 2, 512);
     CHECK_EQ(error_bits(x.status), 0);
     CHECK(matches_pattern(x.data, 0, 0, 2));
-    // ...and a seek without a motor command first also reselects.
-    wd::select(0, false);
-    wait_ms(4000);
-    CHECK(pin_level(PIN_DS0));
-    wd::select(0);
+    // (A seek with the motor bit still off is its own test, below.)
     wd::seek(5);
     CHECK(!pin_level(PIN_DS0));
     CHECK_EQ(cable().drive[0].cyl, 5);
@@ -1761,4 +1757,126 @@ TEST(write_protect_survives_the_deselected_stretch) {
     CHECK(st & wd::WPROT);
     CHECK(cable().drive[0].writes.empty() || cable().drive[0].writes.back().refused_wp);
   }, ms(60000));
+}
+
+// Found by review of #57.
+TEST(motor_on_landing_in_the_deselect_pass_does_not_latch_not_ready) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(0, 1, 512).status), 0);
+    wd::select(0, /*motor=*/false);
+    wait_ms(2900);
+    int guard = 0;
+    while (!pin_level(PIN_DS0) && guard++ < 400000)
+      wait_us(1);
+    wd::select(0); // motor on, right as the deselect pass is in select()'s delay
+    wait_ms(2000);
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::NOTREADY));
+    wd::Xfer x = wd::read_sector(0, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    wait_ms(500);
+    CHECK(!(wd::status() & wd::NOTREADY));
+  }, ms(60000));
+}
+
+TEST(seek_with_the_motor_bit_off_reselects_and_releases_again) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    uint32_t steps0 = cable().drive[0].steps;
+    wd::seek(5);
+    CHECK_EQ(cable().drive[0].cyl, 5);
+    wait_ms(5000);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(!cable().drive[0].motor);
+  }, ms(60000));
+}
+
+TEST(first_select_of_unit1_with_motor_off_still_stops_the_spindle) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]);
+  insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    wd::select(1, false); // first ever select of unit 1, motor bit off
+    wait_ms(8000);
+    CHECK(!cable().drive[0].motor);
+  }, ms(60000));
+}
+
+TEST(switching_units_while_deselected_selects_nothing_until_used) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  g_disk[1].write_protect = true;
+  insert(0, &g_disk[0]);
+  insert(1, &g_disk[1]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(7);
+    wd::side(1);
+    wd::read_sector(7, 1, 512);
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(pin_level(PIN_DS0));
+    wd::select(1, false);
+    wait_ms(100);
+    wd::select(2, false);
+    wait_ms(100);
+    CHECK(wd::seek(3) & wd::NOTREADY); // unit 2 does not exist
+    wd::select(1);
+    wd::restore();
+    CHECK_EQ(cable().drive[1].cyl, 0);
+    CHECK_EQ(cable().drive[0].cyl, 7); // unit 0's head has not moved
+    std::vector<uint8_t> d(512, 0xA5);
+    uint8_t w = wd::write_sector(0, 3, d).status;
+    CHECK(w & wd::WPROT);
+    wd::select(0);
+    wd::Xfer x = wd::read_sector(7, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 7, 0, 2));
+  }, ms(60000));
+}
+
+// The held senses themselves: no FDC path samples ~TRK00/~WPT while the drive
+// is deselected today, so this drives FloppyDrive directly.
+TEST(deselected_drive_reports_its_last_senses) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[0].write_protect = true;
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    CHECK(!fdc_host_busy());
+    FloppyDrive *d = fdc_bench_drive();
+    REQUIRE(d != nullptr);
+    CHECK(d->get_track0_sense());
+    CHECK(d->get_write_protect());
+    d->select(false);
+    CHECK(pin_level(PIN_DS0));
+    CHECK(d->get_track0_sense());  // the lines float now; the values are held
+    CHECK(d->get_write_protect());
+    d->select(true);
+    d->goto_track(3);
+    CHECK(!d->get_track0_sense()); // and refreshed once selected again
+    fdc_bench_release();
+    fdc_bench_done();
+  });
 }

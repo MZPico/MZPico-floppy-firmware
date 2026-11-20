@@ -1067,7 +1067,12 @@ static bool fdc_apply_drive_select(void) {
   // is what stops a host that alternates drives paying the ~300 ms spin-up on
   // each swap. See the spin-up quirk: this drive will not step to TRK00
   // reliably until its disk is actually turning.
-  if (!g_spun[want]) {
+  // ...but only when the host wants the motor on. Forgetting the applied
+  // motor with the motor bit off left ~MOTOR_ON asserted for good: the
+  // deferred stop only runs while g_applied_motor is set (first select of
+  // unit 1 with the motor bit clear; review of #57). The disk task marks the
+  // unit spun when it does run spin_motor() for it.
+  if (!g_spun[want] && S.motor_on) {
     g_spun[want] = true;
     g_applied_motor = false;
   }
@@ -1088,7 +1093,11 @@ static bool fdc_apply_drive_select(void) {
   // the next Type I recalibrates anyway, and stepping here would do it before
   // the spindle is up -- which this drive will not tolerate (see the spin-up
   // quirk in fdc_disk_task).
-  if (prev && g_applied_motor && next->track() >= 0) {
+  // Not when the SAME drive is merely being selected again (after the idle
+  // release, #56, or a bench command): its head only differs from its target
+  // if the bench moved it, and that is fdc_bench_restore_head()'s job, at
+  // the start of the next operation -- idle passes must not move the head.
+  if (prev && prev != next && g_applied_motor && next->track() >= 0) {
     // Apply the FDC step timing before moving: these are per-instance and this
     // drive is still on the flux-capture defaults (12 ms/step), which would
     // turn a full-stroke catch-up into a ~1 s stall inside the disk task.
@@ -3518,7 +3527,13 @@ void fdc_disk_task(void) {
   // a command pending -- every later command BUSY forever, even after it
   // re-selected drive 0 (issue #8).
   bool idle = !S.reading && !S.writing && S.trk_op == 0 && S.op_done == S.op_seq;
-  if (idle && DRV && !S.motor_on && !g_applied_motor) {
+  // ONE read of the host's motor bit for the whole pass. The deselect decision
+  // here and the spin-up below must agree: read twice, a motor-on landing
+  // between the two spun up a drive this pass had just deselected -- ~INDEX
+  // is gated by the select, so the index wait timed out and NOT READY stuck
+  // (review of #57).
+  bool motor_on = S.motor_on;
+  if (idle && DRV && !motor_on && !g_applied_motor) {
     // Nothing to do and the spindle has stopped (the deferred motor stop
     // below has run): release ~DSn. PC drives light their LED from drive
     // select, not from the motor, so a select held for good kept the LED on
@@ -3558,13 +3573,21 @@ void fdc_disk_task(void) {
   }
   // Motor with a spin-down delay: spin up on request (spin_motor waits for
   // index = disk really turning), but defer stop so retries keep the spin-up.
-  if (S.motor_on) {
+  if (motor_on) {
     g_motor_off_at = 0; // cancel any pending stop
     if (!g_applied_motor) {
+      // Never spin up a deselected drive (see `motor_on` above): with an
+      // operation pending the idle gate did not run, and the drive may still
+      // be released from the last motor stop.
+      if (!g_applied_select && (!fdc_apply_drive_select() || !DRV)) {
+        fdc_end_for_missing_unit();
+        return;
+      }
       // The return value is the index sighting -- i.e. "is a disk actually
       // turning in this unit". Keep it: it is what separates an empty or absent
       // drive from a working one, and STATUS has no other source for NOT READY.
       g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+      g_spun[fdc_cur_idx()] = true;
       g_applied_motor = true;
     }
   } else if (g_applied_motor) {
