@@ -186,7 +186,6 @@ struct FdcState {
   volatile bool type2 = false;
   volatile bool reading = false;
   volatile bool pending_force_int = false;
-  volatile uint32_t pending_force_since_us = 0;
   volatile uint32_t last_data_read_us = 0;
   volatile bool multi = false; // multi-record read (auto-advance sectors)
   volatile bool read_addr = false; // Type III READ ADDRESS in flight
@@ -218,7 +217,6 @@ struct FdcState {
   volatile uint8_t wr_sector = 1; // sector being written
   volatile bool wr_deleted = false; // command bit a0: write a deleted DAM
   volatile uint32_t wr_seq = 0;   // core1 -> core0: "splice this buffer"
-  volatile uint32_t wr_done = 0;
 
   // ---- Type III READ TRACK / WRITE TRACK (3.4) ---------------------------
   // Both move a whole track at once -- far more than the one-sector xfer[]
@@ -236,7 +234,6 @@ struct FdcState {
   volatile uint32_t trk_done = 0;
   volatile uint16_t trk_pos = 0;  // host's position within track_buf
   volatile uint16_t trk_len = 0;  // bytes valid / expected
-  volatile uint32_t trk_implausible = 0; // images refused as not-a-format
   volatile uint32_t trk_ok = 0;      // tracks formatted / read
   volatile uint32_t trk_fail = 0;    // ...that failed to reach the media
   volatile uint32_t trk_last_us = 0; // last operation's disk time
@@ -416,7 +413,6 @@ struct FdcState {
   volatile uint32_t rst_rise = 0;         // low -> high transitions
   volatile uint32_t rst_fall = 0;         // high -> low
   volatile uint32_t rst_high_max_us = 0;  // longest completed HIGH excursion
-  volatile uint32_t rst_low_min_us = 0;   // (unused with edge IRQs)
   volatile uint32_t rst_last_high_us = 0; // most recent completed HIGH length
 
   volatile uint32_t pos_resyncs = 0;
@@ -902,7 +898,6 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   S.read_addr = false;
   S.multi = false;
   S.pending_force_int = false;
-  S.pending_force_since_us = 0;
 
   // 3. Abandon writes that have not reached the media. One already in the
   //    splice or laying a track down finishes -- that flux is going onto the
@@ -2202,7 +2197,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // the published sector buffer, defer completion until that buffer is
         // fully consumed, but only while DATA reads keep progressing.
         S.pending_force_int = true;
-        S.pending_force_since_us = time_us_32();
       } else {
         if (S.reading) // diagnostic: how long did the host actually wait?
           S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
@@ -2211,7 +2205,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.read_addr = false;
         S.drq = false;
         S.pending_force_int = false;
-        S.pending_force_since_us = 0;
         // A write that has not been handed to core0 yet is simply dropped. One
         // already in the splice cannot be: the flux is going onto the media in
         // real time and there is no more stopping it than there is on a real
@@ -2286,7 +2279,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // the current Sector register off a fresh capture of the current track.
         S.reading = true;
         S.pending_force_int = false;
-        S.pending_force_since_us = 0;
         S.drq = false;
         S.xfer_len = 0;
         S.xfer_pos = 0;
@@ -2358,7 +2350,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       S.read_addr = true;
       S.multi = false;
       S.pending_force_int = false;
-      S.pending_force_since_us = 0;
       S.drq = false;
       S.xfer_len = 0;
       S.xfer_pos = 0;
@@ -2631,7 +2622,6 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
           S.reading = false;
           S.busy = false;
           S.pending_force_int = false;
-          S.pending_force_since_us = 0;
           fdc_refresh_int_line();
           return (uint8_t)~b;
         }
@@ -2874,7 +2864,6 @@ void fdc_resetdiag_snapshot(FdcResetDiag *o) {
   o->rise = S.rst_rise;
   o->fall = S.rst_fall;
   o->high_max_us = S.rst_high_max_us;
-  o->low_min_us = S.rst_low_min_us;
   o->last_high_us = S.rst_last_high_us;
   o->events = S.reset_events;
   o->at_ms = S.reset_at_ms;
@@ -2885,7 +2874,6 @@ void fdc_resetdiag_clear(void) {
   S.rst_rise = 0;
   S.rst_fall = 0;
   S.rst_high_max_us = 0;
-  S.rst_low_min_us = 0;
   S.rst_last_high_us = 0;
   S.reset_events = 0;
   S.reset_at_ms = 0;
@@ -3870,7 +3858,7 @@ void fdc_disk_task(void) {
     bool ok = false;
     uint32_t t0 = time_us_32();
     if (!plausible) {
-      S.trk_implausible++;
+      // not a format image: nothing written, ok stays false
     } else if (!ready) {
       // nothing written; reported below as a failed track write
     } else if (!S.write_protect) {
@@ -4094,14 +4082,12 @@ void fdc_disk_task(void) {
         S.busy = false;
         fdc_refresh_int_line();
       }
-      S.wr_done = seq;
       return;
     }
 
     float bit = fdc_bit_us();
     fdc_wait_head_ready(true); // the splice hunts IDs by reading
     if (S.cmd_gen != gen) { // superseded during the wait: write nothing
-      S.wr_done = seq;
       return;
     }
     SpliceResult sr =
@@ -4217,7 +4203,6 @@ void fdc_disk_task(void) {
       }
       fdc_refresh_int_line();
     }
-    S.wr_done = seq;
     return;
   }
 
@@ -4236,7 +4221,6 @@ void fdc_disk_task(void) {
       S.busy = false;
       S.drq = false;
       S.pending_force_int = false;
-      S.pending_force_since_us = 0;
       fdc_refresh_int_line();
     }
 

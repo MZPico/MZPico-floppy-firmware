@@ -330,7 +330,7 @@ bool rp2040_flux_write_now(int wrgate_pin, const uint8_t *pulses, size_t n) {
 // waits are bounded at 600 ms, as in arch_rp2.cpp (issue #7); the guard below
 // reports a hang should that bound ever go missing again.
 bool rp2040_flux_write(int index_pin, int wrgate_pin, int, uint8_t *pulses,
-                       uint8_t *pulse_end, bool, bool, bool use_index) {
+                       uint8_t *pulse_end, bool, bool use_index) {
   uint64_t start = now();
   auto timed_out = [&] {
     if (now() - start > sim::ms(10000))

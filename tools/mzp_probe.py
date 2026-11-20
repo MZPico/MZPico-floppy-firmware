@@ -625,7 +625,7 @@ def do_bustest(s):
     err_gap, err_garbage = u32(17), u32(21)
     bits_want1, bits_want0, mm_n = r[25], r[26], r[27]
     mm_exp, mm_got = r[28:36], r[36:44]
-    wr_late_pop, wr_late_sample = u32(44), u32(48)
+    wr_late_pop = u32(44)  # u32(48) is reserved (was wr_late_at_sample, always 0)
     rd_late_pop = u32(52)
     wr_backlog, rd_backlog = u32(56), u32(60)
     bit_high = [u32(64 + 4 * k) for k in range(8)]
@@ -700,7 +700,6 @@ def do_bustest(s):
         print("    UNVERIFIED -- use the 0xDE echo program, see --help)")
     print("  I/O-cycle timing:")
     print(f"    write cycle already over when core1 popped : {wr_late_pop}")
-    print(f"    write cycle ended mid-sample               : {wr_late_sample}")
     print(f"    read  cycle already over when core1 popped : {rd_late_pop}")
     if len(r) >= 148:
         print(f"    read  served but the Z80 had already sampled: {u32(144)}"
@@ -1188,14 +1187,14 @@ def do_resetdiag(s, clear=False):
         print(f"bad/short reply: {r.hex()}{busy_hint(r)}")
         return
     line = r[2]
-    (samples, rise, fall, high_max, low_min, last_high, events,
+    # slot 4 is reserved (was the shortest LOW excursion, never measured)
+    (samples, rise, fall, high_max, _reserved, last_high, events,
      at_ms) = [int.from_bytes(r[3 + 4 * k:7 + 4 * k], "little") for k in range(8)]
     print(f"RESET pin (GPIO29) level now: {'HIGH' if line else 'low'}")
     print(f"  edge IRQs taken  : {samples}")
     print(f"  edges seen       : {rise} rising, {fall} falling")
     print(f"  longest HIGH     : {high_max} us"
           + (f"  (most recent {last_high} us)" if last_high else ""))
-    print(f"  shortest LOW     : {low_min} us")
     print(f"  resets acted on  : {events}"
           + (f"  (last at {at_ms / 1000:.1f} s)" if events else ""))
     print()

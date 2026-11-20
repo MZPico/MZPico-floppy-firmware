@@ -310,6 +310,5 @@ size_t FloppyDrive::capture_track(volatile uint8_t *pulses, size_t max_pulses,
 bool FloppyDrive::write_track(uint8_t *pulses, size_t n_pulses,
                               bool store_greaseweazle, bool use_index) {
   return rp2040_flux_write(_indexpin, _wrgatepin, _wrdatapin, pulses,
-                           pulses + n_pulses, store_greaseweazle,
-                           /*is_apple2=*/false, use_index);
+                           pulses + n_pulses, store_greaseweazle, use_index);
 }

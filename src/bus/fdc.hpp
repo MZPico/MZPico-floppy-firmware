@@ -346,7 +346,6 @@ struct FdcResetDiag {
   uint32_t samples;      // RESET edge interrupts taken (is the IRQ even firing?)
   uint32_t rise, fall;   // edges seen since the counters were cleared
   uint32_t high_max_us;  // longest completed HIGH excursion
-  uint32_t low_min_us;   // shortest completed LOW excursion
   uint32_t last_high_us; // most recent completed HIGH length
   uint32_t events;       // confirmed resets acted on
   uint32_t at_ms;

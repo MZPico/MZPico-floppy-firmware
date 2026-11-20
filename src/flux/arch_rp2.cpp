@@ -55,14 +55,6 @@ static const pio_program_t fluxwrite_struct = {
     .length = sizeof(fluxwrite) / sizeof(fluxwrite[0]),
     .origin = -1};
 
-static const uint16_t fluxwrite_apple2[] = {
-    0x6030, 0xe001, 0xb042, 0x0043, 0x6030, 0xe000, 0xb042, 0x0047,
-};
-static const pio_program_t fluxwrite_apple2_struct = {
-    .instructions = fluxwrite_apple2,
-    .length = sizeof(fluxwrite_apple2) / sizeof(fluxwrite_apple2[0]),
-    .origin = -1};
-
 typedef struct floppy_singleton {
   PIO pio;
   const pio_program_t *program;
@@ -453,12 +445,11 @@ void rp2040_flux_capture_disable(void) {
 
 // ---- Write ----
 
-static bool init_write(int wrdata_pin, bool is_apple2) {
+static bool init_write(int wrdata_pin) {
   if (g_writer.pio) {
     return true;
   }
-  const pio_program_t *program =
-      is_apple2 ? &fluxwrite_apple2_struct : &fluxwrite_struct;
+  const pio_program_t *program = &fluxwrite_struct;
   if (!allocate_pio_set_program(&g_writer, program)) {
     return false;
   }
@@ -592,7 +583,7 @@ static void free_write() {
 // ---- Pre-armed write (splice) ----
 
 bool rp2040_flux_write_prepare(int wrdata_pin) {
-  return init_write(wrdata_pin, false);
+  return init_write(wrdata_pin);
 }
 
 void rp2040_flux_write_release(void) { free_write(); }
@@ -661,9 +652,8 @@ uint32_t rp2040_flux_capture(int index_pin, int rdpin, volatile uint8_t *pulses,
 
 bool rp2040_flux_write(int index_pin, int wrgate_pin, int wrdata_pin,
                        uint8_t *pulses, uint8_t *pulse_end,
-                       bool store_greaseweazle, bool is_apple2,
-                       bool use_index) {
-  if (!init_write(wrdata_pin, is_apple2)) {
+                       bool store_greaseweazle, bool use_index) {
+  if (!init_write(wrdata_pin)) {
     return false;
   }
   bool ok = write_foreground(index_pin, wrgate_pin, pulses, pulse_end,

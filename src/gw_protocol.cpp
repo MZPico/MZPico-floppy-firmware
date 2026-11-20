@@ -1131,7 +1131,7 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
   else if (cmd == MZP_CMD_BUSTEST) {
     // [cmd, ACK, active, last_rx, last_echo, rx(4), rd(4), err(4), err_gap(4),
     //  err_garbage(4), bits_want1, bits_want0, mm_n, mm_exp[8], mm_got[8],
-    //  wr_late_at_pop(4), wr_late_at_sample(4), rd_late_at_pop(4),
+    //  wr_late_at_pop(4), reserved(4) (was wr_late_at_sample; 0), rd_late_at_pop(4),
     //  wr_backlog(4), rd_backlog(4), bit_high[8]*4, err_adjacent(4),
     //  rd_reports(4), rd_err(4), rd_bits_want1, rd_bits_want0, rd_last_exp,
     //  rd_last_got, rd_bit_high[8]*4, rd_late_at_drive(4)]  -- 148 bytes.
@@ -1155,7 +1155,7 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
     for (int k = 0; k < 8; k++)
       reply_buffer[i++] = b.mm_got[k];
     const uint32_t d32[] = {
-        g_bus_diag.wr_late_at_pop, g_bus_diag.wr_late_at_sample,
+        g_bus_diag.wr_late_at_pop, 0u /*reserved*/,
         g_bus_diag.rd_late_at_pop, g_bus_diag.wr_backlog,
         g_bus_diag.rd_backlog};
     for (uint32_t v : d32) {
@@ -1319,14 +1319,16 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
 
   else if (cmd == MZP_CMD_RESETDIAG) {
     // cmd_buffer[2]: 1 = clear the counters after reporting.
-    // [cmd, ACK, line, samples(4), rise(4), fall(4), high_max(4), low_min(4),
-    //  last_high(4), events(4), at_ms(4)] -- 35 bytes.
+    // [cmd, ACK, line, samples(4), rise(4), fall(4), high_max(4), reserved(4),
+    //  last_high(4), events(4), at_ms(4)] -- 35 bytes. The reserved slot was
+    //  the shortest LOW excursion, never measured with edge IRQs; kept at 0
+    //  so older probes still parse the reply.
     FdcResetDiag d;
     fdc_resetdiag_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
     reply_buffer[i++] = d.line;
     const uint32_t v32[] = {d.samples,     d.rise,   d.fall,   d.high_max_us,
-                            d.low_min_us,  d.last_high_us, d.events, d.at_ms};
+                            0u /*reserved*/, d.last_high_us, d.events, d.at_ms};
     for (uint32_t v : v32) {
       for (int k = 0; k < 4; k++)
         reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
