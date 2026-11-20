@@ -184,6 +184,17 @@ struct FdcState {
   // `type2` selects the Type II STATUS layout (set by a Type II command, cleared
   // by a Type I command). `reading` = a read transfer is in flight (BUSY held).
   volatile bool type2 = false;
+  // The host has read the final STATUS of the last Type II/III command (a
+  // STATUS read with BUSY clear). Until then a Force Interrupt is treated as
+  // ending that command, whatever BUSY says: we drop BUSY the moment the last
+  // byte is taken, a WD only after the CRC bytes, and the ROM sends its 0xD0
+  // right there and expects the command's own status (#58).
+  volatile bool t2_final_seen = false;
+  // STATUS is in the Type I layout because of an idle Force Interrupt after a
+  // data command: the status register's CRC and RNF bits stay as that command
+  // left them (they are latches; only Index/TRK00/WP go live), and bit 4 is
+  // that RNF, not a Seek Error from some earlier Type I.
+  volatile bool fi_type1 = false;
   volatile bool reading = false;
   volatile bool pending_force_int = false;
   volatile uint32_t pending_force_since_us = 0;
@@ -924,6 +935,17 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   //    we know of issues its own RESTORE at startup anyway.
   S.sector = 1;
   S.command = 0;
+  // ...and it clears the status register: no command, so the Type I layout,
+  // with nothing latched from before the reset.
+  S.type2 = false;
+  S.fi_type1 = false;
+  S.t2_final_seen = false;
+  S.err_crc = false;
+  S.err_rnf = false;
+  S.lost_data = false;
+  S.rec_deleted = false;
+  S.err_write_protect = false;
+  S.seek_error = false;
 
   fdc_refresh_int_line(); // -> Hi-Z, whatever the transfer state was
 }
@@ -2037,9 +2059,12 @@ inline uint8_t compose_status() {
     }
     if (S.at_track0)
       st |= 0x04; // TRACK 00
-    if (S.seek_error)
+    bool fi = S.fi_type1; // see fi_type1: the data command's latched bits
+    if (fi ? S.err_rnf : S.seek_error)
       st |= 0x10; // SEEK ERROR (set when a Verify-flagged seek finds no
-                  // matching ID field on the target track)
+                  // matching ID field on the target track) / latched RNF
+    if (fi && S.err_crc)
+      st |= 0x08; // latched CRC ERROR
     if (S.write_protect)
       st |= 0x40; // WRITE PROTECT
   }
@@ -2104,6 +2129,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     if ((cmd & 0x80) == 0) {
       // ---- Type I (seek family) ----
       S.type2 = false; // STATUS reverts to the Type I layout
+      S.fi_type1 = false;
       S.read_addr = false;
       // Abandon any half-collected write. The head is about to move, and a
       // buffer collected for one cylinder must never be spliced onto another;
@@ -2204,10 +2230,22 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // The ROM terminates a multi-sector read with 0xD0, then reads STATUS and
       // requires the true value == 0x00 for success — so we must not touch the
       // Type II error flags (a CRC/RNF seen mid-read must survive to be reported)
-      // nor `type2` (the status layout follows the last data command).
+      // nor, for a command still running, `type2` (see idle_fi below).
       // ...but only once the host has started on that sector. A published
       // look-ahead sector nobody has taken a byte of is not a transfer in
       // progress: a WD drops BUSY/DRQ at once (#23).
+      //
+      // With NO command running, though, a WD's STATUS reverts to the Type I
+      // layout (datasheet: "Status reflects the Type I commands"), so a host
+      // can read TRK00 / WP / Index with an idle 0xD0 after a data command
+      // (#58). "No command running" is NOT just BUSY clear here: we drop BUSY
+      // the moment the last data byte is taken, where a WD is still busy
+      // with the CRC bytes, and both the ROM and CP/M send 0xD0 right there
+      // and read the command's own status afterwards -- a CRC error must not
+      // turn into 0x00. So the command counts as over only once the host has
+      // read its final STATUS (t2_final_seen); and even then the CRC and RNF
+      // bits stay latched in the Type I view (fi_type1).
+      bool idle_fi = !S.busy && !S.reading && !S.writing && !S.trk_op;
       if (S.reading && S.drq && S.xfer_pos > 0 && S.xfer_pos < S.xfer_len) {
         // If Force Interrupt arrives while bytes are still being drained from
         // the published sector buffer, defer completion until that buffer is
@@ -2247,6 +2285,10 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // Force Interrupt still drops host-visible BUSY at once (above); core0
         // finishes the motion and clears BUSY again, which is idempotent.
       }
+      if (idle_fi && S.type2 && S.t2_final_seen) {
+        S.fi_type1 = true;
+        S.type2 = false;
+      }
       // Type IV interrupt conditions. Bit3 (I3) = interrupt immediately; the
       // MZ-800 boot ROM uses 0xD8, i.e. it has been asking for INTRQ all along
       // and merely polls as well. 0xD0 (no condition bits) terminates silently.
@@ -2266,6 +2308,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // command ends at once with NOT READY (compose_status reports it for
       // units 2/3). Nothing is queued for core0. Issue #8.
       S.type2 = true;
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.reading = false;
       S.read_addr = false;
       fdc_note_write_abandoned();
@@ -2279,6 +2323,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     } else if ((cmd & 0xC0) == 0x80) {
       // ---- Type II (sector data): 0x80..0xBF ----
       S.type2 = true;
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.read_addr = false;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.err_write_protect = false; // cleared by the next Type II/III command
@@ -2360,6 +2406,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // work out which cylinder the head is actually on (STEP-IN/OUT then
       // READ ADDRESS); returning nothing makes it step blindly and give up.
       S.type2 = true;
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.err_rnf = S.err_crc = S.lost_data = S.rec_deleted = false;
       S.err_write_protect = false; // cleared by the next Type II/III command
       fdc_note_write_abandoned();
@@ -2387,6 +2435,8 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     } else {
       // ---- Type III READ TRACK (0xEX) / WRITE TRACK (0xFX) ----
       S.type2 = true; // both report in the Type II status layout
+      S.fi_type1 = false;
+      S.t2_final_seen = false;
       S.reading = false;
       fdc_note_write_abandoned();
       S.writing = false;
@@ -2607,7 +2657,15 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
       S.force_int_latched = false;
       fdc_refresh_int_line();
     }
-    return (uint8_t)~compose_status(); // STATUS (driven CPL'd)
+    {
+      // Composed once: the "host has seen the final status" flag is taken
+      // from the very byte handed over, so core0 dropping BUSY between a
+      // separate test and the compose cannot leave the two disagreeing.
+      uint8_t st = compose_status();
+      if (!(st & 0x01))
+        S.t2_final_seen = true;
+      return (uint8_t)~st; // STATUS (driven CPL'd)
+    }
   case 0xD9:
     return (uint8_t)~S.track; // inverted like the other registers
   case 0xDA:
@@ -3582,6 +3640,21 @@ void fdc_disk_task(void) {
   if (!DRV) {
     fdc_stop_motor_without_drive(motor_on);
     return; // selected unit never resolved (only reachable before the first one)
+  }
+
+  // Between operations, keep the Type I status bits live, as a WD's are:
+  // ~TRK00 and ~WPT are the drive's own lines. They used to be refreshed only
+  // at a select, at the end of a seek and inside a write -- which was enough
+  // while a host could only see them right after a Type I. An idle Force
+  // Interrupt now shows them after a data command too (#58), and CP/M's BIOS
+  // tests Write Protect exactly that way before every write: a stale bit from
+  // before a disk swap failed the write five times with no recovery, since
+  // nothing on that path moves the head (review of #59). Only while the
+  // drive is selected -- released, its lines float.
+  if (g_applied_select && !S.reading && !S.writing && S.trk_op == 0 &&
+      S.op_done == S.op_seq) {
+    S.at_track0 = DRV->get_track0_sense();
+    fdc_note_wp(DRV->get_write_protect());
   }
 
 
