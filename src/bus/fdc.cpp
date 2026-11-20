@@ -2436,7 +2436,13 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     // at a time. Ownership of xfer[] passes to core0 via `wr_armed`+`wr_seq`
     // once the last byte lands -- the mirror of how `drq` hands a read sector
     // the other way.
-    if (S.trk_op == 2 && S.drq) {
+    // Only while the image is still being collected. Once it is armed, a DATA
+    // write belongs to whatever command came next: taken as a track byte, the
+    // first byte of a WRITE SECTOR issued over an abandoned (or still
+    // writing) format re-armed the old image under the NEW generation, and
+    // the track was formatted again -- on the new cylinder, after a seek
+    // (third review of #60; on main too).
+    if (S.trk_op == 2 && !S.trk_armed && S.drq) {
       // WRITE TRACK: the host is shifting in the whole format image. Unlike a
       // sector write there is no length known in advance -- core0 decides the
       // image is complete when the byte stream goes quiet (FDC_TRACK_IDLE_US).
@@ -4011,8 +4017,10 @@ void fdc_disk_task(void) {
     // (nothing host-visible is published), but leaving trk_op set wedged the
     // controller for good -- a RESET pressed during a format left the boot
     // ROM's RESTORE BUSY forever (second review of #60; on main too). A new
-    // WRITE TRACK issued meanwhile has its own trk_seq and is left alone.
-    if (S.trk_op == 2 && S.trk_seq == seq) {
+    // WRITE TRACK issued meanwhile is left alone: it is not armed yet
+    // (trk_seq only moves at arming, so the seq alone cannot tell it apart),
+    // or it is armed under a later seq.
+    if (S.trk_op == 2 && S.trk_armed && S.trk_seq == seq) {
       S.trk_op = 0;
       S.trk_armed = false;
     }
