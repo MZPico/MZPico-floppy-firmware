@@ -234,7 +234,6 @@ void bus_diag_reset(void) {
   g_bus_hello.dat_low = 0;
   g_bus_hello.dat_high = 0;
   g_bus_diag.wr_late_at_pop = 0;
-  g_bus_diag.wr_late_at_sample = 0; // no longer incremented: the PIO samples
   g_bus_diag.rd_late_at_pop = 0;
   g_bus_diag.rd_late_at_drive = 0;
   g_bus_diag.wr_backlog = 0;

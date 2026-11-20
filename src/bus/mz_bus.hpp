@@ -36,8 +36,6 @@ struct BusDiag {
   volatile uint32_t wr_late_at_pop;    // WRITE: IORQ already high when core1 got
                                        // the pair. Harmless since the PIO captures
                                        // the data byte; kept as a latency gauge
-  volatile uint32_t wr_late_at_sample; // WRITE: legacy (core1 no longer samples);
-                                       // always 0 - kept for the dump layout
   volatile uint32_t rd_late_at_pop;    // READ: cycle over before we could drive
   // READ: served, but IORQ was already high on the first poll after the drive:
   // EXWAIT never held the Z80, which sampled before the byte was on the pins.

@@ -197,7 +197,6 @@ struct FdcState {
   volatile bool fi_type1 = false;
   volatile bool reading = false;
   volatile bool pending_force_int = false;
-  volatile uint32_t pending_force_since_us = 0;
   volatile uint32_t last_data_read_us = 0;
   volatile bool multi = false; // multi-record read (auto-advance sectors)
   volatile bool read_addr = false; // Type III READ ADDRESS in flight
@@ -229,7 +228,6 @@ struct FdcState {
   volatile uint8_t wr_sector = 1; // sector being written
   volatile bool wr_deleted = false; // command bit a0: write a deleted DAM
   volatile uint32_t wr_seq = 0;   // core1 -> core0: "splice this buffer"
-  volatile uint32_t wr_done = 0;
 
   // ---- Type III READ TRACK / WRITE TRACK (3.4) ---------------------------
   // Both move a whole track at once -- far more than the one-sector xfer[]
@@ -243,11 +241,16 @@ struct FdcState {
   // gaps, ID fields and all.
   volatile uint8_t trk_op = 0;    // 0 none, 1 READ TRACK, 2 WRITE TRACK
   volatile bool trk_armed = false; // the image is complete; core0 may write it
+  // cmd_gen when the image was armed. core0 writes the track only while
+  // cmd_gen still equals it: a Force Interrupt leaves an armed track write
+  // in place (one already on the media must finish), so the generation is
+  // the only thing that says this one was abandoned -- and it has to be
+  // the generation at arming, not at whenever core0 gets round to it.
+  volatile uint32_t trk_gen = 0;
   volatile uint32_t trk_seq = 0;
   volatile uint32_t trk_done = 0;
   volatile uint16_t trk_pos = 0;  // host's position within track_buf
   volatile uint16_t trk_len = 0;  // bytes valid / expected
-  volatile uint32_t trk_implausible = 0; // images refused as not-a-format
   volatile uint32_t trk_ok = 0;      // tracks formatted / read
   volatile uint32_t trk_fail = 0;    // ...that failed to reach the media
   volatile uint32_t trk_last_us = 0; // last operation's disk time
@@ -427,7 +430,6 @@ struct FdcState {
   volatile uint32_t rst_rise = 0;         // low -> high transitions
   volatile uint32_t rst_fall = 0;         // high -> low
   volatile uint32_t rst_high_max_us = 0;  // longest completed HIGH excursion
-  volatile uint32_t rst_low_min_us = 0;   // (unused with edge IRQs)
   volatile uint32_t rst_last_high_us = 0; // most recent completed HIGH length
 
   volatile uint32_t pos_resyncs = 0;
@@ -913,7 +915,6 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   S.read_addr = false;
   S.multi = false;
   S.pending_force_int = false;
-  S.pending_force_since_us = 0;
 
   // 3. Abandon writes that have not reached the media. One already in the
   //    splice or laying a track down finishes -- that flux is going onto the
@@ -2251,7 +2252,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // the published sector buffer, defer completion until that buffer is
         // fully consumed, but only while DATA reads keep progressing.
         S.pending_force_int = true;
-        S.pending_force_since_us = time_us_32();
       } else {
         if (S.reading) // diagnostic: how long did the host actually wait?
           S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
@@ -2260,7 +2260,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         S.read_addr = false;
         S.drq = false;
         S.pending_force_int = false;
-        S.pending_force_since_us = 0;
         // A write that has not been handed to core0 yet is simply dropped. One
         // already in the splice cannot be: the flux is going onto the media in
         // real time and there is no more stopping it than there is on a real
@@ -2343,7 +2342,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
         // the current Sector register off a fresh capture of the current track.
         S.reading = true;
         S.pending_force_int = false;
-        S.pending_force_since_us = 0;
         S.drq = false;
         S.xfer_len = 0;
         S.xfer_pos = 0;
@@ -2417,7 +2415,6 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       S.read_addr = true;
       S.multi = false;
       S.pending_force_int = false;
-      S.pending_force_since_us = 0;
       S.drq = false;
       S.xfer_len = 0;
       S.xfer_pos = 0;
@@ -2500,7 +2497,13 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     // at a time. Ownership of xfer[] passes to core0 via `wr_armed`+`wr_seq`
     // once the last byte lands -- the mirror of how `drq` hands a read sector
     // the other way.
-    if (S.trk_op == 2 && S.drq) {
+    // Only while the image is still being collected. Once it is armed, a DATA
+    // write belongs to whatever command came next: taken as a track byte, the
+    // first byte of a WRITE SECTOR issued over an abandoned (or still
+    // writing) format re-armed the old image under the NEW generation, and
+    // the track was formatted again -- on the new cylinder, after a seek
+    // (third review of #60; on main too).
+    if (S.trk_op == 2 && !S.trk_armed && S.drq) {
       // WRITE TRACK: the host is shifting in the whole format image. Unlike a
       // sector write there is no length known in advance -- core0 decides the
       // image is complete when the byte stream goes quiet (FDC_TRACK_IDLE_US).
@@ -2512,6 +2515,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       if (S.trk_pos >= FDC_TRACK_IMAGE_MAX) {
         S.drq = false; // buffer full: that is as much track as there can be
         S.trk_len = S.trk_pos;
+        S.trk_gen = S.cmd_gen;
         S.trk_armed = true;
         S.trk_seq++;
       }
@@ -2700,7 +2704,6 @@ RAM_FUNC static uint8_t fdc_reg_read_inner(uint8_t addr) {
           S.reading = false;
           S.busy = false;
           S.pending_force_int = false;
-          S.pending_force_since_us = 0;
           fdc_refresh_int_line();
           return (uint8_t)~b;
         }
@@ -2943,7 +2946,6 @@ void fdc_resetdiag_snapshot(FdcResetDiag *o) {
   o->rise = S.rst_rise;
   o->fall = S.rst_fall;
   o->high_max_us = S.rst_high_max_us;
-  o->low_min_us = S.rst_low_min_us;
   o->last_high_us = S.rst_last_high_us;
   o->events = S.reset_events;
   o->at_ms = S.reset_at_ms;
@@ -2954,7 +2956,6 @@ void fdc_resetdiag_clear(void) {
   S.rst_rise = 0;
   S.rst_fall = 0;
   S.rst_high_max_us = 0;
-  S.rst_low_min_us = 0;
   S.rst_last_high_us = 0;
   S.reset_events = 0;
   S.reset_at_ms = 0;
@@ -3101,7 +3102,8 @@ uint16_t fdc_bench_read_sector(uint8_t track, uint8_t sector, uint8_t side,
   uint8_t *flux = mzp_flux_buffer(&cap);
   int32_t idx = 0;
   size_t nflux = DRV->capture_track(flux, cap, &idx, /*store_greaseweazle=*/false,
-                                    /*capture_ms=*/220, /*index_wait_ms=*/250);
+                                    /*capture_ms=*/fdc_bench_capture_ms(track),
+                                    /*index_wait_ms=*/250);
 
   float bt = density ? 1.0f : FDC_DD_BIT_US;
   SectorRead sd =
@@ -3347,7 +3349,8 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
   int32_t idx = 0;
   size_t nflux = DRV->capture_track(flux_buf, flux_cap, &idx,
                                     /*store_greaseweazle=*/false,
-                                    /*capture_ms=*/220, /*index_wait_ms=*/250);
+                                    /*capture_ms=*/fdc_bench_capture_ms(track),
+                                    /*index_wait_ms=*/250);
   size_t n = mfm_read_track_raw(flux_buf, nflux, fdc_bit_us(),
                                 (uint8_t *)S.track_buf, FDC_TRACK_IMAGE_MAX);
   S.trk_last_bytes = (uint16_t)n;
@@ -3355,6 +3358,22 @@ uint16_t fdc_bench_read_track(uint8_t track, uint8_t side, uint8_t *flux_buf,
 }
 
 const uint8_t *fdc_track_buffer(void) { return (const uint8_t *)S.track_buf; }
+
+uint32_t fdc_bench_capture_ms(uint8_t track) {
+  // The margin is sized for DD whatever the host has declared: a bench scan
+  // names its own density, and a DD-sized sector span covers HD too. (The
+  // live read window keeps following the declaration, see
+  // fdc_sector_span_us.)
+  uint32_t sz = fdc_sector_size_for(track);
+  if (sz < 512)
+    sz = 512;
+  uint32_t span = (uint32_t)((float)(sz + 128) * 16.0f * FDC_DD_BIT_US);
+  uint32_t rev = g_rev_us[fdc_cur_idx()];
+  uint32_t w = (rev ? rev : FDC_REV_US_DEFAULT) + span;
+  if (w > FDC_READ_CAPTURE_TIMEOUT_US)
+    w = FDC_READ_CAPTURE_TIMEOUT_US;
+  return (w + 999u) / 1000u;
+}
 
 // True while the MZ-800 has a command in flight. Bench commands (USB) must
 // not touch the drive then: they share the drive, the flux buffer and the
@@ -3723,6 +3742,23 @@ void fdc_disk_task(void) {
   // clock-agnostic, the density only tells the decoder how to read them.
   fdc_apply_densel();
 
+  // An armed WRITE TRACK the host has since moved on from -- any command, or
+  // a bus RESET, after the image was armed (trk_gen) and before core0 began
+  // laying it down. It must not be written (that is what trk_gen is for), and
+  // it must not linger either: Force Interrupt, the Type I/II handlers and
+  // the reset ISR all leave an ARMED track op in place, because one already
+  // on the media has to finish, so nothing else would ever clear it. Left
+  // set, the track block returns before the read and write blocks, the seek
+  // block never drops BUSY, and not even a RESET recovers the controller
+  // (second review of #60). Dropped here, BEFORE the seek block, so that the
+  // command which superseded it completes normally in this same pass.
+  if (S.trk_op == 2 && S.trk_armed && S.trk_done != S.trk_seq &&
+      S.trk_gen != S.cmd_gen) {
+    S.trk_done = S.trk_seq;
+    S.trk_armed = false;
+    S.trk_op = 0;
+  }
+
   // Execute a pending physical seek.
   if (S.op_done != S.op_seq) {
     uint32_t seq = S.op_seq;   // snapshot
@@ -3828,10 +3864,17 @@ void fdc_disk_task(void) {
     // Stale-select check (see the select-gate comment above): a track op is
     // positionally blind, so running it against the wrong DRIVE would format
     // or dump another disk entirely.
+    // The generation is taken BEFORE these calls, which can block for many
+    // ms (a catch-up seek, the bench-head restore), and checked after them:
+    // whatever arrived meanwhile is handled from scratch on the next pass,
+    // with its own side and its own pending move (as in the write block).
+    uint32_t gen0 = S.cmd_gen;
     if (!fdc_apply_drive_select() || !DRV)
       return;
     fdc_apply_side();
     fdc_bench_restore_head();
+    if (S.cmd_gen != gen0 || !S.trk_op || S.op_done != S.op_seq)
+      return;
 
     if (S.trk_op == 1) { // READ TRACK
       if (S.trk_done != S.trk_seq) {
@@ -3897,10 +3940,11 @@ void fdc_disk_task(void) {
     if (!S.trk_armed) {
       // The host is still shifting the image in. It stops when the image ends,
       // not when we say so, so silence is the end-of-image signal.
-      if (S.trk_pos > 0 &&
+      if (S.trk_pos > 0 && S.cmd_gen == gen0 &&
           fdc_since(S.last_data_read_us) > FDC_TRACK_IDLE_US) {
         S.trk_len = S.trk_pos;
         S.drq = false;
+        S.trk_gen = gen0;
         S.trk_armed = true;
         S.trk_seq++;
         fdc_refresh_int_line();
@@ -3920,7 +3964,7 @@ void fdc_disk_task(void) {
     if (S.trk_done == S.trk_seq)
       return;
     uint32_t seq = S.trk_seq;
-    uint32_t gen = S.cmd_gen;
+    uint32_t gen = S.trk_gen; // the generation the image was armed under
 
     if (g_stream_active) {
       rp2040_flux_capture_stop();
@@ -4006,7 +4050,7 @@ void fdc_disk_task(void) {
     bool ok = false;
     uint32_t t0 = time_us_32();
     if (!plausible) {
-      S.trk_implausible++;
+      // not a format image: nothing written, ok stays false
     } else if (!ready) {
       // nothing written; reported below as a failed track write
     } else if (!S.write_protect) {
@@ -4110,9 +4154,19 @@ void fdc_disk_task(void) {
       else if (live)
         S.err_rnf = true;
     }
-    if (live) {
+    // The track op is over whether or not the host still cares about it: a
+    // command or a RESET during the physical write makes the RESULT stale
+    // (nothing host-visible is published), but leaving trk_op set wedged the
+    // controller for good -- a RESET pressed during a format left the boot
+    // ROM's RESTORE BUSY forever (second review of #60; on main too). A new
+    // WRITE TRACK issued meanwhile is left alone: it is not armed yet
+    // (trk_seq only moves at arming, so the seq alone cannot tell it apart),
+    // or it is armed under a later seq.
+    if (S.trk_op == 2 && S.trk_armed && S.trk_seq == seq) {
       S.trk_op = 0;
       S.trk_armed = false;
+    }
+    if (live) {
       S.drq = false;
       S.busy = false;
       fdc_refresh_int_line();
@@ -4168,6 +4222,12 @@ void fdc_disk_task(void) {
     if (!S.wr_armed)
       return; // still collecting the sector from the host
 
+    // The command this splice serves. Taken BEFORE the select, side and
+    // bench-head restore below, which can block for milliseconds (a catch-up
+    // seek, a spin-up): a Force Interrupt or a Type I landing in that window
+    // must be seen, not silently spliced past (#25).
+    uint32_t gen = S.cmd_gen;
+
     // Never splice with a move outstanding. This matters far more than it does
     // on the read path, where answering from the wrong cylinder merely returns
     // data the host can reject: here it would overwrite a sector on a track the
@@ -4185,9 +4245,12 @@ void fdc_disk_task(void) {
       return;
     fdc_apply_side(); // a splice on the other surface destroys a sector there
     fdc_bench_restore_head();
+    // Anything that arrived while those blocked: start over on the next pass,
+    // which re-checks every guard above against the state as it is now.
+    if (S.cmd_gen != gen || !S.writing || !S.wr_armed || S.op_done != S.op_seq)
+      return;
 
     uint32_t seq = S.wr_seq; // snapshot
-    uint32_t gen = S.cmd_gen;
     uint8_t want = S.wr_sector;
     uint16_t n = S.xfer_len;
     if (n > FDC_SECTOR_MAX)
@@ -4221,14 +4284,12 @@ void fdc_disk_task(void) {
         S.busy = false;
         fdc_refresh_int_line();
       }
-      S.wr_done = seq;
       return;
     }
 
     float bit = fdc_bit_us();
     fdc_wait_head_ready(true); // the splice hunts IDs by reading
     if (S.cmd_gen != gen) { // superseded during the wait: write nothing
-      S.wr_done = seq;
       return;
     }
     SpliceResult sr =
@@ -4344,7 +4405,6 @@ void fdc_disk_task(void) {
       }
       fdc_refresh_int_line();
     }
-    S.wr_done = seq;
     return;
   }
 
@@ -4363,7 +4423,6 @@ void fdc_disk_task(void) {
       S.busy = false;
       S.drq = false;
       S.pending_force_int = false;
-      S.pending_force_since_us = 0;
       fdc_refresh_int_line();
     }
 
@@ -4430,6 +4489,15 @@ void fdc_disk_task(void) {
       return;
 
     if (S.rd_fresh) {
+      // The command this capture serves -- taken BEFORE the select, side and
+      // bench-head restore, which can block for many ms. A command landing in
+      // that window used to be adopted by the snapshot below them: a new
+      // READ for the other side was then answered, CRC-clean, from the side
+      // applied before the block, and one behind a STEP was captured with the
+      // move still pending (review of #60; the write block had the same
+      // hole). rd_fresh is still set on the early return, so the next pass
+      // starts over against the state as it is then.
+      uint32_t gen = S.cmd_gen;
       // Stale-select check (see the select-gate comment above): capturing the
       // other drive's flux cost a retry per A/B alternation. Only on a FRESH
       // window -- mid-command (multi-sector reuse) the select must not move.
@@ -4437,6 +4505,8 @@ void fdc_disk_task(void) {
         return;
       fdc_apply_side();
       fdc_bench_restore_head();
+      if (S.cmd_gen != gen || !S.reading || S.op_done != S.op_seq)
+        return;
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
       // sync -- a rev + sector-span window contains every sector whole
@@ -4448,7 +4518,6 @@ void fdc_disk_task(void) {
       // core1 set rd_fresh again for its new command. Clearing it afterwards
       // erased that, and the new command was answered from flux captured
       // before its queued move ran, on the old surface or drive (issue #3).
-      uint32_t gen = S.cmd_gen;
       S.rd_fresh = false;
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);

@@ -55,14 +55,6 @@ static const pio_program_t fluxwrite_struct = {
     .length = sizeof(fluxwrite) / sizeof(fluxwrite[0]),
     .origin = -1};
 
-static const uint16_t fluxwrite_apple2[] = {
-    0x6030, 0xe001, 0xb042, 0x0043, 0x6030, 0xe000, 0xb042, 0x0047,
-};
-static const pio_program_t fluxwrite_apple2_struct = {
-    .instructions = fluxwrite_apple2,
-    .length = sizeof(fluxwrite_apple2) / sizeof(fluxwrite_apple2[0]),
-    .origin = -1};
-
 typedef struct floppy_singleton {
   PIO pio;
   const pio_program_t *program;
@@ -453,12 +445,11 @@ void rp2040_flux_capture_disable(void) {
 
 // ---- Write ----
 
-static bool init_write(int wrdata_pin, bool is_apple2) {
+static bool init_write(int wrdata_pin) {
   if (g_writer.pio) {
     return true;
   }
-  const pio_program_t *program =
-      is_apple2 ? &fluxwrite_apple2_struct : &fluxwrite_struct;
+  const pio_program_t *program = &fluxwrite_struct;
   if (!allocate_pio_set_program(&g_writer, program)) {
     return false;
   }
@@ -525,25 +516,70 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
   pio_sm_set_enabled(g_writer.pio, g_writer.sm, false);
   pio_sm_clear_fifos(g_writer.pio, g_writer.sm);
   pio_sm_exec(g_writer.pio, g_writer.sm, g_writer.offset);
-  while (!pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
+  // Refills stop at the end of the buffer: past it greaseunpack() returns
+  // 0xffff, and queueing those wrote a few long garbage pulses after the
+  // image (#25).
+  // Lengths of the two newest pulses queued, in 24 MHz ticks, as the PIO
+  // will play them (it takes 16 bits).
+  unsigned last_ticks = 0, prev_ticks = 0;
+  while (pulses != pulse_end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
     unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
+    if (value == 0xffff && pulses == pulse_end)
+      break; // a truncated greaseweazle record, not a pulse
+    prev_ticks = last_ticks;
+    last_ticks = value > 0xffff ? 0xffff : value;
     value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
     pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
   }
   pio_sm_set_enabled(g_writer.pio, g_writer.sm, true);
 
   bool old_index_state = false;
+  bool at_index = false;
   while (pulses != pulse_end) {
     bool index_state = gpio_get(index_pin);
     if (old_index_state && !index_state) {
+      at_index = true;
       break; // falling edge of index pin
     }
-    while (!pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
+    while (pulses != pulse_end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
       unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
+      if (value == 0xffff && pulses == pulse_end)
+        break;
+      prev_ticks = last_ticks;
+      last_ticks = value > 0xffff ? 0xffff : value;
       value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
       pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
     }
     old_index_state = index_state;
+  }
+  if (!at_index) {
+    // The image ran out before the index. Disabling the state machine now
+    // would drop whatever is still queued -- the last bytes of the image --
+    // so let the FIFO drain and the last pulse reach the head first, as the
+    // splice does. Never past the index, though: that is the start of the
+    // track, so both waits end at its falling edge (#25).
+    while (!pio_sm_is_tx_fifo_empty(g_writer.pio, g_writer.sm)) {
+      bool index_state = gpio_get(index_pin);
+      if (old_index_state && !index_state) {
+        at_index = true;
+        break;
+      }
+      old_index_state = index_state;
+    }
+    // FIFO empty means the last word has just been pulled, not that it is
+    // out: the pulse before it has only just started, and the last one
+    // follows it. Wait both lengths (the output clock is 24 MHz, so ticks/24
+    // is us; a greaseweazle interval can be far longer than MFM's 8 us, and
+    // is clamped to the 16 bits the PIO plays, so the wait is bounded at
+    // ~5.5 ms even with no index to end it).
+    uint32_t tail_us = (prev_ticks + last_ticks) / 24u + 16u;
+    uint32_t t_tail = time_us_32();
+    while (!at_index && time_us_32() - t_tail < tail_us) {
+      bool index_state = gpio_get(index_pin);
+      if (old_index_state && !index_state)
+        at_index = true;
+      old_index_state = index_state;
+    }
   }
   restore_interrupts(irq);
 
@@ -566,7 +602,7 @@ static void free_write() {
 // ---- Pre-armed write (splice) ----
 
 bool rp2040_flux_write_prepare(int wrdata_pin) {
-  return init_write(wrdata_pin, false);
+  return init_write(wrdata_pin);
 }
 
 void rp2040_flux_write_release(void) { free_write(); }
@@ -635,9 +671,8 @@ uint32_t rp2040_flux_capture(int index_pin, int rdpin, volatile uint8_t *pulses,
 
 bool rp2040_flux_write(int index_pin, int wrgate_pin, int wrdata_pin,
                        uint8_t *pulses, uint8_t *pulse_end,
-                       bool store_greaseweazle, bool is_apple2,
-                       bool use_index) {
-  if (!init_write(wrdata_pin, is_apple2)) {
+                       bool store_greaseweazle, bool use_index) {
+  if (!init_write(wrdata_pin)) {
     return false;
   }
   bool ok = write_foreground(index_pin, wrgate_pin, pulses, pulse_end,

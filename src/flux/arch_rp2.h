@@ -28,7 +28,7 @@ uint32_t rp2040_flux_capture(int index_pin, int rdpin, volatile uint8_t *pulses,
 // Write flux from `pulses` to the drive, gating WGATE around the write.
 bool rp2040_flux_write(int index_pin, int wrgate_pin, int wrdata_pin,
                        uint8_t *pulses, uint8_t *pulse_end,
-                       bool store_greaseweazle, bool is_apple2, bool use_index);
+                       bool store_greaseweazle, bool use_index);
 
 // ---- Incremental (streaming) capture ----
 // Unlike rp2040_flux_capture (a single blocking batch call that captures for a
