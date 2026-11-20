@@ -4026,6 +4026,12 @@ void fdc_disk_task(void) {
     if (!S.wr_armed)
       return; // still collecting the sector from the host
 
+    // The command this splice serves. Taken BEFORE the select, side and
+    // bench-head restore below, which can block for milliseconds (a catch-up
+    // seek, a spin-up): a Force Interrupt or a Type I landing in that window
+    // must be seen, not silently spliced past (#25).
+    uint32_t gen = S.cmd_gen;
+
     // Never splice with a move outstanding. This matters far more than it does
     // on the read path, where answering from the wrong cylinder merely returns
     // data the host can reject: here it would overwrite a sector on a track the
@@ -4043,9 +4049,12 @@ void fdc_disk_task(void) {
       return;
     fdc_apply_side(); // a splice on the other surface destroys a sector there
     fdc_bench_restore_head();
+    // Anything that arrived while those blocked: start over on the next pass,
+    // which re-checks every guard above against the state as it is now.
+    if (S.cmd_gen != gen || !S.writing || !S.wr_armed || S.op_done != S.op_seq)
+      return;
 
     uint32_t seq = S.wr_seq; // snapshot
-    uint32_t gen = S.cmd_gen;
     uint8_t want = S.wr_sector;
     uint16_t n = S.xfer_len;
     if (n > FDC_SECTOR_MAX)

@@ -1696,3 +1696,56 @@ TEST(field_cut_off_for_good_delivers_no_bytes) {
     CHECK(!(s & wd::CRC));
   }, ms(60000));
 }
+
+// #25: the write block snapshots the command generation before the drive
+// select, side and bench-head restore, which can block for many ms. A Force
+// Interrupt landing in that window must stop the splice: nothing reaches the
+// media. Here a bench command left the head 60 cylinders away, so the restore
+// takes >100 ms, and the host gives up 20 ms into it.
+TEST(force_interrupt_during_the_pre_splice_restore_writes_nothing) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(10);
+    wd::side(1);
+    CHECK_EQ(error_bits(wd::read_sector(10, 1, 512).status), 0);
+    // Motor off and stopped, THEN the bench moves the head: with the spindle
+    // down the select catch-up is skipped, so the head is still away when the
+    // host's write is armed, and the write block's own restore moves it.
+    wd::select(0, false);
+    wait_ms(4000);
+    FloppyDrive *d = fdc_bench_drive();
+    REQUIRE(d != nullptr);
+    d->goto_track(70);
+    fdc_bench_release();
+    fdc_bench_done();
+    wait_ms(50);
+    CHECK_EQ(cable().drive[0].cyl, 70);
+    wd::select(0); // motor on again
+    size_t writes_before = cable().drive[0].writes.size();
+    out(0xD9, 10);
+    out(0xDA, 3);
+    out(0xD8, 0xA0); // WRITE SECTOR
+    size_t fed = 0;
+    for (uint64_t end = now() + ms(3000); now() < end && fed < 512;) {
+      if (wd::status() & wd::DRQ) {
+        out(0xDB, 0x5A);
+        ++fed;
+      }
+    }
+    CHECK_EQ(fed, 512u);
+    // Wait until the restore is under way, then give up.
+    for (uint64_t end = now() + ms(1000); now() < end && cable().drive[0].cyl == 70;)
+      wait_us(100);
+    wait_ms(5);
+    CHECK(cable().drive[0].cyl > 10 && cable().drive[0].cyl < 70);
+    wd::force_interrupt();
+    wait_ms(1500);
+    CHECK(!(wd::status() & wd::BUSY));
+    CHECK_EQ(cable().drive[0].writes.size(), writes_before);
+    wd::Xfer x = wd::read_sector(10, 3, 512); // the sector is untouched
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 10, 0, 3));
+  });
+}
