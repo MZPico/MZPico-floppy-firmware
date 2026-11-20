@@ -230,6 +230,12 @@ struct FdcState {
   // gaps, ID fields and all.
   volatile uint8_t trk_op = 0;    // 0 none, 1 READ TRACK, 2 WRITE TRACK
   volatile bool trk_armed = false; // the image is complete; core0 may write it
+  // cmd_gen when the image was armed. core0 writes the track only while
+  // cmd_gen still equals it: a Force Interrupt leaves an armed track write
+  // in place (one already on the media must finish), so the generation is
+  // the only thing that says this one was abandoned -- and it has to be
+  // the generation at arming, not at whenever core0 gets round to it.
+  volatile uint32_t trk_gen = 0;
   volatile uint32_t trk_seq = 0;
   volatile uint32_t trk_done = 0;
   volatile uint16_t trk_pos = 0;  // host's position within track_buf
@@ -2442,6 +2448,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       if (S.trk_pos >= FDC_TRACK_IMAGE_MAX) {
         S.drq = false; // buffer full: that is as much track as there can be
         S.trk_len = S.trk_pos;
+        S.trk_gen = S.cmd_gen;
         S.trk_armed = true;
         S.trk_seq++;
       }
@@ -3692,10 +3699,17 @@ void fdc_disk_task(void) {
     // Stale-select check (see the select-gate comment above): a track op is
     // positionally blind, so running it against the wrong DRIVE would format
     // or dump another disk entirely.
+    // The generation is taken BEFORE these calls, which can block for many
+    // ms (a catch-up seek, the bench-head restore), and checked after them:
+    // whatever arrived meanwhile is handled from scratch on the next pass,
+    // with its own side and its own pending move (as in the write block).
+    uint32_t gen0 = S.cmd_gen;
     if (!fdc_apply_drive_select() || !DRV)
       return;
     fdc_apply_side();
     fdc_bench_restore_head();
+    if (S.cmd_gen != gen0 || !S.trk_op || S.op_done != S.op_seq)
+      return;
 
     if (S.trk_op == 1) { // READ TRACK
       if (S.trk_done != S.trk_seq) {
@@ -3765,6 +3779,7 @@ void fdc_disk_task(void) {
           fdc_since(S.last_data_read_us) > FDC_TRACK_IDLE_US) {
         S.trk_len = S.trk_pos;
         S.drq = false;
+        S.trk_gen = gen0;
         S.trk_armed = true;
         S.trk_seq++;
         fdc_refresh_int_line();
@@ -3784,7 +3799,7 @@ void fdc_disk_task(void) {
     if (S.trk_done == S.trk_seq)
       return;
     uint32_t seq = S.trk_seq;
-    uint32_t gen = S.cmd_gen;
+    uint32_t gen = S.trk_gen; // the generation the image was armed under
 
     if (g_stream_active) {
       rp2040_flux_capture_stop();
@@ -4299,6 +4314,15 @@ void fdc_disk_task(void) {
       return;
 
     if (S.rd_fresh) {
+      // The command this capture serves -- taken BEFORE the select, side and
+      // bench-head restore, which can block for many ms. A command landing in
+      // that window used to be adopted by the snapshot below them: a new
+      // READ for the other side was then answered, CRC-clean, from the side
+      // applied before the block, and one behind a STEP was captured with the
+      // move still pending (review of #60; the write block had the same
+      // hole). rd_fresh is still set on the early return, so the next pass
+      // starts over against the state as it is then.
+      uint32_t gen = S.cmd_gen;
       // Stale-select check (see the select-gate comment above): capturing the
       // other drive's flux cost a retry per A/B alternation. Only on a FRESH
       // window -- mid-command (multi-sector reuse) the select must not move.
@@ -4306,6 +4330,8 @@ void fdc_disk_task(void) {
         return;
       fdc_apply_side();
       fdc_bench_restore_head();
+      if (S.cmd_gen != gen || !S.reading || S.op_done != S.op_seq)
+        return;
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
       // sync -- a rev + sector-span window contains every sector whole
@@ -4317,7 +4343,6 @@ void fdc_disk_task(void) {
       // core1 set rd_fresh again for its new command. Clearing it afterwards
       // erased that, and the new command was answered from flux captured
       // before its queued move ran, on the old surface or drive (issue #3).
-      uint32_t gen = S.cmd_gen;
       S.rd_fresh = false;
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);

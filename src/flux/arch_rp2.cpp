@@ -519,12 +519,15 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
   // Refills stop at the end of the buffer: past it greaseunpack() returns
   // 0xffff, and queueing those wrote a few long garbage pulses after the
   // image (#25).
-  unsigned last_ticks = 0; // length of the newest pulse queued, in 24 MHz ticks
+  // Lengths of the two newest pulses queued, in 24 MHz ticks, as the PIO
+  // will play them (it takes 16 bits).
+  unsigned last_ticks = 0, prev_ticks = 0;
   while (pulses != pulse_end && !pio_sm_is_tx_fifo_full(g_writer.pio, g_writer.sm)) {
     unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
     if (value == 0xffff && pulses == pulse_end)
       break; // a truncated greaseweazle record, not a pulse
-    last_ticks = value;
+    prev_ticks = last_ticks;
+    last_ticks = value > 0xffff ? 0xffff : value;
     value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
     pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
   }
@@ -542,7 +545,8 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
       unsigned value = greaseunpack(&pulses, pulse_end, store_greaseweazle);
       if (value == 0xffff && pulses == pulse_end)
         break;
-      last_ticks = value;
+      prev_ticks = last_ticks;
+      last_ticks = value > 0xffff ? 0xffff : value;
       value = (value < OVERHEAD) ? 1 : value - OVERHEAD;
       pio_sm_put_blocking(g_writer.pio, g_writer.sm, value);
     }
@@ -562,11 +566,13 @@ static bool write_foreground(int index_pin, int wrgate_pin, uint8_t *pulses,
       }
       old_index_state = index_state;
     }
-    // FIFO empty means the last pulse is in the OSR, not that it is out: it
-    // still runs for its own length (the output clock is 24 MHz, so ticks/24
-    // is us; a greaseweazle interval can be far longer than MFM's 8 us).
-    // Wait that long, plus a margin for the pulse before it finishing.
-    uint32_t tail_us = last_ticks / 24u + 16u;
+    // FIFO empty means the last word has just been pulled, not that it is
+    // out: the pulse before it has only just started, and the last one
+    // follows it. Wait both lengths (the output clock is 24 MHz, so ticks/24
+    // is us; a greaseweazle interval can be far longer than MFM's 8 us, and
+    // is clamped to the 16 bits the PIO plays, so the wait is bounded at
+    // ~5.5 ms even with no index to end it).
+    uint32_t tail_us = (prev_ticks + last_ticks) / 24u + 16u;
     uint32_t t_tail = time_us_32();
     while (!at_index && time_us_32() - t_tail < tail_us) {
       bool index_state = gpio_get(index_pin);

@@ -1749,3 +1749,65 @@ TEST(force_interrupt_during_the_pre_splice_restore_writes_nothing) {
     CHECK(matches_pattern(x.data, 10, 0, 3));
   });
 }
+
+namespace {
+void bench_strand_head_at_70() {
+  wd::select(0);
+  wd::restore();
+  wd::seek(10);
+  wd::side(1);
+  CHECK_EQ(error_bits(wd::read_sector(10, 1, 512).status), 0);
+  wd::select(0, false);
+  wait_ms(4000);
+  FloppyDrive *d = fdc_bench_drive();
+  REQUIRE(d != nullptr);
+  d->goto_track(70);
+  fdc_bench_release();
+  fdc_bench_done();
+  wait_ms(50);
+  CHECK_EQ(cable().drive[0].cyl, 70);
+  wd::select(0);
+}
+void wait_restore_under_way() {
+  for (uint64_t end = now() + ms(2000); now() < end && cable().drive[0].cyl == 70;)
+    wait_us(100);
+  wait_ms(5);
+  CHECK(cable().drive[0].cyl > 10 && cable().drive[0].cyl < 70);
+}
+}
+
+TEST(read_for_the_other_side_issued_during_the_pre_capture_restore_gets_it) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    bench_strand_head_at_70();
+    out(0xD9, 10);
+    out(0xDA, 1);
+    out(0xD8, 0x80); // read A on head 0
+    wait_restore_under_way();
+    wd::force_interrupt();
+    wd::side(0); // head 1
+    wd::Xfer b = wd::read_sector(10, 5, 512);
+    std::fprintf(stderr, "  status %02x n=%zu h0=%d h1=%d\n", b.status, b.data.size(),
+                 (int)matches_pattern(b.data, 10, 0, 5), (int)matches_pattern(b.data, 10, 1, 5));
+    CHECK_EQ(error_bits(b.status), 0);
+    CHECK(matches_pattern(b.data, 10, 1, 5));
+  });
+}
+
+TEST(read_behind_a_step_issued_during_the_pre_capture_restore_waits_for_it) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    bench_strand_head_at_70();
+    out(0xD9, 10);
+    out(0xDA, 1);
+    out(0xD8, 0x80); // read A
+    wait_restore_under_way();
+    wd::force_interrupt();
+    out(0xD8, 0x58); // STEP IN with update, no wait
+    wd::Xfer b = wd::read_sector(11, 5, 512);
+    std::fprintf(stderr, "  status %02x n=%zu c11=%d c10=%d\n", b.status, b.data.size(),
+                 (int)matches_pattern(b.data, 11, 0, 5), (int)matches_pattern(b.data, 10, 0, 5));
+    CHECK_EQ(error_bits(b.status), 0);
+    CHECK(matches_pattern(b.data, 11, 0, 5));
+  });
+}
