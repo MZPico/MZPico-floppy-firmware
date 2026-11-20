@@ -499,10 +499,14 @@ BUSY-polling covers latency instead, per the ROM driver).
       those two bytes appearing anywhere, which arbitrary sector data satisfies
       about 86% of the time each. The media is protected by physical `~WPT`,
       the `wren` switch, that check, and WRITE TRACK running index-to-index.
-    - **Still unproven: the catch-up seek on select.** It only fires when
-      `head_target` diverges from the head, and only core1 sets `head_target` —
-      from real host Type I commands. Bench seeks drive the head directly and
-      never create that divergence, so this first gets exercised under CP/M.
+    - **The catch-up seek on select** only fires when `head_target` diverges
+      from the head, and only core1 sets `head_target` — from real host Type I
+      commands. Bench seeks drive the head directly and never create that
+      divergence. It is exercised in the simulator
+      (`unit_first_spun_by_a_motor_off_seek_still_gets_its_catch_up_seek`: a
+      STEP folded for unit 1 while unit 0 is selected is caught up on the
+      switch back) and still not observed on hardware (#34). Since #57 it runs
+      on a real drive switch only, never when the same drive is re-selected.
     - **Diagnostics must name the drive they describe.** `fdcdump` renders the
       drive core0 is *driving*, while the select is applied lazily by the next
       actuating command — so a dump taken right after `drive 1` reported drive
@@ -527,7 +531,8 @@ BUSY-polling covers latency instead, per the ROM driver).
     RNF/CRC/wrong-cylinder/Verify failure since power-up, with the whole
     position chain sampled at that instant. Built for the ~1-in-20 boot-time
     `FD:Loading error`, which a host retry otherwise erases before anyone can
-    look. **Still needs to catch one.**
+    look. It caught one — a read taken 2.5 s after reset with the spindle
+    cold — which led to the spin-up and head-settle gates (#32, fw-6cc2c50).
 
 ## Primary risks / unknowns
 

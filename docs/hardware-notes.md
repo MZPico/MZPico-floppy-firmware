@@ -150,8 +150,15 @@ two revolutions of clean flux); both fixed:
    register is free to disagree with our position by design, and CP/M rewrites
    it on drive switches. Fix: fold the absolute cylinder.
 
-**Open, and where work stopped:** HD two-drive copies (A: DD → B: HD) still
-fail ~1.5 % of positioning bursts to the directory track with the head
+**Status since (2026-11, #31):** a re-test on fw-eb7f2dc was clean on the
+write side (128/128 writes, 0 RNF, `PIP [V]` twice) with one wrong-cylinder
+read in 4016; fw-2a1d1c5 saw one more, on drive 1, with the head position
+unknown at that moment (an earlier recalibrate had not seen TRK00). Each was
+rejected by the ID track compare and retried. The bulk-copy content fault
+below has not been seen again. What follows is the 2026-08 account.
+
+**Open, and where work stopped (2026-08):** HD two-drive copies (A: DD → B: HD)
+failed ~1.5 % of positioning bursts to the directory track with the head
 physically short, and bulk-copied files can hold another sector's content with
 the directory sometimes wrong too. Established by measurement: identical rate on
 two unrelated drives (ALPS DF354H090F, Mitsumi D359M3) → not the drive; every
