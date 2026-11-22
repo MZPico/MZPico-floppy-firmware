@@ -3745,3 +3745,113 @@ TEST(force_interrupt_as_read_track_publishes_leaves_no_drq) {
     CHECK(!(st & wd::BUSY));
   });
 }
+
+// ---- review of #65 ----
+namespace {
+bool feed(const std::vector<uint8_t> &d, size_t from, uint32_t timeout_ms = 3000) {
+  size_t fed = from;
+  for (uint64_t end = now() + ms(timeout_ms); now() < end && fed < d.size();)
+    if (wd::status() & wd::DRQ)
+      out(0xDB, d[fed++]);
+  return fed == d.size();
+}
+} // namespace
+
+// core0 judged a READ live, then fills xfer[]/xfer_len/xfer_pos BEFORE the
+// locked re-check. A WRITE SECTOR the host issues in that window (after a
+// Force Interrupt) has its first byte overwritten and xfer_pos reset.
+TEST(write_issued_as_a_read_fills_the_buffer_survives) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    wd::read_sector(6, 1, 512);
+    std::vector<uint8_t> d(512);
+    for (size_t i = 0; i < d.size(); ++i)
+      d[i] = (uint8_t)(i * 7 + 1);
+    RaceOnce r{20, [&d] {
+      race_out(0xD8, 0xD0);
+      race_out(0xDA, 5);
+      race_out(0xD8, 0xA0);  // WRITE SECTOR 5
+      race_out(0xDB, d[0]);  // first byte: a DATA write is not blocked
+    }};
+    arm_race(r);
+    out(0xDA, 2);
+    out(0xD8, 0x80); // READ SECTOR 2
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(1);
+    CHECK(r.fired);
+    CHECK(feed(d, 1));
+    uint8_t st = wd::wait_ready();
+    set_race_point(nullptr);
+    CHECK_EQ(error_bits(st), 0);
+    CHECK(wd::read_sector(6, 5, 512).data == d);
+  });
+}
+
+// The WRITE TRACK abandon branch (cmd_gen moved during the head wait) checks
+// trk_op/trk_armed/trk_seq and clears them outside the lock: a new WRITE
+// TRACK landing between is zeroed, BUSY stays up with no DRQ.
+TEST(write_track_issued_as_an_abandoned_one_is_dropped_survives) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA);
+  g_disk[0].t[20][0] = Track{};
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(20);
+    wd::side(1);
+    std::vector<uint8_t> img = wd::format_image(20, 0, 9, 2, false);
+    int stage = 0;
+    set_race_point([&stage](int id) {
+      if (id == 21 && stage == 0) {
+        stage = 1;
+        race_out(0xD8, 0xD0); // supersede the armed format
+      } else if (id == 22 && stage == 1) {
+        stage = 2;
+        race_out(0xD8, 0xF0); // the host's retry: a new WRITE TRACK
+      }
+    });
+    out(0xD8, 0xF0);
+    CHECK(feed(img, 0));
+    for (uint64_t end = now() + ms(3000); now() < end && stage < 2;)
+      wait_ms(1);
+    set_race_point(nullptr);
+    CHECK_EQ(stage, 2);
+    CHECK(feed(img, 0, 1000)); // the new format collects its image
+    uint8_t st = wd::wait_ready(3000);
+    CHECK(!(st & wd::BUSY));
+    CHECK_EQ(error_bits(st), 0);
+  });
+}
+
+// The write path sets err_rnf from a `live` computed outside the lock: a
+// command landing between (Force Interrupt + WRITE TRACK) inherits the dead
+// write's RNF, and a successful format reports RNF.
+TEST(format_issued_as_a_write_fails_reports_no_rnf) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    wd::read_sector(6, 1, 512);
+    RaceOnce r{23, [] { race_out(0xD8, 0xD0); race_out(0xD8, 0xF0); }};
+    arm_race(r);
+    std::vector<uint8_t> d(512, 0x3C);
+    out(0xDA, 14); // not on the track: the splice fails RNF
+    out(0xD8, 0xA0);
+    CHECK(feed(d, 0));
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(1);
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    CHECK(feed(wd::format_image(6, 0, 9, 2, false), 0));
+    uint8_t st = wd::wait_ready(3000);
+    CHECK(!(st & wd::BUSY));
+    CHECK_EQ(error_bits(st), 0);
+  });
+}
