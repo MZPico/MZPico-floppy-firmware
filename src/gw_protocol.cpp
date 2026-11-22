@@ -1188,8 +1188,8 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
   else if (cmd == MZP_CMD_RECALDIAG) {
     // [cmd, ACK, fails(4), retry_ok(4), retry_fail(4), first_valid,
     //  first_at_ms(4), first_drive, first_site, first_target, first_state,
-    //  first_motor_on_ms(4), first_retry] -- 28 bytes. Read-only; cleared
-    //  together with the firstfail latch.
+    //  first_motor_on_ms(4), first_retry] -- 28 bytes. cmd_buffer[2] == 1
+    //  (len 3): clear the latch after reporting, in this same handler.
     FdcRecalDiag d;
     fdc_recaldiag_snapshot(&d);
     reply_buffer[i++] = GW_ACK_OK;
@@ -1208,6 +1208,8 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
       reply_buffer[i++] = (d.first_motor_on_ms >> (8 * k)) & 0xFF;
     reply_buffer[i++] = d.first_retry;
     cdc_write_all(reply_buffer, i);
+    if (cmd_buffer[1] >= 3 && cmd_buffer[2] == 1)
+      fdc_recaldiag_reset();
   }
 
   else if (cmd == MZP_CMD_RDWIN) {

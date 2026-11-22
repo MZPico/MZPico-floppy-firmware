@@ -3060,6 +3060,11 @@ void fdc_recaldiag_snapshot(FdcRecalDiag *o) {
   o->first_retry = S.rc_retry;
 }
 
+void fdc_recaldiag_reset(void) {
+  S.rc_valid = false;
+  S.rc_fails = S.rc_retry_ok = S.rc_retry_fail = 0;
+}
+
 void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->valid = S.ff_valid ? 1 : 0;
   o->kind = S.ff_kind;
@@ -3112,8 +3117,6 @@ void fdc_resetdiag_clear(void) {
 
 void fdc_firstfail_reset(void) {
   S.ff_valid = false;
-  S.rc_valid = false;
-  S.rc_fails = S.rc_retry_ok = S.rc_retry_fail = 0;
   S.ff_count = 0;
   S.ff_kind = 0;
   S.ff_at_ms = 0;
@@ -3923,6 +3926,7 @@ void fdc_disk_task(void) {
     uint32_t gen = S.cmd_gen;  // see cmd_gen
     bool restore = (S.restore_done != S.restore_req);
     uint32_t rseq = S.restore_req;
+    uint32_t rgen = S.restore_gen; // the RESTORE this pass runs
     bool verify = S.op_verify;
 
     // The select may be stale if this seek landed while core0 was busy (see
@@ -4008,7 +4012,10 @@ void fdc_disk_task(void) {
     bool publish;
     if (recal_failed) {
       seek_err = true;
-      publish = S.restore_gen == S.cmd_gen;
+      // ...this pass's RESTORE, not one that arrived during its retries
+      // (CodeRabbit on #64): that one runs on its own next pass.
+      publish = S.restore_req == rseq && S.restore_gen == rgen &&
+                rgen == S.cmd_gen;
     } else {
       seek_err = verify ? !fdc_verify_track(S.track) : false;
       publish = S.op_seq == seq && S.cmd_gen == gen;
