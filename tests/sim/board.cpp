@@ -7,6 +7,20 @@
 #include "floppy.hpp"
 #include "gw_protocol.hpp"
 #include "mz_bus.hpp"
+#include "hardware/sync.h"
+
+#include <functional>
+#include <utility>
+#include <vector>
+
+// ---- spin-lock model and race points (#61), see hal hardware/sync.h ----
+namespace {
+spin_lock_t g_locks[32];
+bool g_lock_model = true;
+std::vector<std::pair<uint8_t, uint8_t>> g_deferred; // raw (port, value)
+std::function<void(int)> g_race_cb;
+} // namespace
+
 
 // ---- link-time stand-ins for the parts of the firmware not under test ----
 static uint8_t g_flux[MAX_FLUX_PULSE_PER_TRACK];
@@ -53,8 +67,21 @@ static constexpr uint64_t IO_TICKS = 74;
 static bool inverted(uint8_t port) { return port >= 0xD8 && port <= 0xDB; }
 
 void out(uint8_t port, uint8_t v) {
-  fdc_reg_write(port, inverted(port) ? (uint8_t)~v : v);
+  uint8_t raw = inverted(port) ? (uint8_t)~v : v;
+  if (sim_publock_held())
+    g_deferred.push_back({port, raw}); // core1 would be waiting on the lock
+  else
+    fdc_reg_write(port, raw);
   wait_ticks(IO_TICKS);
+}
+
+void set_race_point(std::function<void(int)> cb) { g_race_cb = std::move(cb); }
+void race_out(uint8_t port, uint8_t v) {
+  uint8_t raw = inverted(port) ? (uint8_t)~v : v;
+  if (sim_publock_held())
+    g_deferred.push_back({port, raw});
+  else
+    fdc_reg_write(port, raw);
 }
 
 uint8_t in(uint8_t port) {
@@ -257,3 +284,43 @@ std::vector<uint8_t> format_image(uint8_t cyl, uint8_t head, int nsec,
 
 } // namespace wd
 } // namespace sim
+
+spin_lock_t *spin_lock_instance(unsigned num) { return &g_locks[num & 31]; }
+int spin_lock_claim_unused(bool) {
+  static int next = 0;
+  return next++ & 31;
+}
+void spin_lock_unsafe_blocking(spin_lock_t *l) {
+  if (g_lock_model)
+    l->held = 1;
+}
+void spin_unlock_unsafe(spin_lock_t *l) {
+  l->held = 0;
+  // The writes that "waited" on the lock run now, in order, each one whole:
+  // a replayed command takes and releases the lock itself (its cmd_gen
+  // bump), and replaying the next one from inside that nested unlock would
+  // run it in the middle of the first one's handler.
+  static bool draining = false;
+  if (draining)
+    return;
+  draining = true;
+  while (!g_deferred.empty() && !sim_publock_held()) {
+    auto w = g_deferred.front();
+    g_deferred.erase(g_deferred.begin());
+    fdc_reg_write(w.first, w.second);
+  }
+  draining = false;
+}
+bool sim_publock_held(void) {
+  for (auto &l : g_locks)
+    if (l.held)
+      return true;
+  return false;
+}
+void sim_publock_model(bool on) { g_lock_model = on; }
+void sim_race_point(int id) {
+  if (g_race_cb) {
+    auto cb = g_race_cb; // a callback may clear or replace itself
+    cb(id);
+  }
+}

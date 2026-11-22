@@ -3560,3 +3560,188 @@ TEST(step_mid_read_address_transfer_releases_int) {
   });
 }
 
+
+// ---------------- core0 publish vs a host command (#61) ----------------
+// core0 checks that its work still belongs to the live command, then
+// publishes. A command landing between the two used to be clobbered. Each
+// test issues host commands AT a race point between a check and its publish
+// (sim::set_race_point); with the publish lock they wait until the publish is
+// done, as core1 waits on the lock. Run with sim_publock_model(false) each of
+// these fails.
+namespace {
+// Poll like the ROM: take every DRQ byte until BUSY drops.
+wd::Xfer drain(uint32_t timeout_ms = 3000) {
+  wd::Xfer x;
+  for (uint64_t end = now() + ms(timeout_ms); now() < end;) {
+    uint8_t st = wd::status();
+    if (st & wd::DRQ)
+      x.data.push_back(in(0xDB));
+    else if (!(st & wd::BUSY)) {
+      x.status = st;
+      return x;
+    }
+  }
+  x.timed_out = true;
+  x.status = wd::status();
+  return x;
+}
+struct RaceOnce {
+  int id;
+  std::function<void()> fn;
+  bool fired = false;
+};
+void arm_race(RaceOnce &r) {
+  set_race_point([&r](int id) {
+    if (id == r.id && !r.fired) {
+      r.fired = true;
+      r.fn();
+    }
+  });
+}
+} // namespace
+
+// A STEP completes; a READ the host issues right as the STEP drops BUSY must
+// keep its own BUSY and deliver its sector.
+TEST(read_issued_as_a_seek_drops_busy_is_not_ended_by_it) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(4);
+    wd::side(1);
+    wd::read_sector(4, 1, 512);
+    RaceOnce r{1, [] { race_out(0xDA, 3); race_out(0xD8, 0x80); }};
+    arm_race(r);
+    out(0xD8, 0x50); // STEP IN, update -> Track 5
+    wd::Xfer x = drain();
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    CHECK_EQ(x.data.size(), 512u);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 5, 0, 3));
+  });
+}
+
+// Force Interrupt right as core0 raises DRQ for a sector: STATUS afterwards is
+// 0x00, no DRQ (the ROM requires a clean STATUS after 0xD0).
+TEST(force_interrupt_as_drq_is_raised_leaves_no_drq) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    RaceOnce r{2, [] { race_out(0xD8, 0xD0); }};
+    arm_race(r);
+    out(0xDA, 2);
+    out(0xD8, 0x80);
+    wait_ms(400);
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::DRQ));
+    CHECK(!(st & wd::BUSY));
+    // and the controller is fine
+    CHECK(matches_pattern(wd::read_sector(0, 3, 512).data, 0, 0, 3));
+  });
+}
+
+// A READ ends with RNF; a new READ the host issues (after Force Interrupt)
+// right at that moment must survive.
+TEST(read_issued_as_an_rnf_completes_survives) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    RaceOnce r{3, [] { race_out(0xD8, 0xD0); race_out(0xDA, 4); race_out(0xD8, 0x80); }};
+    arm_race(r);
+    out(0xDA, 14); // not on the track
+    out(0xD8, 0x80);
+    wd::Xfer x;
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(5);
+    x = drain();
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    CHECK_EQ(x.data.size(), 512u);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 4));
+  });
+}
+
+// A WRITE completes; a READ issued right then must survive.
+TEST(read_issued_as_a_write_completes_survives) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    wd::read_sector(6, 1, 512);
+    RaceOnce r{4, [] { race_out(0xD8, 0xD0); race_out(0xDA, 5); race_out(0xD8, 0x80); }};
+    arm_race(r);
+    std::vector<uint8_t> d(512, 0x3C);
+    out(0xDA, 2);
+    out(0xD8, 0xA0);
+    size_t fed = 0;
+    for (uint64_t end = now() + ms(2000); now() < end && fed < 512;)
+      if (wd::status() & wd::DRQ) {
+        out(0xDB, d[fed]);
+        ++fed;
+      }
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(5);
+    wd::Xfer x = drain();
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    CHECK_EQ(x.data.size(), 512u);
+    CHECK(matches_pattern(x.data, 6, 0, 5));
+  });
+}
+
+// A READ nobody drains times out (LOST DATA); a new READ the host issues right
+// then must survive.
+TEST(read_issued_as_lost_data_fires_survives) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    RaceOnce r{13, [] { race_out(0xD8, 0xD0); race_out(0xDA, 6); race_out(0xD8, 0x80); }};
+    arm_race(r);
+    out(0xDA, 2);
+    out(0xD8, 0x80); // never drained
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(1);
+    wd::Xfer x = drain();
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    CHECK_EQ(x.data.size(), 512u);
+    CHECK(matches_pattern(x.data, 0, 0, 6));
+  });
+}
+
+// READ TRACK decoded; a Force Interrupt right as it publishes: no DRQ after.
+TEST(force_interrupt_as_read_track_publishes_leaves_no_drq) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    RaceOnce r{8, [] { race_out(0xD8, 0xD0); }};
+    arm_race(r);
+    out(0xD8, 0xE0); // READ TRACK
+    for (uint64_t end = now() + ms(2000); now() < end && !r.fired;)
+      wait_ms(5);
+    wait_ms(20);
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    uint8_t st = wd::status();
+    CHECK(!(st & wd::DRQ));
+    CHECK(!(st & wd::BUSY));
+  });
+}
