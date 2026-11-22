@@ -3905,3 +3905,43 @@ TEST(format_issued_as_a_write_fails_reports_no_rnf) {
     CHECK_EQ(error_bits(st), 0);
   });
 }
+
+// ---- second review of #65 ----
+// A Type I does not end a READ SECTOR (core1 leaves `reading` set). One that
+// lands after core0 judged the read live but before the locked publish makes
+// the publish fail -- and the found path then marks the read done anyway
+// (S.rd_done = seq), unlike the RNF path's finish_stale(). The read is still
+// pending, nothing will ever serve or end it: BUSY forever.
+TEST(type1_between_live_and_read_publish_does_not_wedge_the_read) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    wd::read_sector(6, 1, 512);
+    RaceOnce r{20, [] {
+      race_out(0xDB, 6);    // SEEK to where the head already is
+      race_out(0xD8, 0x10);
+    }};
+    arm_race(r);
+    out(0xDA, 2);
+    out(0xD8, 0x80); // READ SECTOR 2
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(1);
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    // The read must finish one way or the other: DRQ with data, or an error.
+    bool done = false;
+    for (uint64_t end = now() + ms(3000); now() < end && !done;) {
+      uint8_t st = wd::status();
+      if (st & wd::DRQ) {
+        for (int i = 0; i < 512 && (wd::status() & wd::DRQ); ++i)
+          in(0xDB);
+      }
+      if (!(st & wd::BUSY))
+        done = true;
+    }
+    CHECK(done);
+  });
+}

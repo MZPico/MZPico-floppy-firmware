@@ -4104,7 +4104,9 @@ void fdc_disk_task(void) {
         // -> flip the latch and re-decode.
         {
           uint8_t idtmp[6];
-          if (g_flux_n > 0 &&
+          // (re-decoded into S.track_buf, which a WRITE TRACK collects its
+          // image into: only while this READ TRACK is still the live command)
+          if (g_flux_n > 0 && S.trk_op == 1 && S.cmd_gen == gen &&
               !mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
               fdc_try_other_density(flux, g_flux_n))
             n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
@@ -4774,7 +4776,17 @@ void fdc_disk_task(void) {
         return;
       fdc_apply_side();
       fdc_bench_restore_head();
-      if (S.cmd_gen != gen || !S.reading || S.op_done != S.op_seq)
+      // ...and rd_fresh is consumed in the same locked step as that check: a
+      // new READ (ADDRESS) landing between the two had its own rd_fresh
+      // cleared and was answered RNF without ever searching (review of #65).
+      bool go = [&]() RAM_FUNC -> bool {
+        FdcPub pub;
+        if (S.cmd_gen != gen || !S.reading || S.op_done != S.op_seq)
+          return false;
+        S.rd_fresh = false;
+        return true;
+      }();
+      if (!go)
         return;
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
@@ -4787,7 +4799,7 @@ void fdc_disk_task(void) {
       // core1 set rd_fresh again for its new command. Clearing it afterwards
       // erased that, and the new command was answered from flux captured
       // before its queued move ran, on the old surface or drive (issue #3).
-      S.rd_fresh = false;
+      // (consumed above, under the lock)
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);
       else
@@ -4988,13 +5000,21 @@ void fdc_disk_task(void) {
         // is still the live command right now (review of #65): a WRITE the
         // host issued after `live` above would have its first byte
         // overwritten. A host command arriving during the copy itself cannot
-        // be a WRITE with data yet -- Force Interrupt, WRITE and the first
-        // DATA byte are three Z80 I/O instructions, ~10 us, while the copy
-        // is a few us -- and its xfer_len/xfer_pos are set only in the locked
-        // publish below, which fails for a superseded READ.
-        if (S.reading && S.rd_seq == seq && S.cmd_gen == gen)
-          for (uint16_t k = 0; k < n; ++k)
-            S.xfer[k] = g_secbuf[k];
+        // be a WRITE with data yet: the copy runs forward at ~30 ns a byte,
+        // while the host's first DATA byte comes >= ~10 us after its WRITE
+        // command and the rest ~10 us apart, so the copy stays far ahead of
+        // the host's write position. Its xfer_len/xfer_pos are set only in
+        // the locked publish below, which fails for a superseded READ.
+        // With core0's interrupts masked for the copy (~15-35 us; core1 is not
+        // involved): a USB interrupt landing right after the check could
+        // otherwise stretch the copy past the host's first WRITE byte.
+        {
+          uint32_t irq = save_and_disable_interrupts();
+          if (S.reading && S.rd_seq == seq && S.cmd_gen == gen)
+            for (uint16_t k = 0; k < n; ++k)
+              S.xfer[k] = g_secbuf[k];
+          restore_interrupts(irq);
+        }
         // CRC is STICKY across a multi-record command, and a bad one ENDS it.
         //
         // This used to be a plain assignment. In a Read Multiple (0x9X, which is
@@ -5045,7 +5065,7 @@ void fdc_disk_task(void) {
         // the check and the store left DRQ up after it. The status bits of
         // this record are published in the same step -- set before the check,
         // they could land on a newer command the host had just issued.
-        [&]() RAM_FUNC {
+        bool published = [&]() RAM_FUNC -> bool {
         FdcPub pub;
         if (S.reading && S.rd_seq == seq && S.cmd_gen == gen) {
           FDC_RACE_POINT(2);
@@ -5074,9 +5094,18 @@ void fdc_disk_task(void) {
           // only arrived if some later unrelated event happened to call
           // refresh. fdc_refresh_int_line() applies the mode/EINT gate itself.
           fdc_refresh_int_line();
+          return true;
         }
+        return false;
         }();
-        S.rd_done = seq;
+        // Not published: a command landed after `live`. A Type I leaves the
+        // READ running, so marking it done here wedged it with BUSY up for
+        // good; finish_stale() leaves it to be recaptured after the move
+        // (review of #65).
+        if (published)
+          S.rd_done = seq;
+        else
+          finish_stale();
         // Multi-record keeps the captured window: every remaining sector of
         // this track is already in it, so no re-capture is needed.
       } else {
