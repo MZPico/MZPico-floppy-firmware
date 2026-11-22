@@ -94,6 +94,7 @@ MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_FWVER = 0xA0
 MZP_CMD_DENSEL = 0xA1
 MZP_CMD_RDWIN = 0xA2
+MZP_CMD_RECALDIAG = 0xA3
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -1216,6 +1217,40 @@ def do_resetdiag(s, clear=False):
         print("  it is active low and the polarity assumption is inverted.")
 
 
+RECAL_SITES = {1: "RESTORE", 2: "SEEK", 3: "select catch-up",
+               4: "head resync", 5: "bench-head restore"}
+
+
+def do_recaldiag(s):
+    """Recalibrates that never found TRK00 (#31) -- the cause behind a later
+    wrong-cylinder read. Printed as part of `firstfail`; older firmware does
+    not know the command, which is reported and otherwise harmless."""
+    s.write(bytes([MZP_CMD_RECALDIAG, 2]))
+    s.flush()
+    r = read_exact(s, 28)
+    if len(r) < 28 or r[1] != 0:
+        print("recalibrates: (not reported by this firmware)")
+        return
+    u32 = lambda o: int.from_bytes(r[o:o + 4], "little")
+    fails, ok, bad = u32(2), u32(6), u32(10)
+    print(f"recalibrates that never saw TRK00: {fails}"
+          + (f"  (retry with the spindle up: {ok} found it, {bad} did not)"
+             if fails else ""))
+    if not r[14]:
+        return
+    at_ms, drv, site, tgt, st, mon = u32(15), r[19], r[20], r[21], r[22], u32(23)
+    retry = ("never found it" if r[27] == 0xFF
+             else f"found TRK00 on attempt {r[27]}")
+    flags = [n for b, n in ((1, "host motor bit"), (2, "motor applied"),
+                            (4, "~MOTOR_ON line"), (8, "drive selected"),
+                            (0x10, "index seen"), (0x20, "spin-up gate PENDING"))
+             if st & b]
+    print(f"  first one at {at_ms / 1000:.1f} s: drive {'?' if drv == 0xFF else drv},"
+          f" {RECAL_SITES.get(site, site)} to cylinder {tgt}; retry {retry}")
+    print(f"  state     : {', '.join(flags) or '(nothing set)'}"
+          + ("" if mon == 0xFFFFFFFF else f"; motor line on for {mon} ms"))
+
+
 def do_firstfail(s, clear=False):
     """The first failure since power-up, held unaltered.
 
@@ -1257,6 +1292,7 @@ def do_firstfail(s, clear=False):
     print(f"head-position resyncs:   {resyncs}"
           + (f"  (last: disk said {rs_from}, we wanted {rs_to})"
              if resyncs else ""))
+    do_recaldiag(s)
     if not valid:
         print("no failure latched yet -- nothing has gone wrong since boot")
         return

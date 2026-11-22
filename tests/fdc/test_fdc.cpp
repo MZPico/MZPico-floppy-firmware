@@ -3112,3 +3112,104 @@ TEST(integ_e3_write_track_on_empty_drive_then_restore) {
     CHECK(!(wd::status() & wd::BUSY));
   });
 }
+
+// ---------------- Recalibrate that misses TRK00 (#31) ----------------
+// These drives lose STEP pulses until the spindle is at speed. A recalibrate
+// issued right after the spin-up's first index never reaches TRK00 and used to
+// leave the head stranded, position unknown: the host's next read then hit the
+// wrong cylinder (the #31 capture: head_target=0, phys_track=?). The failure is
+// now latched in full and the move retried with the spindle up.
+namespace {
+FdcRecalDiag recal() {
+  FdcRecalDiag r{};
+  fdc_recaldiag_snapshot(&r);
+  return r;
+}
+} // namespace
+
+TEST(cold_recalibrate_that_misses_trk00_is_retried_with_the_spindle_up) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  // Longer than one whole recalibrate attempt (100 step-outs and 20 step-ins,
+  // about 1 s), so the first attempt really fails; over before the retry.
+  cable().drive[0].steps_need_motor_for_ticks = ms(1800);
+  run([] {
+    wd::select(0);
+    uint8_t st = wd::restore();
+    CHECK(st & wd::TRK0);
+    CHECK_EQ(cable().drive[0].cyl, 0);
+    CHECK(cable().drive[0].steps_lost > 0); // the first attempt really missed
+    FdcRecalDiag r = recal();
+    CHECK_EQ(r.fails, 1u);
+    CHECK_EQ(r.retry_ok, 1u);
+    CHECK_EQ(r.first_valid, 1);
+    CHECK_EQ(r.first_site, 1);   // RESTORE
+    CHECK_EQ(r.first_drive, 0);
+    CHECK(r.first_retry >= 1 && r.first_retry <= 2);
+    CHECK(r.first_state & 0x04); // the motor line was on
+    wd::side(1);
+    wd::Xfer x = wd::read_sector(0, 1, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 1));
+  });
+}
+
+// The #31 shape: drive 1 used for the first time, CP/M-style, its steps lost
+// at first. The head must still end up where the host asked.
+TEST(first_seek_on_unit1_with_lost_steps_lands_on_the_target) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]);
+  insert(1, &g_disk[1]);
+  board_boot();
+  cable().drive[1].cyl = 9;
+  cable().drive[1].steps_need_motor_for_ticks = ms(1800);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    // ~MOTOR_ON is one wire: drive 1's spindle has been turning all along.
+    // The quirk only bites from a cold start of the line, so stop it first.
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(!cable().drive[1].motor);
+    wd::select(1);
+    wd::restore();
+    wd::seek(2);
+    CHECK_EQ(cable().drive[1].cyl, 2);
+    wd::Xfer x = wd::read_sector(2, 3, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 2, 0, 3));
+    CHECK_EQ(dbg().sec_cyl_mismatch, 0u);
+    FdcRecalDiag r = recal();
+    CHECK(r.fails >= 1);
+    CHECK_EQ(r.retry_fail, 0u);
+    CHECK_EQ(r.first_drive, 1);
+  });
+}
+
+// A drive that never finds TRK00 (no disk turning it, a dead sensor) is
+// latched as such, and the controller does not wedge.
+TEST(recalibrate_that_never_finds_trk00_is_latched_and_does_not_wedge) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    uint8_t st = wd::wait_ready(8000);
+    CHECK(!(st & wd::BUSY));
+    CHECK(!(st & wd::TRK0));
+    FdcRecalDiag r = recal();
+    CHECK_EQ(r.fails, 1u);
+    CHECK_EQ(r.retry_fail, 1u);
+    CHECK_EQ(r.first_retry, 0xFF);
+    // The latch clears with firstfail's.
+    fdc_firstfail_reset();
+    CHECK_EQ(recal().first_valid, 0);
+    CHECK_EQ(recal().fails, 0u);
+  }, ms(60000));
+}

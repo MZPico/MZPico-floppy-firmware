@@ -447,6 +447,11 @@ struct FdcState {
   // So: capture the FIRST failure since power-up in full, and never overwrite
   // it. Cleared only by an explicit probe command.
   volatile bool ff_valid = false;
+  // Recalibrate failures (fdc_drive_head_to, FdcRecalDiag). core0 only.
+  uint32_t rc_fails = 0, rc_retry_ok = 0, rc_retry_fail = 0;
+  bool rc_valid = false;
+  uint32_t rc_at_ms = 0, rc_motor_on_ms = 0;
+  uint8_t rc_drive = 0, rc_site = 0, rc_target = 0, rc_state = 0, rc_retry = 0;
   volatile uint32_t ff_count = 0;   // failures seen since power-up (all of them)
   volatile uint32_t ff_at_ms = 0;   // ms since boot -- how early it happened
   volatile uint8_t ff_kind = 0;     // 1 RNF, 2 data CRC, 3 wrong cylinder,
@@ -1035,6 +1040,7 @@ bool g_stream_active = false; // an incremental capture is currently running
 // core0 only, and only from a point where no transfer is in flight: the shared
 // lines are handed over here, and doing that under a read or a splice would
 // move the flux path to a different spindle mid-sector.
+static bool fdc_drive_head_to(int tgt, uint8_t site); // see its definition
 static bool fdc_apply_drive_select(void) {
   uint8_t want = g_drive_lock ? 0 : S.drive_sel;
   if (want >= (uint8_t)g_ndrives) {
@@ -1132,7 +1138,7 @@ static bool fdc_apply_drive_select(void) {
     g_timing_set = true;
     int tgt = S.head_target[want];
     if (next->track() != tgt)
-      next->goto_track(tgt);
+      fdc_drive_head_to(tgt, 3);
   }
 
   // Refresh the physical status bits from the drive we have just selected --
@@ -1532,6 +1538,65 @@ static void fdc_wait_head_ready(bool settle) {
     return;
   while (!DRV->head_ready(settle ? FDC_HEAD_SETTLE_US : 0, FDC_SPINUP_STABLE_US)) {
   }
+}
+
+// Drive the head to `tgt`, and do not accept a recalibrate that never found
+// TRK00 (#31). goto_track() recalibrates whenever the position is unknown or
+// the target is 0, and gives up -- position unknown -- if TRK00 never shows.
+// That strands the head: the next read lands on whatever cylinder the head is
+// over and the host sees a wrong-cylinder RNF, long after the cause. These
+// drives do not step reliably until the spindle is up to speed (memory:
+// drive spin-up quirk), and a spin-up that has only just seen an index is not
+// that, so: record the failure in full, wait for the spin-up gate and an index
+// sighting, and try once more. `site` says which path asked (FdcRecalDiag).
+static constexpr int FDC_RECAL_RETRIES = 2;
+static constexpr uint32_t FDC_RECAL_RETRY_GAP_MS = 200;
+static bool fdc_drive_head_to(int tgt, uint8_t site) {
+  if (!DRV)
+    return false;
+  bool ok = DRV->goto_track(tgt) && DRV->track() >= 0;
+  if (ok)
+    return true;
+  bool first = !S.rc_valid;
+  S.rc_fails++;
+  if (first) {
+    bool line = FloppyDrive::motor_line_on();
+    S.rc_valid = true;
+    S.rc_at_ms = to_ms_since_boot(get_absolute_time());
+    S.rc_drive = (g_cur_drive < 0) ? 0xFF : (uint8_t)g_cur_drive;
+    S.rc_site = site;
+    S.rc_target = (uint8_t)tgt;
+    S.rc_state = (uint8_t)((S.motor_on ? 0x01 : 0) | (g_applied_motor ? 0x02 : 0) |
+                           (line ? 0x04 : 0) | (DRV->drive_is_selected() ? 0x08 : 0) |
+                           (DRV->index_seen() ? 0x10 : 0) |
+                           (!DRV->head_ready(0, FDC_SPINUP_STABLE_US) ? 0x20 : 0));
+    S.rc_motor_on_ms = line ? (time_us_32() - FloppyDrive::motor_on_since_us()) / 1000u
+                            : 0xFFFFFFFFu;
+    S.rc_retry = 0;
+  }
+  // The retry: the spindle really up, then the same move again -- twice, a
+  // revolution apart, since "up to speed" is a guess for a drive we have no
+  // datasheet for. One attempt is ~1 s of steps (100 out, 20 in), so the
+  // worst case is ~3 s with BUSY up, and only ever on a path that has
+  // already failed.
+  g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+  g_applied_motor = true;
+  g_motor_off_at = 0;
+  fdc_wait_head_ready(false);
+  int attempt = 0;
+  while (!ok && attempt < FDC_RECAL_RETRIES) {
+    if (attempt)
+      sleep_ms(FDC_RECAL_RETRY_GAP_MS);
+    ++attempt;
+    ok = DRV->goto_track(tgt) && DRV->track() >= 0;
+  }
+  if (ok)
+    S.rc_retry_ok++;
+  else
+    S.rc_retry_fail++;
+  if (first)
+    S.rc_retry = ok ? (uint8_t)attempt : 0xFF;
+  return ok;
 }
 
 static bool fdc_verify_track(uint8_t track) {
@@ -1974,7 +2039,7 @@ static void fdc_resync_head(uint8_t seen_cyl) {
   DRV->set_track_belief((int)seen_cyl);
   int tgt = S.head_target[fdc_cur_idx()];
   if ((int)seen_cyl != tgt)
-    DRV->goto_track(tgt);
+    fdc_drive_head_to(tgt, 4);
   S.at_track0 = DRV->get_track0_sense();
 }
 
@@ -2911,6 +2976,20 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->bt_err_count = (uint16_t)S.bt_err_count;
 }
 
+void fdc_recaldiag_snapshot(FdcRecalDiag *o) {
+  o->fails = S.rc_fails;
+  o->retry_ok = S.rc_retry_ok;
+  o->retry_fail = S.rc_retry_fail;
+  o->first_valid = S.rc_valid ? 1 : 0;
+  o->first_at_ms = S.rc_at_ms;
+  o->first_drive = S.rc_drive;
+  o->first_site = S.rc_site;
+  o->first_target = S.rc_target;
+  o->first_state = S.rc_state;
+  o->first_motor_on_ms = S.rc_motor_on_ms;
+  o->first_retry = S.rc_retry;
+}
+
 void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->valid = S.ff_valid ? 1 : 0;
   o->kind = S.ff_kind;
@@ -2963,6 +3042,8 @@ void fdc_resetdiag_clear(void) {
 
 void fdc_firstfail_reset(void) {
   S.ff_valid = false;
+  S.rc_valid = false;
+  S.rc_fails = S.rc_retry_ok = S.rc_retry_fail = 0;
   S.ff_count = 0;
   S.ff_kind = 0;
   S.ff_at_ms = 0;
@@ -3594,7 +3675,7 @@ static void fdc_bench_restore_head(void) {
       g_applied_motor = true;
       g_motor_off_at = 0;
     }
-    DRV->goto_track(tgt);
+    fdc_drive_head_to(tgt, 5);
   }
   g_bench_head_dirty = false;
   S.at_track0 = DRV->get_track0_sense();
@@ -3796,17 +3877,21 @@ void fdc_disk_task(void) {
     // core1 has already updated it per the WD rules. Overwriting it here forced
     // belief == reality, which is precisely the state a recalibrating host is
     // trying to establish for itself via READ ADDRESS.
+    bool recal_failed = false;
     if (restore) {
-      DRV->goto_track(0); // steps out until TRK00
+      recal_failed = !fdc_drive_head_to(0, 1); // steps out until TRK00
       S.restore_done = rseq;
     }
     // Drive the head to whatever core1 has folded into head_target. Read once:
     // core1 may move it again while we step, which just leaves op_seq != op_done
-    // and brings us straight back here.
-    {
+    // and brings us straight back here. Not straight after a RESTORE that has
+    // just failed with all its retries: with the position unknown this would
+    // recalibrate all over again, and the host would wait twice as long for
+    // the same answer (the next command tries afresh).
+    if (!recal_failed) {
       int tgt = S.head_target[fdc_cur_idx()];
       if (DRV->track() != tgt)
-        DRV->goto_track(tgt);
+        fdc_drive_head_to(tgt, 2);
     }
     g_bench_head_dirty = false; // the move put it where the host wants it
 
