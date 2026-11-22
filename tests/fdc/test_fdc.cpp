@@ -3410,8 +3410,6 @@ TEST(step_during_a_read_address_ends_it_and_completes) {
   });
 }
 
-// ---- third review of #64 ----
-
 // A STEP landing while the READ ADDRESS is still inside its ID search (the
 // rd_fresh block), not in the decode block: does it come back as a READ
 // SECTOR? Watch DRQ and the counters, not just the final BUSY.
@@ -3529,3 +3527,36 @@ TEST(seek_error_does_not_survive_a_step_force_interrupt_burst) {
     CHECK(!(st & wd::SEEKERR));
   }, ms(120000));
 }
+
+// ---- fourth review of #64 ----
+
+// EINT armed, a READ ADDRESS raises DRQ (and ~INT), the host takes two bytes
+// and then issues a STEP. core1 ends the READ ADDRESS (reading/drq cleared),
+// but the ~INT refresh in the command handler ran BEFORE that clear, so the
+// line must not stay asserted with nothing pending.
+TEST(step_mid_read_address_transfer_releases_int) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    out(0xDF, 0x01); // EINT on
+    out(0xD8, 0xC0); // READ ADDRESS
+    bool drq = false;
+    for (uint64_t end = now() + ms(500); now() < end;) {
+      if (wd::status() & wd::DRQ) { drq = true; break; }
+    }
+    CHECK(drq);
+    CHECK(pin_oe(12));
+    in(0xDB);
+    in(0xDB);
+    out(0xD8, 0x50); // STEP IN, no Force Interrupt
+    wait_us(50);
+    bool held = pin_oe(12);
+    wd::wait_ready(3000);
+    out(0xDF, 0x00);
+    CHECK(!held); // ~INT asserted with no DRQ pending
+  });
+}
+

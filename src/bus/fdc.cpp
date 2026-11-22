@@ -2210,6 +2210,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       if (S.reading && S.read_addr) {
         S.reading = false;
         S.drq = false;
+        fdc_refresh_int_line(); // the refresh above ran before this clear
       }
       S.read_addr = false;
       // Abandon any half-collected write. The head is about to move, and a
@@ -4832,7 +4833,10 @@ void fdc_disk_task(void) {
       bool live = S.reading && S.rd_seq == seq && S.cmd_gen == gen;
 
       if (sd.found && sd.has_data && !live) {
-        if (!S.read_addr)
+        // Not for a READ ADDRESS result (rd_result b4, set above from this
+        // pass's own decode): its sd.size_n is not a sector's, and the live
+        // S.read_addr may have been cleared by a command meanwhile.
+        if (!(S.rd_result & 0x10))
           fdc_note_size_code(sd.cyl, sd.size_n);
         finish_stale();
       } else if (sd.found && sd.has_data) {
