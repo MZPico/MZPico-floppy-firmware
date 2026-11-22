@@ -3207,8 +3207,11 @@ TEST(recalibrate_that_never_finds_trk00_is_latched_and_does_not_wedge) {
     CHECK_EQ(r.fails, 1u);
     CHECK_EQ(r.retry_fail, 1u);
     CHECK_EQ(r.first_retry, 0xFF);
-    // The latch clears with firstfail's.
+    // Not cleared with firstfail's latch (a failure latched between the two
+    // reports would be lost); it has its own clear.
     fdc_firstfail_reset();
+    CHECK_EQ(recal().first_valid, 1);
+    fdc_recaldiag_reset();
     CHECK_EQ(recal().first_valid, 0);
     CHECK_EQ(recal().fails, 0u);
   }, ms(60000));
@@ -3230,7 +3233,9 @@ TEST(resync_retry_does_not_end_a_newer_read) {
     // No RESTORE: position unknown, head over cyl 5, host thinks cyl 0.
     wd::Xfer x1 = wd::read_sector(0, 1, 512, false, 1200);
     wd::Xfer x2 = wd::read_sector(0, 2, 512, false, 6000);
-    // A read either delivers its sector or reports an error -- never
+    CHECK(x1.timed_out);  // the host gave up (and sent Force Interrupt)
+    CHECK(!x2.timed_out); // the newer READ finished on its own
+    // ...and either delivered its sector or reported an error -- never
     // "complete, no error" with no data.
     CHECK(!(x2.data.empty() && error_bits(x2.status) == 0));
   });
@@ -3427,11 +3432,13 @@ TEST(step_during_read_address_search_never_raises_drq) {
       out(0xD8, 0xC0); // READ ADDRESS
       wait_us(200 + 300 * k);
       out(0xD8, 0x50); // STEP IN, no Force Interrupt
+      // After a STEP, STATUS is in the Type I layout, where bit 1 is INDEX:
+      // watch the controller's own DRQ flag (rd_flags b2) instead.
       bool saw_drq = false;
       uint8_t st = 0;
       for (int i = 0; i < 200000; ++i) {
         st = wd::status();
-        if (st & wd::DRQ)
+        if (dbg().rd_flags & 0x04)
           saw_drq = true;
         if (!(st & wd::BUSY))
           break;
@@ -3560,3 +3567,46 @@ TEST(step_mid_read_address_transfer_releases_int) {
   });
 }
 
+
+// A second RESTORE arriving while the first one's failed recalibrate is still
+// retrying: the first one's Seek Error must not be reported as the second's
+// (CodeRabbit on #64). Here the second finds TRK00.
+TEST(failed_restore_seek_error_is_not_reported_for_a_later_restore) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000); // A cannot win
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    out(0xD8, 0x00); // RESTORE A
+    wait_ms(1500);   // inside A's retries
+    out(0xD8, 0x00); // RESTORE B
+    // Once A has given up for good, let the steps land: B then succeeds.
+    for (uint64_t end = now() + ms(10000); now() < end && recal().retry_fail == 0;)
+      wait_us(200);
+    CHECK_EQ(recal().retry_fail, 1u);
+    cable().drive[0].steps_need_motor_for_ticks = 0;
+    // While B runs, A's failure must not show as B's Seek Error, nor be
+    // latched as the first failure.
+    bool seek_err_seen = false;
+    uint8_t st = 0;
+    for (uint64_t end = now() + ms(8000); now() < end;) {
+      st = wd::status();
+      if (st & wd::SEEKERR)
+        seek_err_seen = true;
+      if (!(st & wd::BUSY))
+        break;
+      wait_us(200);
+    }
+    FdcFirstFail ff{};
+    fdc_firstfail_snapshot(&ff);
+    CHECK(!seek_err_seen);
+    CHECK_EQ(ff.count, 0u);
+    CHECK(!(st & wd::BUSY));
+    CHECK(st & wd::TRK0);
+    CHECK(!(st & wd::SEEKERR));
+    CHECK_EQ(cable().drive[0].cyl, 0);
+  }, ms(60000));
+}

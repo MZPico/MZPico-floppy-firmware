@@ -341,7 +341,7 @@ void fdc_firstfail_snapshot(FdcFirstFail *out);
 // the head stranded with position unknown, and the host's next read is the
 // wrong-cylinder RNF the first-failure latch then shows: the symptom, not the
 // cause. This holds the cause. `first_*` describe the first one since
-// power-up (cleared with the firstfail latch).
+// power-up or the last fdc_recaldiag_reset().
 struct FdcRecalDiag {
   uint32_t fails;        // recalibrates that never saw TRK00
   uint32_t retry_ok;     // ...of which the retry, spindle confirmed up, found it
@@ -359,6 +359,10 @@ struct FdcRecalDiag {
   uint8_t first_retry;   // retry attempts it took to find TRK00 (1..2); 0xFF = never
 };
 void fdc_recaldiag_snapshot(FdcRecalDiag *out);
+// Cleared on its own (MZP_CMD_RECALDIAG with arg 1, in the same handler as
+// the report), not with the firstfail latch: nothing can be latched between
+// the report and the clear.
+void fdc_recaldiag_reset(void);
 
 // Raw bus-RESET line telemetry, recorded with no polarity assumption -- what
 // the pin actually did, as opposed to what we decided about it. This is the

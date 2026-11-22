@@ -1221,24 +1221,31 @@ RECAL_SITES = {1: "RESTORE", 2: "SEEK", 3: "select catch-up",
                4: "head resync", 5: "bench-head restore"}
 
 
-def fetch_recaldiag(s):
-    """The RECALDIAG reply, or None on firmware that does not know it."""
-    s.write(bytes([MZP_CMD_RECALDIAG, 2]))
+def fetch_recaldiag(s, clear=False):
+    """(status, reply): status "ok" with the 28-byte reply, "unsupported" for
+    firmware that answers BADCMD (nothing else follows), "short" for an
+    incomplete reply. With clear=True the firmware resets the latch right
+    after this report, in the same handler."""
+    s.write(bytes([MZP_CMD_RECALDIAG, 3, 1 if clear else 0]))
     s.flush()
     r = read_exact(s, 2)
-    if len(r) < 2 or r[1] != 0:
-        return None  # [0xA3, BADCMD]: older firmware -- nothing more follows
+    if len(r) == 2 and r[1] != 0:
+        return "unsupported", None
+    if len(r) < 2:
+        return "short", None
     r += read_exact(s, 26)
-    return r if len(r) == 28 else None
+    return ("ok", r) if len(r) == 28 else ("short", None)
 
 
-def do_recaldiag(s, r=None):
+def do_recaldiag(s, fetched=None):
     """Recalibrates that never found TRK00 (#31) -- the cause behind a later
     wrong-cylinder read. Printed as part of `firstfail`."""
-    if r is None:
-        r = fetch_recaldiag(s)
-    if r is None:
+    status, r = fetched if fetched is not None else fetch_recaldiag(s)
+    if status == "unsupported":
         print("recalibrates: (not reported by this firmware)")
+        return
+    if status != "ok":
+        print("recalibrates: (incomplete reply)")
         return
     u32 = lambda o: int.from_bytes(r[o:o + 4], "little")
     fails, ok, bad = u32(2), u32(6), u32(10)
@@ -1267,8 +1274,13 @@ def do_firstfail(s, clear=False):
     moment a host retries -- the retry that succeeds erases the evidence. That
     is why the rare boot-time `FD:Loading error` has never been diagnosable.
     """
-    # Fetched FIRST: `firstfail clear` resets this latch too, after its reply.
-    recal = fetch_recaldiag(s)
+    # The recalibrate latch is reported (and, with clear, reset in the same
+    # handler) first. If that reply is incomplete, nothing is cleared: a
+    # latched failure must never be discarded unseen.
+    recal = fetch_recaldiag(s, clear=clear)
+    if clear and recal[0] == "short":
+        print("recalibrate diagnostics came back incomplete: NOT clearing")
+        clear = False
     s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
     s.flush()
     r = read_exact(s, 67)
@@ -1305,7 +1317,9 @@ def do_firstfail(s, clear=False):
              if resyncs else ""))
     do_recaldiag(s, recal)
     if not valid:
-        print("no failure latched yet -- nothing has gone wrong since boot")
+        print("no first read/seek failure latched"
+              + ("" if recal[0] == "ok" and int.from_bytes(recal[1][2:6], "little")
+                 else " -- nothing has gone wrong since boot"))
         return
     print(f"\nFIRST failure, at {at_ms / 1000:.1f} s after boot:")
     print(f"  kind      : {FF_KINDS.get(kind, kind)}")
