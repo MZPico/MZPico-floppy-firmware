@@ -164,6 +164,7 @@ struct FdcState {
   // change across a select, the host would have no way to see it happen.
   volatile int16_t head_target[FDC_DRIVE_MAX] = {0, 0};
   volatile uint32_t restore_req = 0;  // core1 only: bumped per RESTORE
+  volatile uint32_t restore_gen = 0;  // cmd_gen of the latest RESTORE
   volatile uint32_t restore_done = 0; // core0 only
   volatile bool step_in = true; // last direction, for the bare STEP (0x2X/0x3X)
   volatile bool op_verify = false; // WD Type I Verify (V) bit on this command
@@ -2271,6 +2272,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       if (restore) {
         S.head_target[fdc_drive_idx()] = 0;
         S.restore_req++; // force a physical TRK00 seek even if we think we're there
+        S.restore_gen = S.cmd_gen; // (cmd_gen was bumped for this command above)
       } else if (seek_abs) {
         int t = (int)S.data;
         if (t < 0)
@@ -3918,10 +3920,29 @@ void fdc_disk_task(void) {
     // the head is over some unknown cylinder, so the Verify would read a
     // wrong-cylinder ID, resync, and run the whole failed recalibrate again --
     // 7 s of BUSY for one command (review of #64).
-    S.seek_error = recal_failed ? true
-                   : (verify ? !fdc_verify_track(S.track) : false);
-    if (S.seek_error)
-      fdc_note_failure(4, 0, 0xFF, 0xFF);
+    // Published only for the command it belongs to (second review of #64).
+    // A failed recalibrate is the RESTORE's Seek Error, so it is reported only
+    // if that RESTORE is still the last command the host sent: a Force
+    // Interrupt during it (a WD aborted by Force Interrupt reports none), or a
+    // STEP folded into this same pass (a STEP without V never sets it), is
+    // judged on its own. restore_gen is the RESTORE's own generation -- the
+    // pass's `gen` cannot tell, because a command that arrived during the
+    // spin-up at the top of the pass is already in it. The Verify result is
+    // likewise published only while this seek is still the live command.
+    bool seek_err;
+    bool publish;
+    if (recal_failed) {
+      seek_err = true;
+      publish = S.restore_gen == S.cmd_gen;
+    } else {
+      seek_err = verify ? !fdc_verify_track(S.track) : false;
+      publish = S.op_seq == seq && S.cmd_gen == gen;
+    }
+    if (publish) {
+      S.seek_error = seek_err;
+      if (seek_err)
+        fdc_note_failure(4, 0, 0xFF, 0xFF);
+    }
 
     S.op_done = seq;
     // Clear BUSY only if this seek is still the active command. A newer Type I
@@ -4637,6 +4658,27 @@ void fdc_disk_task(void) {
     if (S.rd_done != S.rd_seq && !S.drq) {
       uint32_t seq = S.rd_seq; // snapshot
       uint32_t gen = S.cmd_gen;
+      // What this pass is serving. A Type I clears S.read_addr but leaves the
+      // read running (see the Force Interrupt notes), so it cannot be read
+      // back afterwards to tell a READ ADDRESS from a READ SECTOR.
+      bool was_read_addr = S.read_addr;
+      // A result that went stale while we blocked: is the command it was for
+      // still pending? Then do NOT mark it done -- nothing would ever end it
+      // (the seek block will not drop BUSY while `reading` is set). A READ
+      // SECTOR is recaptured on the next pass, after the move, for the state
+      // as it is then (the g_flux_gen check below). A READ ADDRESS superseded
+      // by a Type I is position-dependent, so it is ended; BUSY now belongs
+      // to the Type I, which drops it when its move is done (review of #64).
+      auto finish_stale = [&]() {
+        if (S.reading && S.rd_seq == seq) {
+          if (was_read_addr && !S.read_addr) {
+            S.reading = false;
+            S.rd_done = seq;
+          }
+          return; // a READ SECTOR: recaptured on the next pass
+        }
+        S.rd_done = seq;
+      };
       // The buffer belongs to an older command generation: never decode it
       // for this one. A new READ has rd_fresh set already; any other command
       // that left this read live (a Type I does not end a read) gets a fresh
@@ -4786,9 +4828,9 @@ void fdc_disk_task(void) {
       bool live = S.reading && S.rd_seq == seq && S.cmd_gen == gen;
 
       if (sd.found && sd.has_data && !live) {
-        if (!S.read_addr)
+        if (!was_read_addr)
           fdc_note_size_code(sd.cyl, sd.size_n);
-        S.rd_done = seq;
+        finish_stale();
       } else if (sd.found && sd.has_data) {
         if (S.read_addr)
           // WD quirk: READ ADDRESS also loads the track address byte into the
@@ -4909,8 +4951,10 @@ void fdc_disk_task(void) {
           S.reading = false;
           S.busy = false;
           fdc_refresh_int_line(); // WD raises INTRQ on an errored completion too
+          S.rd_done = seq;
+        } else {
+          finish_stale();
         }
-        S.rd_done = seq;
         g_flux_n = 0;
       }
     }
