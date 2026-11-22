@@ -1221,14 +1221,23 @@ RECAL_SITES = {1: "RESTORE", 2: "SEEK", 3: "select catch-up",
                4: "head resync", 5: "bench-head restore"}
 
 
-def do_recaldiag(s):
-    """Recalibrates that never found TRK00 (#31) -- the cause behind a later
-    wrong-cylinder read. Printed as part of `firstfail`; older firmware does
-    not know the command, which is reported and otherwise harmless."""
+def fetch_recaldiag(s):
+    """The RECALDIAG reply, or None on firmware that does not know it."""
     s.write(bytes([MZP_CMD_RECALDIAG, 2]))
     s.flush()
-    r = read_exact(s, 28)
-    if len(r) < 28 or r[1] != 0:
+    r = read_exact(s, 2)
+    if len(r) < 2 or r[1] != 0:
+        return None  # [0xA3, BADCMD]: older firmware -- nothing more follows
+    r += read_exact(s, 26)
+    return r if len(r) == 28 else None
+
+
+def do_recaldiag(s, r=None):
+    """Recalibrates that never found TRK00 (#31) -- the cause behind a later
+    wrong-cylinder read. Printed as part of `firstfail`."""
+    if r is None:
+        r = fetch_recaldiag(s)
+    if r is None:
         print("recalibrates: (not reported by this firmware)")
         return
     u32 = lambda o: int.from_bytes(r[o:o + 4], "little")
@@ -1258,6 +1267,8 @@ def do_firstfail(s, clear=False):
     moment a host retries -- the retry that succeeds erases the evidence. That
     is why the rare boot-time `FD:Loading error` has never been diagnosable.
     """
+    # Fetched FIRST: `firstfail clear` resets this latch too, after its reply.
+    recal = fetch_recaldiag(s)
     s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
     s.flush()
     r = read_exact(s, 67)
@@ -1292,7 +1303,7 @@ def do_firstfail(s, clear=False):
     print(f"head-position resyncs:   {resyncs}"
           + (f"  (last: disk said {rs_from}, we wanted {rs_to})"
              if resyncs else ""))
-    do_recaldiag(s)
+    do_recaldiag(s, recal)
     if not valid:
         print("no failure latched yet -- nothing has gone wrong since boot")
         return

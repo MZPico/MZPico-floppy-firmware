@@ -3911,9 +3911,15 @@ void fdc_disk_task(void) {
     // field before reporting success. Real WD1793 behavior -- see
     // mfm_verify_track(). On the surface the host has selected NOW: the side
     // latch may have moved while we stepped.
-    if (verify)
+    if (verify && !recal_failed)
       fdc_apply_side();
-    S.seek_error = verify ? !fdc_verify_track(S.track) : false;
+    // A RESTORE that never found TRK00 is a Seek Error whatever the V flag
+    // says, as on a WD179x (255 steps without TRK00). And it is not verified:
+    // the head is over some unknown cylinder, so the Verify would read a
+    // wrong-cylinder ID, resync, and run the whole failed recalibrate again --
+    // 7 s of BUSY for one command (review of #64).
+    S.seek_error = recal_failed ? true
+                   : (verify ? !fdc_verify_track(S.track) : false);
     if (S.seek_error)
       fdc_note_failure(4, 0, 0xFF, 0xFF);
 
@@ -4892,6 +4898,12 @@ void fdc_disk_task(void) {
             fdc_note_failure(1, want, 0xFF, 0xFF);
           }
         }
+        // The resync can block for seconds (a recalibrate, with its retries,
+        // #31). A host that gave up meanwhile -- Force Interrupt, then a new
+        // READ -- must not have that NEW command ended here with BUSY down,
+        // no DRQ and no error: it would take a stale buffer for its data
+        // (review of #64; rule 4).
+        live = live && S.reading && S.rd_seq == seq && S.cmd_gen == gen;
         if (live) {
           S.drq = false;
           S.reading = false;

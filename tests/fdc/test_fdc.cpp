@@ -3213,3 +3213,65 @@ TEST(recalibrate_that_never_finds_trk00_is_latched_and_does_not_wedge) {
     CHECK_EQ(recal().fails, 0u);
   }, ms(60000));
 }
+
+// A resync inside the READ path that has to recalibrate (target 0)
+// and whose recalibrate is retried blocks core0 for seconds. `live` was taken
+// before it; a Force Interrupt + new READ meanwhile must not be ended by the
+// stale read's publish.
+TEST(resync_retry_does_not_end_a_newer_read) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(2600);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    // No RESTORE: position unknown, head over cyl 5, host thinks cyl 0.
+    wd::Xfer x1 = wd::read_sector(0, 1, 512, false, 1200);
+    wd::Xfer x2 = wd::read_sector(0, 2, 512, false, 6000);
+    // A read either delivers its sector or reports an error -- never
+    // "complete, no error" with no data.
+    CHECK(!(x2.data.empty() && error_bits(x2.status) == 0));
+  });
+}
+
+// a failed RESTORE -- what does the host see, and how long is BUSY?
+TEST(failed_restore_reports_seek_error_and_recalibrates_once) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    for (int v = 0; v < 2; ++v) {
+      uint64_t t0 = now();
+      out(0xD8, v ? 0x04 : 0x00); // RESTORE, verify flag v
+      wait_us(30);
+      uint8_t st = wd::wait_ready(20000);
+      uint64_t busy_ms = (now() - t0) / ms(1);
+      CHECK(st & wd::SEEKERR); // a WD sets Seek Error when TRK00 never shows
+      CHECK(!(st & wd::BUSY));
+      CHECK(busy_ms < 5000);   // one recalibrate with its retries, not two
+    }
+  }, ms(120000));
+}
+
+// the retry spins up with the host's motor bit off. The deferred stop
+// and the idle ~DSn release must still follow.
+TEST(recalibrate_retry_with_motor_off_still_stops_and_releases) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1500);
+  run([] {
+    wd::select(0, false);
+    wd::restore();
+    wait_ms(6000);
+    CHECK(!cable().drive[0].motor);
+    CHECK(pin_level(PIN_DS0)); // released (active low)
+  }, ms(60000));
+}
