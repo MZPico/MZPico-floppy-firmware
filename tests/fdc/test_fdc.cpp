@@ -3409,3 +3409,123 @@ TEST(step_during_a_read_address_ends_it_and_completes) {
     CHECK(matches_pattern(x.data, 8, 0, 2));
   });
 }
+
+// ---- third review of #64 ----
+
+// A STEP landing while the READ ADDRESS is still inside its ID search (the
+// rd_fresh block), not in the decode block: does it come back as a READ
+// SECTOR? Watch DRQ and the counters, not just the final BUSY.
+TEST(step_during_read_address_search_never_raises_drq) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::read_sector(5, 1, 512);
+    for (int k = 0; k < 4; ++k) {
+      FdcDebug d0{};
+      fdc_debug_snapshot(&d0);
+      out(0xD8, 0xC0); // READ ADDRESS
+      wait_us(200 + 300 * k);
+      out(0xD8, 0x50); // STEP IN, no Force Interrupt
+      bool saw_drq = false;
+      uint8_t st = 0;
+      for (int i = 0; i < 200000; ++i) {
+        st = wd::status();
+        if (st & wd::DRQ)
+          saw_drq = true;
+        if (!(st & wd::BUSY))
+          break;
+      }
+      FdcDebug d1{};
+      fdc_debug_snapshot(&d1);
+      CHECK(!saw_drq);
+      CHECK(!(st & wd::BUSY));
+      CHECK_EQ(d1.lost_data_events, d0.lost_data_events);
+      CHECK_EQ(d1.sec_ok, d0.sec_ok);
+      CHECK_EQ(d1.sec_rnf, d0.sec_rnf);
+    }
+  });
+}
+
+// CP/M's recalibrate idiom: READ ADDRESS, then a STEP that does not update
+// the Track register. If the READ ADDRESS turns into a READ SECTOR of the
+// last sector number against the (now wrong) Track register, it reports a
+// wrong-cylinder RNF -- the #31 signature -- for a command that never read.
+TEST(step_no_update_during_read_address_search_counts_no_cyl_mismatch) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::read_sector(5, 1, 512);
+    FdcDebug d0{};
+    fdc_debug_snapshot(&d0);
+    uint64_t t0 = now();
+    out(0xD8, 0xC0); // READ ADDRESS
+    wait_us(200);
+    out(0xD8, 0x40); // STEP IN, no update, no Force Interrupt
+    uint8_t st = wd::wait_ready(5000);
+    uint64_t dt = now() - t0;
+    FdcDebug d1{};
+    fdc_debug_snapshot(&d1);
+    CHECK(!(st & wd::BUSY));
+    CHECK_EQ(d1.sec_rnf, d0.sec_rnf);
+    CHECK_EQ(d1.sec_cyl_mismatch, d0.sec_cyl_mismatch);
+    CHECK(dt < ms(100));
+  });
+}
+
+// A failed RESTORE's Seek Error, then a RESTORE that succeeds but is followed
+// at once by a Force Interrupt (the host does not wait for BUSY). The publish
+// is skipped for the second RESTORE -- does the first one's Seek Error stay?
+TEST(seek_error_does_not_survive_a_good_restore_followed_by_force_interrupt) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(6000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00);
+    uint8_t st = wd::wait_ready(20000);
+    CHECK(st & wd::SEEKERR);
+    wait_ms(3000);
+    out(0xD8, 0x00); // RESTORE
+    wait_us(20);
+    out(0xD8, 0xD0); // Force Interrupt right behind it
+    wait_ms(8000);   // core0 finishes the (now good) recalibrate
+    st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(st & wd::TRK0);
+    CHECK(!(st & wd::SEEKERR));
+  }, ms(120000));
+}
+
+// Same, CP/M style: a STEP IN + Force Interrupt burst after the failed
+// RESTORE. A STEP without V never reports Seek Error.
+TEST(seek_error_does_not_survive_a_step_force_interrupt_burst) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(6000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00);
+    uint8_t st = wd::wait_ready(20000);
+    CHECK(st & wd::SEEKERR);
+    wait_ms(3000);
+    out(0xD8, 0x50); // STEP IN
+    wait_us(20);
+    out(0xD8, 0xD0);
+    wait_ms(8000);
+    st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(!(st & wd::SEEKERR));
+  }, ms(120000));
+}

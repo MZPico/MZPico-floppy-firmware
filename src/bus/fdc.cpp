@@ -2197,6 +2197,20 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // ---- Type I (seek family) ----
       S.type2 = false; // STATUS reverts to the Type I layout
       S.fi_type1 = false;
+      // A new Type I starts with a clean Seek Error; core0 sets it, if at all,
+      // only when it publishes for this command (third review of #64).
+      S.seek_error = false;
+      // A READ ADDRESS in flight ends here: it is a question about where the
+      // head is, and the head is about to move. Left running (as a READ
+      // SECTOR is, see the Force Interrupt notes) it came back from core0 as
+      // a phantom READ SECTOR of a stale sector number -- DRQ, LOST DATA, and
+      // on CP/M's STEP-without-update the very wrong-cylinder signature #31
+      // hunts (third review of #64). core0 sees `reading` clear and publishes
+      // nothing.
+      if (S.reading && S.read_addr) {
+        S.reading = false;
+        S.drq = false;
+      }
       S.read_addr = false;
       // Abandon any half-collected write. The head is about to move, and a
       // buffer collected for one cylinder must never be spliced onto another;
@@ -4658,25 +4672,15 @@ void fdc_disk_task(void) {
     if (S.rd_done != S.rd_seq && !S.drq) {
       uint32_t seq = S.rd_seq; // snapshot
       uint32_t gen = S.cmd_gen;
-      // What this pass is serving. A Type I clears S.read_addr but leaves the
-      // read running (see the Force Interrupt notes), so it cannot be read
-      // back afterwards to tell a READ ADDRESS from a READ SECTOR.
-      bool was_read_addr = S.read_addr;
       // A result that went stale while we blocked: is the command it was for
       // still pending? Then do NOT mark it done -- nothing would ever end it
-      // (the seek block will not drop BUSY while `reading` is set). A READ
-      // SECTOR is recaptured on the next pass, after the move, for the state
-      // as it is then (the g_flux_gen check below). A READ ADDRESS superseded
-      // by a Type I is position-dependent, so it is ended; BUSY now belongs
-      // to the Type I, which drops it when its move is done (review of #64).
+      // (the seek block will not drop BUSY while `reading` is set). It is a
+      // READ SECTOR (a Type I ends a READ ADDRESS on core1), and it is
+      // recaptured on the next pass, after the move, for the state as it is
+      // then (the g_flux_gen check below) (review of #64).
       auto finish_stale = [&]() {
-        if (S.reading && S.rd_seq == seq) {
-          if (was_read_addr && !S.read_addr) {
-            S.reading = false;
-            S.rd_done = seq;
-          }
-          return; // a READ SECTOR: recaptured on the next pass
-        }
+        if (S.reading && S.rd_seq == seq)
+          return;
         S.rd_done = seq;
       };
       // The buffer belongs to an older command generation: never decode it
@@ -4828,7 +4832,7 @@ void fdc_disk_task(void) {
       bool live = S.reading && S.rd_seq == seq && S.cmd_gen == gen;
 
       if (sd.found && sd.has_data && !live) {
-        if (!was_read_addr)
+        if (!S.read_addr)
           fdc_note_size_code(sd.cyl, sd.size_n);
         finish_stale();
       } else if (sd.found && sd.has_data) {
