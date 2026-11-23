@@ -130,7 +130,12 @@ build from a tree with uncommitted changes says `+dirty`.
 **A `PICO_SDK_PATH` in your environment wins over the pinned submodule**
 (`CMakeLists.txt` defers to it). CI and the releases build with the pinned
 2.2.0, so build hardware-test uf2s the same way:
-`env -u PICO_SDK_PATH cmake -S . -B build-pinned -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=$PWD/external/pico-sdk`.
+
+```bash
+env -u PICO_SDK_PATH cmake -S . -B build-pinned -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH=$PWD/external/pico-sdk
+cmake --build build-pinned          # -> build-pinned/mzpico_floppy.uf2
+```
+
 `grep PICO_SDK_PATH: <build>/CMakeCache.txt` shows which SDK a build dir uses.
 
 ## Tests

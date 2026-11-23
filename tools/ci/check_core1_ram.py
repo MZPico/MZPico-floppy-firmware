@@ -39,7 +39,10 @@ FUNC_RE = re.compile(r"^([0-9a-f]{8}) <([^>]+)>:$")
 CALL_RE = re.compile(r"\sblx?\s+([0-9a-f]+) <([^>+]+)(\+0x[0-9a-f]+)?>")
 WORD_RE = re.compile(r"\.word\s+0x(1[0-9a-f]{7})\b")
 # A branch to another symbol is a tail call; a register call is unknowable.
-BRANCH_RE = re.compile(r"\sb(?:\.[nw])?\s+([0-9a-f]+) <([^>+]+)(\+0x[0-9a-f]+)?>")
+# Conditional branches (`bne.n`) count too: they cannot reach flash from RAM,
+# but they can tail-call another RAM function, which must then be followed.
+BRANCH_RE = re.compile(r"\sb(?:eq|ne|cs|cc|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)?"
+                       r"(?:\.[nw])?\s+([0-9a-f]+) <([^>+]+)(\+0x[0-9a-f]+)?>")
 INDIRECT_RE = re.compile(r"\sbl?x\s+(r\d+|ip|lr)\b")
 
 
@@ -63,6 +66,10 @@ def disassemble(elf):
 def main():
     elf = sys.argv[1] if len(sys.argv) > 1 else "build/mzpico_floppy.elf"
     funcs = disassemble(elf)
+    return check(funcs, elf)
+
+
+def check(funcs, elf):
     problems = []
     seen = set()
     todo = list(ROOTS)
@@ -83,15 +90,17 @@ def main():
                 target, callee, off = int(m.group(1), 16), m.group(2), m.group(3)
                 if target >> 28 != 0x2 or callee.endswith("_veneer"):
                     problems.append(f"{f}: calls flash: {line.strip()}")
-                elif callee != f and not off:
-                    todo.append(callee)  # follow it: RAM alone proves nothing
+                elif callee != f:
+                    # follow it, also when entered at an offset: RAM alone
+                    # proves nothing about what the rest of it calls
+                    todo.append(callee)
             b = BRANCH_RE.search(line)
             if b and b.group(2) != f:  # a jump into ANOTHER function
                 target, callee = int(b.group(1), 16), b.group(2)
                 if target >> 28 != 0x2 or callee.endswith("_veneer"):
                     problems.append(f"{f}: tail-calls flash: {line.strip()}")
-                elif not b.group(3):
-                    todo.append(callee)
+                else:
+                    todo.append(callee)  # `<helper+0x2>` enters helper too
             if INDIRECT_RE.search(line) and "bx\tlr" not in line and " bx lr" not in line:
                 problems.append(f"{f}: indirect call (cannot be checked): {line.strip()}")
             if WORD_RE.search(line):
