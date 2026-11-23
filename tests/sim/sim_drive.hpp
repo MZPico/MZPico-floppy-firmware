@@ -69,6 +69,11 @@ struct Drive {
   uint64_t settle_noise_ticks = ms(8);
   uint64_t speed_stable_ticks = ms(450); // from motor on (index from spinup_ticks)
   uint64_t last_step_at = 0;
+  // The ALPS/Mitsumi quirk (memory: drive spin-up): STEP pulses are lost
+  // until the spindle is at speed, so a recalibrate issued too early never
+  // reaches TRK00. Opt-in; 0 = steps always land.
+  uint64_t steps_need_motor_for_ticks = 0;
+  int steps_lost = 0;
   // ...and the ringing does not stop at once: for a while after the noise the
   // signal is marginal -- real transitions, with timing jitter enough to flip
   // the odd bit. An ID field (6 bytes) usually survives that; a 512-byte data

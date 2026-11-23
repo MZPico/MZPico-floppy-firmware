@@ -336,6 +336,34 @@ struct FdcFirstFail {
 };
 void fdc_firstfail_snapshot(FdcFirstFail *out);
 
+// Recalibrate failures (#31): a move that had to find TRK00 -- the head
+// position unknown, or the target cylinder 0 -- and never saw it. That leaves
+// the head stranded with position unknown, and the host's next read is the
+// wrong-cylinder RNF the first-failure latch then shows: the symptom, not the
+// cause. This holds the cause. `first_*` describe the first one since
+// power-up or the last fdc_recaldiag_reset().
+struct FdcRecalDiag {
+  uint32_t fails;        // recalibrates that never saw TRK00
+  uint32_t retry_ok;     // ...of which the retry, spindle confirmed up, found it
+  uint32_t retry_fail;   // ...and the retry did not either
+  uint8_t first_valid;
+  uint32_t first_at_ms;
+  uint8_t first_drive;   // 0xFF = none
+  uint8_t first_site;    // 1 RESTORE, 2 SEEK, 3 select catch-up, 4 resync,
+                         // 5 bench-head restore
+  uint8_t first_target;  // the cylinder it was driving to
+  uint8_t first_state;   // b0 host motor bit, b1 motor applied, b2 ~MOTOR_ON
+                         // line, b3 drive selected, b4 index seen on this
+                         // spindle, b5 spin-up gate still pending (< 500 ms)
+  uint32_t first_motor_on_ms; // how long the motor line had been on (0xFFFFFFFF = off)
+  uint8_t first_retry;   // retry attempts it took to find TRK00 (1..2); 0xFF = never
+};
+void fdc_recaldiag_snapshot(FdcRecalDiag *out);
+// Cleared on its own (MZP_CMD_RECALDIAG with arg 1, in the same handler as
+// the report), not with the firstfail latch: nothing can be latched between
+// the report and the clear.
+void fdc_recaldiag_reset(void);
+
 // Raw bus-RESET line telemetry, recorded with no polarity assumption -- what
 // the pin actually did, as opposed to what we decided about it. This is the
 // tool for "I pressed reset and nothing was counted": it separates a line that

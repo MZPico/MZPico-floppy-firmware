@@ -89,7 +89,7 @@ arguments for the command list. The useful commands:
 | `health` | Which firmware is running; bus anomalies |
 | `rddiag` | The last read: capture, decode, the position chain |
 | `wrdiag` | The last write: what was written, or why it was refused |
-| `firstfail` | The first failure since power-up, held unaltered |
+| `firstfail` | The first failure since power-up, held unaltered, and any recalibrate that never found TRK00 |
 | `scan <track> <side>` | Every sector on a track, with CRCs |
 | `drive 0` / `drive 1` | Which drive the bench commands use |
 

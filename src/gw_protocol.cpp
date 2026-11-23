@@ -87,6 +87,7 @@
 #define MZP_CMD_FWVER 0xA0     // firmware git hash -- WHICH build is running
 #define MZP_CMD_DENSEL 0xA1    // DENSEL pin override: 0/1 force, 2 auto, 3 query
 #define MZP_CMD_RDWIN 0xA2     // bench: one read through the LIVE read window
+#define MZP_CMD_RECALDIAG 0xA3 // recalibrates that never found TRK00 (#31)
 #define MZP_MAX_SECTORS 40
 #define MZP_MAX_ENC_SECTORS 18
 
@@ -1182,6 +1183,33 @@ static void gw_dispatch(uint8_t cmd, uint8_t len, int i) {
     for (int k = 0; k < 4; k++) // appended: older probes read the first 144
       reply_buffer[i++] = (g_bus_diag.rd_late_at_drive >> (8 * k)) & 0xFF;
     cdc_write_all(reply_buffer, i);
+  }
+
+  else if (cmd == MZP_CMD_RECALDIAG) {
+    // [cmd, ACK, fails(4), retry_ok(4), retry_fail(4), first_valid,
+    //  first_at_ms(4), first_drive, first_site, first_target, first_state,
+    //  first_motor_on_ms(4), first_retry] -- 28 bytes. cmd_buffer[2] == 1
+    //  (len 3): clear the latch after reporting, in this same handler.
+    FdcRecalDiag d;
+    fdc_recaldiag_snapshot(&d);
+    reply_buffer[i++] = GW_ACK_OK;
+    const uint32_t a32[] = {d.fails, d.retry_ok, d.retry_fail};
+    for (uint32_t v : a32)
+      for (int k = 0; k < 4; k++)
+        reply_buffer[i++] = (v >> (8 * k)) & 0xFF;
+    reply_buffer[i++] = d.first_valid;
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.first_at_ms >> (8 * k)) & 0xFF;
+    reply_buffer[i++] = d.first_drive;
+    reply_buffer[i++] = d.first_site;
+    reply_buffer[i++] = d.first_target;
+    reply_buffer[i++] = d.first_state;
+    for (int k = 0; k < 4; k++)
+      reply_buffer[i++] = (d.first_motor_on_ms >> (8 * k)) & 0xFF;
+    reply_buffer[i++] = d.first_retry;
+    cdc_write_all(reply_buffer, i);
+    if (cmd_buffer[1] >= 3 && cmd_buffer[2] == 1)
+      fdc_recaldiag_reset();
   }
 
   else if (cmd == MZP_CMD_RDWIN) {

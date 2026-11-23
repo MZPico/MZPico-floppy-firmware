@@ -10,6 +10,7 @@
 #include "mz_bus.hpp"      // bus_diag_reset
 #include "hardware/gpio.h" // gpio_get (index-edge sync), RESET edge IRQ
 #include "hardware/irq.h"  // IO_IRQ_BANK0 (bus RESET)
+#include "hardware/sync.h" // spin locks (the publish lock, #61)
 #ifndef MZP_HOST_SIM
 #include "hardware/structs/timer.h" // timer_hw (inline 64-bit time in the RESET ISR)
 #include "hardware/structs/io_bank0.h" // io_bank0_hw (inline IRQ acknowledge)
@@ -168,6 +169,7 @@ struct FdcState {
   // change across a select, the host would have no way to see it happen.
   volatile int16_t head_target[FDC_DRIVE_MAX] = {0, 0};
   volatile uint32_t restore_req = 0;  // core1 only: bumped per RESTORE
+  volatile uint32_t restore_gen = 0;  // cmd_gen of the latest RESTORE
   volatile uint32_t restore_done = 0; // core0 only
   volatile bool step_in = true; // last direction, for the bare STEP (0x2X/0x3X)
   volatile bool op_verify = false; // WD Type I Verify (V) bit on this command
@@ -451,6 +453,11 @@ struct FdcState {
   // So: capture the FIRST failure since power-up in full, and never overwrite
   // it. Cleared only by an explicit probe command.
   volatile bool ff_valid = false;
+  // Recalibrate failures (fdc_drive_head_to, FdcRecalDiag). core0 only.
+  uint32_t rc_fails = 0, rc_retry_ok = 0, rc_retry_fail = 0;
+  bool rc_valid = false;
+  uint32_t rc_at_ms = 0, rc_motor_on_ms = 0;
+  uint8_t rc_drive = 0, rc_site = 0, rc_target = 0, rc_state = 0, rc_retry = 0;
   volatile uint32_t ff_count = 0;   // failures seen since power-up (all of them)
   volatile uint32_t ff_at_ms = 0;   // ms since boot -- how early it happened
   volatile uint8_t ff_kind = 0;     // 1 RNF, 2 data CRC, 3 wrong cylinder,
@@ -592,6 +599,55 @@ struct FdcState {
 };
 
 FdcState S;
+
+// ---- The publish lock (#61) ------------------------------------------------
+//
+// core0 decides from `S.cmd_gen` that the work it just finished still belongs
+// to the live command, and then publishes host-visible state -- BUSY down,
+// DRQ up, error bits, ~INT. Done as two steps, a command written by the host
+// between them was clobbered: its BUSY dropped by the old command's
+// completion, a DRQ raised after the host's Force Interrupt (the ROM requires
+// 0x00 after 0xD0). Rule 4 had the check; this makes check + publish one step.
+//
+// core1 takes the lock only around `S.cmd_gen++` (command entry, bus RESET),
+// so a command either lands before core0's check (which then fails) or after
+// its publish (and overrides it). core0 holds it for the check and a handful
+// of stores -- never for a buffer copy, a decode or anything that can block:
+// while core0 holds it, a command write on core1 waits, and core1 must still
+// answer the next bus cycle within ~560 ns. Interrupts are masked while the
+// lock is held so neither core can be preempted holding it (the RESET ISR,
+// on core1, takes it too).
+static spin_lock_t *g_pub_lock = nullptr;
+ALWAYS_INLINE uint32_t fdc_pub_lock(void) {
+  uint32_t irq = save_and_disable_interrupts();
+  spin_lock_unsafe_blocking(g_pub_lock);
+  return irq;
+}
+ALWAYS_INLINE void fdc_pub_unlock(uint32_t irq) {
+  spin_unlock_unsafe(g_pub_lock);
+  restore_interrupts(irq);
+}
+// Holds the lock for the enclosing scope (core0 publish sites).
+struct FdcPub {
+  uint32_t irq;
+  FdcPub() : irq(fdc_pub_lock()) {}
+  ~FdcPub() { fdc_pub_unlock(irq); }
+  FdcPub(const FdcPub &) = delete;
+  FdcPub &operator=(const FdcPub &) = delete;
+};
+ALWAYS_INLINE void fdc_bump_cmd_gen(void) {
+  uint32_t irq = fdc_pub_lock();
+  S.cmd_gen++;
+  fdc_pub_unlock(irq);
+}
+// A point between a check and the publish it guards. Nothing in the firmware;
+// in the host simulation a test can issue host commands at exactly this
+// instant (tests/sim/board.hpp: set_race_point).
+#ifdef MZP_HOST_SIM
+#define FDC_RACE_POINT(id) sim_race_point(id)
+#else
+#define FDC_RACE_POINT(id) ((void)0)
+#endif
 // The drive currently selected. Resolved from S.drive_sel by
 // fdc_apply_drive_select() -- never assigned anywhere else, so every path that
 // actuates the drive sees the same answer.
@@ -946,7 +1002,7 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   // 2. Drop everything the host was waiting on. It is gone; holding BUSY or DRQ
   //    serves nobody, and leaving them set means the machine comes back to a
   //    controller claiming to be mid-command.
-  S.cmd_gen++; // the reset ends every command; nothing in flight may publish
+  fdc_bump_cmd_gen(); // the reset ends every command; nothing in flight may publish
   S.busy = false;
   S.drq = false;
   S.reading = false;
@@ -1073,6 +1129,7 @@ bool g_stream_active = false; // an incremental capture is currently running
 // core0 only, and only from a point where no transfer is in flight: the shared
 // lines are handed over here, and doing that under a read or a splice would
 // move the flux path to a different spindle mid-sector.
+static bool fdc_drive_head_to(int tgt, uint8_t site); // see its definition
 static bool fdc_apply_drive_select(void) {
   uint8_t want = g_drive_lock ? 0 : S.drive_sel;
   if (want >= (uint8_t)g_ndrives) {
@@ -1170,7 +1227,7 @@ static bool fdc_apply_drive_select(void) {
     g_timing_set = true;
     int tgt = S.head_target[want];
     if (next->track() != tgt)
-      next->goto_track(tgt);
+      fdc_drive_head_to(tgt, 3);
   }
 
   // Refresh the physical status bits from the drive we have just selected --
@@ -1570,6 +1627,65 @@ static void fdc_wait_head_ready(bool settle) {
     return;
   while (!DRV->head_ready(settle ? FDC_HEAD_SETTLE_US : 0, FDC_SPINUP_STABLE_US)) {
   }
+}
+
+// Drive the head to `tgt`, and do not accept a recalibrate that never found
+// TRK00 (#31). goto_track() recalibrates whenever the position is unknown or
+// the target is 0, and gives up -- position unknown -- if TRK00 never shows.
+// That strands the head: the next read lands on whatever cylinder the head is
+// over and the host sees a wrong-cylinder RNF, long after the cause. These
+// drives do not step reliably until the spindle is up to speed (memory:
+// drive spin-up quirk), and a spin-up that has only just seen an index is not
+// that, so: record the failure in full, wait for the spin-up gate and an index
+// sighting, and try once more. `site` says which path asked (FdcRecalDiag).
+static constexpr int FDC_RECAL_RETRIES = 2;
+static constexpr uint32_t FDC_RECAL_RETRY_GAP_MS = 200;
+static bool fdc_drive_head_to(int tgt, uint8_t site) {
+  if (!DRV)
+    return false;
+  bool ok = DRV->goto_track(tgt) && DRV->track() >= 0;
+  if (ok)
+    return true;
+  bool first = !S.rc_valid;
+  S.rc_fails++;
+  if (first) {
+    bool line = FloppyDrive::motor_line_on();
+    S.rc_valid = true;
+    S.rc_at_ms = to_ms_since_boot(get_absolute_time());
+    S.rc_drive = (g_cur_drive < 0) ? 0xFF : (uint8_t)g_cur_drive;
+    S.rc_site = site;
+    S.rc_target = (uint8_t)tgt;
+    S.rc_state = (uint8_t)((S.motor_on ? 0x01 : 0) | (g_applied_motor ? 0x02 : 0) |
+                           (line ? 0x04 : 0) | (DRV->drive_is_selected() ? 0x08 : 0) |
+                           (DRV->index_seen() ? 0x10 : 0) |
+                           (!DRV->head_ready(0, FDC_SPINUP_STABLE_US) ? 0x20 : 0));
+    S.rc_motor_on_ms = line ? (time_us_32() - FloppyDrive::motor_on_since_us()) / 1000u
+                            : 0xFFFFFFFFu;
+    S.rc_retry = 0;
+  }
+  // The retry: the spindle really up, then the same move again -- twice, a
+  // revolution apart, since "up to speed" is a guess for a drive we have no
+  // datasheet for. One attempt is ~1 s of steps (100 out, 20 in), so the
+  // worst case is ~3 s with BUSY up, and only ever on a path that has
+  // already failed.
+  g_ready[fdc_cur_idx()] = DRV->spin_motor(true);
+  g_applied_motor = true;
+  g_motor_off_at = 0;
+  fdc_wait_head_ready(false);
+  int attempt = 0;
+  while (!ok && attempt < FDC_RECAL_RETRIES) {
+    if (attempt)
+      sleep_ms(FDC_RECAL_RETRY_GAP_MS);
+    ++attempt;
+    ok = DRV->goto_track(tgt) && DRV->track() >= 0;
+  }
+  if (ok)
+    S.rc_retry_ok++;
+  else
+    S.rc_retry_fail++;
+  if (first)
+    S.rc_retry = ok ? (uint8_t)attempt : 0xFF;
+  return ok;
 }
 
 static bool fdc_verify_track(uint8_t track) {
@@ -2012,7 +2128,7 @@ static void fdc_resync_head(uint8_t seen_cyl) {
   DRV->set_track_belief((int)seen_cyl);
   int tgt = S.head_target[fdc_cur_idx()];
   if ((int)seen_cyl != tgt)
-    DRV->goto_track(tgt);
+    fdc_drive_head_to(tgt, 4);
   S.at_track0 = DRV->get_track0_sense();
 }
 
@@ -2113,6 +2229,9 @@ inline uint8_t compose_status() {
 } // namespace
 
 void fdc_init(FloppyDrive *const *drives, int n) {
+  // Before core1 is launched (bus_init): its command handler takes it.
+  if (!g_pub_lock)
+    g_pub_lock = spin_lock_instance((unsigned)spin_lock_claim_unused(true));
   if (n > FDC_DRIVE_MAX)
     n = FDC_DRIVE_MAX;
   g_ndrives = n;
@@ -2159,7 +2278,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
     S.cmd_seen[raw >> 5] |= (1u << (raw & 31));
     S.cmd_pos++;
     S.cmd_count++;
-    S.cmd_gen++; // invalidates any core0 work in flight -- see cmd_gen
+    fdc_bump_cmd_gen(); // invalidates any core0 work in flight -- see cmd_gen
     S.cmd_gap_us = time_us_32() - S.last_ready_us; // diagnostic: see last_ready_us
     // A new command clears any latched Force-Interrupt INTRQ (WD spec) and
     // re-evaluates ~INT. Done before the decode below so a Type IV can re-arm it.
@@ -2169,6 +2288,21 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       // ---- Type I (seek family) ----
       S.type2 = false; // STATUS reverts to the Type I layout
       S.fi_type1 = false;
+      // A new Type I starts with a clean Seek Error; core0 sets it, if at all,
+      // only when it publishes for this command (third review of #64).
+      S.seek_error = false;
+      // A READ ADDRESS in flight ends here: it is a question about where the
+      // head is, and the head is about to move. Left running (as a READ
+      // SECTOR is, see the Force Interrupt notes) it came back from core0 as
+      // a phantom READ SECTOR of a stale sector number -- DRQ, LOST DATA, and
+      // on CP/M's STEP-without-update the very wrong-cylinder signature #31
+      // hunts (third review of #64). core0 sees `reading` clear and publishes
+      // nothing.
+      if (S.reading && S.read_addr) {
+        S.reading = false;
+        S.drq = false;
+        fdc_refresh_int_line(); // the refresh above ran before this clear
+      }
       S.read_addr = false;
       // Abandon any half-collected write. The head is about to move, and a
       // buffer collected for one cylinder must never be spliced onto another;
@@ -2244,6 +2378,7 @@ RAM_FUNC void fdc_reg_write(uint8_t addr, uint8_t raw) {
       if (restore) {
         S.head_target[fdc_drive_idx()] = 0;
         S.restore_req++; // force a physical TRK00 seek even if we think we're there
+        S.restore_gen = S.cmd_gen; // (cmd_gen was bumped for this command above)
       } else if (seek_abs) {
         int t = (int)S.data;
         if (t < 0)
@@ -2949,6 +3084,25 @@ void fdc_debug_snapshot(FdcDebug *o) {
   o->bt_err_count = (uint16_t)S.bt_err_count;
 }
 
+void fdc_recaldiag_snapshot(FdcRecalDiag *o) {
+  o->fails = S.rc_fails;
+  o->retry_ok = S.rc_retry_ok;
+  o->retry_fail = S.rc_retry_fail;
+  o->first_valid = S.rc_valid ? 1 : 0;
+  o->first_at_ms = S.rc_at_ms;
+  o->first_drive = S.rc_drive;
+  o->first_site = S.rc_site;
+  o->first_target = S.rc_target;
+  o->first_state = S.rc_state;
+  o->first_motor_on_ms = S.rc_motor_on_ms;
+  o->first_retry = S.rc_retry;
+}
+
+void fdc_recaldiag_reset(void) {
+  S.rc_valid = false;
+  S.rc_fails = S.rc_retry_ok = S.rc_retry_fail = 0;
+}
+
 void fdc_firstfail_snapshot(FdcFirstFail *o) {
   o->valid = S.ff_valid ? 1 : 0;
   o->kind = S.ff_kind;
@@ -3590,16 +3744,19 @@ static void fdc_stop_motor_without_drive(bool motor_on) {
 // for core0 (queued before the switch). No drive will ever run it, so end it
 // the way a WD ends a command on a drive that is not ready: BUSY drops, and the
 // status shows NOT READY. Leaving it pending kept BUSY up forever.
-static void fdc_end_for_missing_unit(void) {
+// RAM: it runs with the publish lock held (#61).
+RAM_FUNC static void fdc_end_for_missing_unit(void) {
   // One read of op_seq: a SEEK core1 publishes after this point (for a unit
   // that does exist, once re-selected) must stay pending for the next pass,
   // not be acknowledged here without ever running.
+  FdcPub pub; // the check and the ending as one step (#61)
   uint32_t seq = S.op_seq;
   bool pending = S.op_done != seq || S.reading || S.writing || S.trk_op;
   S.op_done = seq;
   S.restore_done = S.restore_req;
   if (!pending)
     return;
+  FDC_RACE_POINT(6);
   S.reading = false;
   S.read_addr = false;
   S.writing = false;
@@ -3608,7 +3765,7 @@ static void fdc_end_for_missing_unit(void) {
   S.trk_armed = false;
   S.drq = false;
   S.busy = false;
-  S.cmd_gen++; // anything still in flight for it must not publish
+  S.cmd_gen++; // anything still in flight for it must not publish (lock held)
   fdc_refresh_int_line();
 }
 
@@ -3632,7 +3789,7 @@ static void fdc_bench_restore_head(void) {
       g_applied_motor = true;
       g_motor_off_at = 0;
     }
-    DRV->goto_track(tgt);
+    fdc_drive_head_to(tgt, 5);
   }
   g_bench_head_dirty = false;
   S.at_track0 = DRV->get_track0_sense();
@@ -3790,12 +3947,16 @@ void fdc_disk_task(void) {
   // block never drops BUSY, and not even a RESET recovers the controller
   // (second review of #60). Dropped here, BEFORE the seek block, so that the
   // command which superseded it completes normally in this same pass.
-  if (S.trk_op == 2 && S.trk_armed && S.trk_done != S.trk_seq &&
-      S.trk_gen != S.cmd_gen) {
-    S.trk_done = S.trk_seq;
-    S.trk_armed = false;
-    S.trk_op = 0;
-  }
+  [&]() RAM_FUNC {
+    FdcPub pub; // a new WRITE/READ TRACK must not be zeroed by this (#61)
+    if (S.trk_op == 2 && S.trk_armed && S.trk_done != S.trk_seq &&
+        S.trk_gen != S.cmd_gen) {
+      FDC_RACE_POINT(7);
+      S.trk_done = S.trk_seq;
+      S.trk_armed = false;
+      S.trk_op = 0;
+    }
+  }();
 
   // Execute a pending physical seek.
   if (S.op_done != S.op_seq) {
@@ -3803,6 +3964,7 @@ void fdc_disk_task(void) {
     uint32_t gen = S.cmd_gen;  // see cmd_gen
     bool restore = (S.restore_done != S.restore_req);
     uint32_t rseq = S.restore_req;
+    uint32_t rgen = S.restore_gen; // the RESTORE this pass runs
     bool verify = S.op_verify;
 
     // The select may be stale if this seek landed while core0 was busy (see
@@ -3834,17 +3996,21 @@ void fdc_disk_task(void) {
     // core1 has already updated it per the WD rules. Overwriting it here forced
     // belief == reality, which is precisely the state a recalibrating host is
     // trying to establish for itself via READ ADDRESS.
+    bool recal_failed = false;
     if (restore) {
-      DRV->goto_track(0); // steps out until TRK00
+      recal_failed = !fdc_drive_head_to(0, 1); // steps out until TRK00
       S.restore_done = rseq;
     }
     // Drive the head to whatever core1 has folded into head_target. Read once:
     // core1 may move it again while we step, which just leaves op_seq != op_done
-    // and brings us straight back here.
-    {
+    // and brings us straight back here. Not straight after a RESTORE that has
+    // just failed with all its retries: with the position unknown this would
+    // recalibrate all over again, and the host would wait twice as long for
+    // the same answer (the next command tries afresh).
+    if (!recal_failed) {
       int tgt = S.head_target[fdc_cur_idx()];
       if (DRV->track() != tgt)
-        DRV->goto_track(tgt);
+        fdc_drive_head_to(tgt, 2);
     }
     g_bench_head_dirty = false; // the move put it where the host wants it
 
@@ -3864,10 +4030,46 @@ void fdc_disk_task(void) {
     // field before reporting success. Real WD1793 behavior -- see
     // mfm_verify_track(). On the surface the host has selected NOW: the side
     // latch may have moved while we stepped.
-    if (verify)
+    if (verify && !recal_failed)
       fdc_apply_side();
-    S.seek_error = verify ? !fdc_verify_track(S.track) : false;
-    if (S.seek_error)
+    // A RESTORE that never found TRK00 is a Seek Error whatever the V flag
+    // says, as on a WD179x (255 steps without TRK00). And it is not verified:
+    // the head is over some unknown cylinder, so the Verify would read a
+    // wrong-cylinder ID, resync, and run the whole failed recalibrate again --
+    // 7 s of BUSY for one command (review of #64).
+    // Published only for the command it belongs to (second review of #64).
+    // A failed recalibrate is the RESTORE's Seek Error, so it is reported only
+    // if that RESTORE is still the last command the host sent: a Force
+    // Interrupt during it (a WD aborted by Force Interrupt reports none), or a
+    // STEP folded into this same pass (a STEP without V never sets it), is
+    // judged on its own. restore_gen is the RESTORE's own generation -- the
+    // pass's `gen` cannot tell, because a command that arrived during the
+    // spin-up at the top of the pass is already in it. The Verify result is
+    // likewise published only while this seek is still the live command.
+    bool seek_err;
+    bool publish;
+    if (recal_failed) {
+      seek_err = true;
+      // ...this pass's RESTORE, not one that arrived during its retries
+      // (CodeRabbit on #64): that one runs on its own next pass.
+      publish = S.restore_req == rseq && S.restore_gen == rgen &&
+                rgen == S.cmd_gen;
+    } else {
+      seek_err = verify ? !fdc_verify_track(S.track) : false;
+      publish = S.op_seq == seq && S.cmd_gen == gen;
+    }
+    [&]() RAM_FUNC {
+      FdcPub pub;
+      if (publish) {
+        // (re-evaluated under the lock: a command may have landed since)
+        publish = recal_failed ? S.restore_gen == S.cmd_gen
+                               : S.op_seq == seq && S.cmd_gen == gen;
+        FDC_RACE_POINT(10);
+        if (publish)
+          S.seek_error = seek_err;
+      }
+    }();
+    if (publish && seek_err)
       fdc_note_failure(4, 0, 0xFF, 0xFF);
 
     S.op_done = seq;
@@ -3884,12 +4086,16 @@ void fdc_disk_task(void) {
     // both predate this pass's snapshot. Clearing BUSY here told the host the
     // write was done before it reached the disk; the host moved on and the
     // splice then ran for a command nobody was waiting for.
-    if (S.op_seq == seq && S.cmd_gen == gen && !S.reading && !S.writing &&
-        !S.trk_op) {
-      S.busy = false;
-      S.last_ready_us = time_us_32(); // diagnostic: gap until the next command
-      fdc_refresh_int_line();              // Type I complete
-    }
+    [&]() RAM_FUNC {
+      FdcPub pub; // check + BUSY drop as one step (#61)
+      if (S.op_seq == seq && S.cmd_gen == gen && !S.reading && !S.writing &&
+          !S.trk_op) {
+        FDC_RACE_POINT(1);
+        S.busy = false;
+        S.last_ready_us = time_us_32(); // diagnostic: gap until the next command
+        fdc_refresh_int_line();              // Type I complete
+      }
+    }();
   }
 
   // ---- Type III READ TRACK / WRITE TRACK -----------------------------------
@@ -3936,7 +4142,9 @@ void fdc_disk_task(void) {
         // -> flip the latch and re-decode.
         {
           uint8_t idtmp[6];
-          if (g_flux_n > 0 &&
+          // (re-decoded into S.track_buf, which a WRITE TRACK collects its
+          // image into: only while this READ TRACK is still the live command)
+          if (g_flux_n > 0 && S.trk_op == 1 && S.cmd_gen == gen &&
               !mfm_read_address(flux, g_flux_n, fdc_bit_us(), idtmp) &&
               fdc_try_other_density(flux, g_flux_n))
             n = mfm_read_track_raw(flux, g_flux_n, fdc_bit_us(),
@@ -3945,31 +4153,46 @@ void fdc_disk_task(void) {
         }
         S.trk_last_us = time_us_32() - t0;
         S.trk_last_bytes = (uint16_t)n;
-        if (n == 0) {
-          S.err_rnf = true; // nothing decodable -> the WD's only "no data" bit
+        if (n == 0)
           S.trk_fail++;
-          S.trk_op = 0;
-          S.busy = false;
-        } else {
+        else
           S.trk_ok++;
-          S.trk_len = (uint16_t)n;
-          S.trk_pos = 0;
-          S.last_data_read_us = time_us_32();
-          S.drq = true;
-        }
+        // The decode above ran after the last generation check: published
+        // only if this READ TRACK is still the live command (#61, rule 4).
+        [&]() RAM_FUNC {
+          FdcPub pub;
+          if (S.trk_op == 1 && S.cmd_gen == gen) {
+            FDC_RACE_POINT(8);
+            if (n == 0) {
+              S.err_rnf = true; // nothing decodable -> the WD's only "no data" bit
+              S.trk_op = 0;
+              S.busy = false;
+            } else {
+              S.trk_len = (uint16_t)n;
+              S.trk_pos = 0;
+              S.last_data_read_us = time_us_32();
+              S.drq = true;
+            }
+            fdc_refresh_int_line();
+          }
+        }();
         S.trk_done = seq;
-        fdc_refresh_int_line();
       } else if (S.drq &&
                  fdc_since(S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
         // Nobody is taking the bytes. Same reasoning as the sector read: we
         // buffer, so we *can* wait forever, and a host entitled to walk away
         // would deadlock us holding BUSY.
-        S.lost_data = true;
-        S.lost_data_events++;
-        S.trk_op = 0;
-        S.drq = false;
-        S.busy = false;
-        fdc_refresh_int_line();
+        [&]() RAM_FUNC {
+          FdcPub pub; // re-checked: a new command may have landed (#61)
+          if (S.trk_op == 1 && S.cmd_gen == gen0 && S.drq) {
+            S.lost_data = true;
+            S.lost_data_events++;
+            S.trk_op = 0;
+            S.drq = false;
+            S.busy = false;
+            fdc_refresh_int_line();
+          }
+        }();
       }
       return;
     }
@@ -3978,15 +4201,19 @@ void fdc_disk_task(void) {
     if (!S.trk_armed) {
       // The host is still shifting the image in. It stops when the image ends,
       // not when we say so, so silence is the end-of-image signal.
-      if (S.trk_pos > 0 && S.cmd_gen == gen0 &&
+      [&]() RAM_FUNC {
+      FdcPub pub; // check + arm / end as one step (#61)
+      if (S.trk_op == 2 && !S.trk_armed && S.trk_pos > 0 && S.cmd_gen == gen0 &&
           fdc_since(S.last_data_read_us) > FDC_TRACK_IDLE_US) {
+        FDC_RACE_POINT(9);
         S.trk_len = S.trk_pos;
         S.drq = false;
         S.trk_gen = gen0;
         S.trk_armed = true;
         S.trk_seq++;
         fdc_refresh_int_line();
-      } else if (S.trk_pos == 0 &&
+      } else if (S.trk_op == 2 && !S.trk_armed && S.trk_pos == 0 &&
+                 S.cmd_gen == gen0 &&
                  fdc_since(S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
         // Command issued, not one byte sent. Nothing to write; don't hold BUSY.
         S.lost_data = true;
@@ -3996,6 +4223,7 @@ void fdc_disk_task(void) {
         S.busy = false;
         fdc_refresh_int_line();
       }
+      }();
       return;
     }
 
@@ -4144,12 +4372,17 @@ void fdc_disk_task(void) {
         // there is no timing window to hit, which is why formatting is the
         // safer of the two write paths despite being the more destructive.
         fdc_wait_head_ready(true);
+        FDC_RACE_POINT(21);
         // The wait can last 500 ms: a reset or a new command meanwhile means
         // nobody wants this track written any more.
         if (S.cmd_gen == gen)
           ok = DRV->write_track(flux, n_flux, /*store_greaseweazle=*/false,
                               /*use_index=*/true);
-        else if (S.trk_op == 2 && S.trk_armed && S.trk_seq == seq) {
+        else [&]() RAM_FUNC {
+          FdcPub pub; // a new WRITE TRACK issued right now must survive (#61)
+          if (!(S.trk_op == 2 && S.trk_armed && S.trk_seq == seq))
+            return;
+          FDC_RACE_POINT(22);
           // Abandoned before it reached the media (a reset, or a Force
           // Interrupt, leaves an ARMED track write in place because one
           // already being written must finish). This one never started:
@@ -4157,7 +4390,7 @@ void fdc_disk_task(void) {
           S.trk_op = 0;
           S.trk_armed = false;
           S.drq = false;
-        }
+        }();
       }
     }
     S.trk_last_us = time_us_32() - t0;
@@ -4182,16 +4415,18 @@ void fdc_disk_task(void) {
       S.twr_pos = (uint8_t)((p + 1) & 7);
       S.twr_n++;
     }
-    bool live = S.trk_op == 2 && S.trk_seq == seq && S.cmd_gen == gen;
-    if (ok) {
+    if (ok)
       S.trk_ok++;
-    } else {
+    else
       S.trk_fail++;
-      if (live && S.write_protect)
-        S.err_write_protect = true;
-      else if (live)
-        S.err_rnf = true;
-    }
+    [&]() RAM_FUNC {
+    FdcPub pub; // check + publish as one step (#61)
+    bool live = S.trk_op == 2 && S.trk_seq == seq && S.cmd_gen == gen;
+    FDC_RACE_POINT(11);
+    if (!ok && live && S.write_protect)
+      S.err_write_protect = true;
+    else if (!ok && live)
+      S.err_rnf = true;
     // The track op is over whether or not the host still cares about it: a
     // command or a RESET during the physical write makes the RESULT stale
     // (nothing host-visible is published), but leaving trk_op set wedged the
@@ -4209,6 +4444,7 @@ void fdc_disk_task(void) {
       S.busy = false;
       fdc_refresh_int_line();
     }
+    }();
     S.trk_done = seq;
     return;
   }
@@ -4238,25 +4474,40 @@ void fdc_disk_task(void) {
     // WD, which never needs the length in advance because it streams to the
     // media. This runs before the stall check below because that one waits
     // 250 ms to reach the wrong conclusion.
-    if (S.drq && !S.wr_armed && S.xfer_pos > 0 &&
-        fdc_since(S.last_data_read_us) > FDC_TRACK_IDLE_US) {
-      S.drq = false; // stop core1 appending before we fix the length
-      S.xfer_len = S.xfer_pos;
-      S.wr_armed = true;
-      S.wr_seq++;
-      S.wr_short_armed++;
-      fdc_refresh_int_line();
-    }
-    if (S.drq && fdc_since(S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
-      S.lost_data = true;
-      S.lost_data_events++;
-      S.writing = false;
-      S.wr_armed = false;
-      S.drq = false;
-      S.busy = false;
-      fdc_refresh_int_line();
+    // Both checks and their effects as one step each, against the command
+    // this pass started with (#61): a new command landing in between must
+    // not be armed or ended in the old one's place.
+    uint32_t wgen = S.cmd_gen;
+    [&]() RAM_FUNC {
+      FdcPub pub;
+      if (S.cmd_gen == wgen && S.writing && S.drq && !S.wr_armed &&
+          S.xfer_pos > 0 && fdc_since(S.last_data_read_us) > FDC_TRACK_IDLE_US) {
+        S.drq = false; // stop core1 appending before we fix the length
+        S.xfer_len = S.xfer_pos;
+        S.wr_armed = true;
+        S.wr_seq++;
+        S.wr_short_armed++;
+        fdc_refresh_int_line();
+      }
+    }();
+    bool lost = [&]() RAM_FUNC -> bool {
+      FdcPub pub;
+      if (S.cmd_gen == wgen && S.writing && S.drq &&
+          fdc_since(S.last_data_read_us) > FDC_DRQ_STALL_TIMEOUT_US) {
+        FDC_RACE_POINT(12);
+        S.lost_data = true;
+        S.lost_data_events++;
+        S.writing = false;
+        S.wr_armed = false;
+        S.drq = false;
+        S.busy = false;
+        fdc_refresh_int_line();
+        return true;
+      }
+      return false;
+    }();
+    if (lost)
       return;
-    }
     if (!S.wr_armed)
       return; // still collecting the sector from the host
 
@@ -4314,14 +4565,18 @@ void fdc_disk_task(void) {
     // a positioning problem it does not have.
     if (S.write_protect) {
       S.wr_refused++;
-      if (S.writing && S.wr_seq == seq && S.cmd_gen == gen) {
-        S.err_write_protect = true;
-        S.writing = false;
-        S.wr_armed = false;
-        S.drq = false;
-        S.busy = false;
-        fdc_refresh_int_line();
-      }
+      [&]() RAM_FUNC {
+        FdcPub pub;
+        if (S.writing && S.wr_seq == seq && S.cmd_gen == gen) {
+          FDC_RACE_POINT(5);
+          S.err_write_protect = true;
+          S.writing = false;
+          S.wr_armed = false;
+          S.drq = false;
+          S.busy = false;
+          fdc_refresh_int_line();
+        }
+      }();
       return;
     }
 
@@ -4370,14 +4625,13 @@ void fdc_disk_task(void) {
     // diagnostics and the head resync below describe the disk and stand.
     bool live = S.writing && S.wr_seq == seq && S.cmd_gen == gen;
     if (sr.wrote) {
-      if (live)
-        S.err_rnf = false;
       S.last_id_cyl = sr.seen_cyl;
       S.last_id_head = sr.seen_head;
     } else {
       // Everything that is not a completed write is RNF to the host: the WD has
       // exactly one "the sector I was told to write is not under this head"
       // status bit. fdc_record_splice's counters are what tell the causes apart.
+      FDC_RACE_POINT(23);
       {
         uint8_t p = S.wrf_pos;
         S.wrf_trk[p] = S.track;
@@ -4403,8 +4657,9 @@ void fdc_disk_task(void) {
         S.wrf_pos = (uint8_t)((p + 1) & 7);
         S.wrf_n++;
       }
-      if (live)
-        S.err_rnf = true;
+      // (S.err_rnf is host-visible: set in the locked publish below. Set
+      // here, a command that landed meanwhile got this write's RNF -- e.g. a
+      // FORMAT that then succeeded reported RNF.)
       if (sr.cyl_mismatch) {
         S.sec_cyl_mismatch++;
         S.last_id_cyl = sr.seen_cyl;
@@ -4421,8 +4676,13 @@ void fdc_disk_task(void) {
     // off, and resurrecting BUSY/DRQ afterwards would hang a host that has
     // already moved on. `live` is re-evaluated: the splice above ran with
     // interrupts off, but core1 is not core0 and kept accepting commands.
+    uint16_t next_len = fdc_sector_size_for(S.track); // (looked up outside the lock)
+    [&]() RAM_FUNC {
+    FdcPub pub; // check + publish as one step (#61)
     live = S.writing && S.wr_seq == seq && S.cmd_gen == gen;
     if (live) {
+      FDC_RACE_POINT(4);
+      S.err_rnf = !sr.wrote;
       if (sr.wrote && S.multi) {
         // Multi-record: the WD stays BUSY and asks for the next sector's worth
         // of bytes. Each one is spliced on its own pass, and each re-finds its
@@ -4430,7 +4690,7 @@ void fdc_disk_task(void) {
         // ride the disk in real time whatever we do.
         S.sector++;
         S.wr_sector = S.sector;
-        S.xfer_len = fdc_sector_size_for(S.track);
+        S.xfer_len = next_len;
         S.xfer_pos = 0;
         S.wr_armed = false;
         S.last_data_read_us = time_us_32();
@@ -4443,6 +4703,7 @@ void fdc_disk_task(void) {
       }
       fdc_refresh_int_line();
     }
+    }();
     return;
   }
 
@@ -4452,17 +4713,23 @@ void fdc_disk_task(void) {
   // / fdc_read_capture_pump. READ ADDRESS searches in chunks
   // (fdc_read_address_search).
   if (S.reading) {
-    if (S.pending_force_int &&
-        fdc_since(S.last_data_read_us) > FDC_FORCE_INT_DEFER_IDLE_US) {
-      // Host stopped reading DATA after Force Interrupt was posted; finalize to
-      // avoid lingering BUSY/DRQ.
-      S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
-      S.reading = false;
-      S.busy = false;
-      S.drq = false;
-      S.pending_force_int = false;
-      fdc_refresh_int_line();
-    }
+    // The timeouts below act as one step with their check, against the
+    // command this pass started with (#61).
+    uint32_t rgen = S.cmd_gen;
+    [&]() RAM_FUNC {
+      FdcPub pub;
+      if (S.cmd_gen == rgen && S.reading && S.pending_force_int &&
+          fdc_since(S.last_data_read_us) > FDC_FORCE_INT_DEFER_IDLE_US) {
+        // Host stopped reading DATA after Force Interrupt was posted; finalize
+        // to avoid lingering BUSY/DRQ.
+        S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
+        S.reading = false;
+        S.busy = false;
+        S.drq = false;
+        S.pending_force_int = false;
+        fdc_refresh_int_line();
+      }
+    }();
 
     // LOST DATA. A real WD clocks the data field off the disk in real time and
     // cannot wait: if the host does not take a DRQ'd byte within a byte time it
@@ -4484,23 +4751,27 @@ void fdc_disk_task(void) {
                           : (S.xfer_pos == 0)
                               ? FDC_READ_DRQ_FIRSTBYTE_US
                               : FDC_DRQ_STALL_TIMEOUT_US;
-    if (S.reading && S.drq && !S.pending_force_int &&
-        fdc_since(S.last_data_read_us) > drq_budget) {
-      // Completing an undrained READ ADDRESS is normal, not an error: do not
-      // raise LOST DATA there or a host that only wants the Sector register
-      // sees a spurious failure. A sector read that goes unread IS a real
-      // overrun, so that one keeps the flag.
-      if (!S.read_addr) {
-        S.lost_data = true;
-        S.lost_data_events++;
+    [&]() RAM_FUNC {
+      FdcPub pub;
+      if (S.cmd_gen == rgen && S.reading && S.drq && !S.pending_force_int &&
+          fdc_since(S.last_data_read_us) > drq_budget) {
+        FDC_RACE_POINT(13);
+        // Completing an undrained READ ADDRESS is normal, not an error: do not
+        // raise LOST DATA there or a host that only wants the Sector register
+        // sees a spurious failure. A sector read that goes unread IS a real
+        // overrun, so that one keeps the flag.
+        if (!S.read_addr) {
+          S.lost_data = true;
+          S.lost_data_events++;
+        }
+        S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
+        S.reading = false;
+        S.read_addr = false;
+        S.busy = false;
+        S.drq = false;
+        fdc_refresh_int_line();
       }
-      S.rd_elapsed_us = time_us_32() - S.rd_issue_us;
-      S.reading = false;
-      S.read_addr = false;
-      S.busy = false;
-      S.drq = false;
-      fdc_refresh_int_line();
-    }
+    }();
 
     // The block above (or a Force Interrupt on core1) may have ended the read.
     // Re-test before committing to a capture window: it blocks core0 for up to
@@ -4543,7 +4814,17 @@ void fdc_disk_task(void) {
         return;
       fdc_apply_side();
       fdc_bench_restore_head();
-      if (S.cmd_gen != gen || !S.reading || S.op_done != S.op_seq)
+      // ...and rd_fresh is consumed in the same locked step as that check: a
+      // new READ (ADDRESS) landing between the two had its own rd_fresh
+      // cleared and was answered RNF without ever searching (review of #65).
+      bool go = [&]() RAM_FUNC -> bool {
+        FdcPub pub;
+        if (S.cmd_gen != gen || !S.reading || S.op_done != S.op_seq)
+          return false;
+        S.rd_fresh = false;
+        return true;
+      }();
+      if (!go)
         return;
       // First sector of a new command: grab a fresh window. The head is already
       // on-track from a prior SEEK; READ SECTOR does not itself seek. No index
@@ -4556,7 +4837,7 @@ void fdc_disk_task(void) {
       // core1 set rd_fresh again for its new command. Clearing it afterwards
       // erased that, and the new command was answered from flux captured
       // before its queued move ran, on the old surface or drive (issue #3).
-      S.rd_fresh = false;
+      // (consumed above, under the lock)
       if (S.read_addr)
         g_readaddr_found = fdc_read_address_search(g_readaddr_id);
       else
@@ -4584,6 +4865,17 @@ void fdc_disk_task(void) {
     if (S.rd_done != S.rd_seq && !S.drq) {
       uint32_t seq = S.rd_seq; // snapshot
       uint32_t gen = S.cmd_gen;
+      // A result that went stale while we blocked: is the command it was for
+      // still pending? Then do NOT mark it done -- nothing would ever end it
+      // (the seek block will not drop BUSY while `reading` is set). It is a
+      // READ SECTOR (a Type I ends a READ ADDRESS on core1), and it is
+      // recaptured on the next pass, after the move, for the state as it is
+      // then (the g_flux_gen check below) (review of #64).
+      auto finish_stale = [&]() {
+        if (S.reading && S.rd_seq == seq)
+          return;
+        S.rd_done = seq;
+      };
       // The buffer belongs to an older command generation: never decode it
       // for this one. A new READ has rd_fresh set already; any other command
       // that left this read live (a Type I does not end a read) gets a fresh
@@ -4733,20 +5025,34 @@ void fdc_disk_task(void) {
       bool live = S.reading && S.rd_seq == seq && S.cmd_gen == gen;
 
       if (sd.found && sd.has_data && !live) {
-        if (!S.read_addr)
+        // Not for a READ ADDRESS result (rd_result b4, set above from this
+        // pass's own decode): its sd.size_n is not a sector's, and the live
+        // S.read_addr may have been cleared by a command meanwhile.
+        if (!(S.rd_result & 0x10))
           fdc_note_size_code(sd.cyl, sd.size_n);
-        S.rd_done = seq;
+        finish_stale();
       } else if (sd.found && sd.has_data) {
-        if (S.read_addr)
-          // WD quirk: READ ADDRESS also loads the track address byte into the
-          // Sector register. A host probing head position may read it there
-          // rather than from the data stream.
-          S.sector = g_readaddr_id[0];
+        FDC_RACE_POINT(20);
         uint16_t n = (sd.size <= FDC_SECTOR_MAX) ? sd.size : FDC_SECTOR_MAX;
-        for (uint16_t k = 0; k < n; ++k)
-          S.xfer[k] = g_secbuf[k];
-        S.xfer_len = n;
-        S.xfer_pos = 0;
+        // S.xfer is shared with WRITE SECTOR. Copy into it only if this READ
+        // is still the live command right now (review of #65): a WRITE the
+        // host issued after `live` above would have its first byte
+        // overwritten. A host command arriving during the copy itself cannot
+        // be a WRITE with data yet: the copy runs forward at ~30 ns a byte,
+        // while the host's first DATA byte comes >= ~10 us after its WRITE
+        // command and the rest ~10 us apart, so the copy stays far ahead of
+        // the host's write position. Its xfer_len/xfer_pos are set only in
+        // the locked publish below, which fails for a superseded READ.
+        // With core0's interrupts masked for the copy (~15-35 us; core1 is not
+        // involved): a USB interrupt landing right after the check could
+        // otherwise stretch the copy past the host's first WRITE byte.
+        {
+          uint32_t irq = save_and_disable_interrupts();
+          if (S.reading && S.rd_seq == seq && S.cmd_gen == gen)
+            for (uint16_t k = 0; k < n; ++k)
+              S.xfer[k] = g_secbuf[k];
+          restore_interrupts(irq);
+        }
         // CRC is STICKY across a multi-record command, and a bad one ENDS it.
         //
         // This used to be a plain assignment. In a Read Multiple (0x9X, which is
@@ -4760,8 +5066,7 @@ void fdc_disk_task(void) {
         // the command (the record is still transferred, then INTRQ/BUSY-off with
         // CRC ERROR set) instead of auto-advancing to the next record.
         if (!sd.data_crc_ok) {
-          S.err_crc = true;
-          S.multi = false;
+          // (S.err_crc / S.multi are host-visible: set with DRQ, below)
           if (!S.read_addr)
             fdc_note_failure(2, want, sd.cyl, sd.head);
           // Guarded like sec_ok below: this counter is what rddiag prints as
@@ -4792,11 +5097,29 @@ void fdc_disk_task(void) {
           S.last_trk_reg = S.track;
           S.last_want_side = S.side1 ? 1 : 0;
         }
-        S.rec_deleted = sd.deleted;
-        S.err_rnf = false;
         // Publish DRQ last: it is the ownership handoff of xfer[] to core1.
-        // Re-checked: core1 may have moved on while we filled the buffer.
+        // Re-checked under the publish lock (#61): core1 may have moved on
+        // while we filled the buffer, and a Force Interrupt landing between
+        // the check and the store left DRQ up after it. The status bits of
+        // this record are published in the same step -- set before the check,
+        // they could land on a newer command the host had just issued.
+        bool published = [&]() RAM_FUNC -> bool {
+        FdcPub pub;
         if (S.reading && S.rd_seq == seq && S.cmd_gen == gen) {
+          FDC_RACE_POINT(2);
+          S.xfer_len = n;
+          S.xfer_pos = 0;
+          if (S.read_addr)
+            // WD quirk: READ ADDRESS also loads the track address byte into
+            // the Sector register. A host probing head position may read it
+            // there rather than from the data stream.
+            S.sector = g_readaddr_id[0];
+          if (!sd.data_crc_ok) {
+            S.err_crc = true;
+            S.multi = false;
+          }
+          S.rec_deleted = sd.deleted;
+          S.err_rnf = false;
           // Start the LOST DATA clock here, not at command issue: the host has
           // had nothing to read until this moment.
           S.last_data_read_us = time_us_32();
@@ -4809,8 +5132,18 @@ void fdc_disk_task(void) {
           // only arrived if some later unrelated event happened to call
           // refresh. fdc_refresh_int_line() applies the mode/EINT gate itself.
           fdc_refresh_int_line();
+          return true;
         }
-        S.rd_done = seq;
+        return false;
+        }();
+        // Not published: a command landed after `live`. A Type I leaves the
+        // READ running, so marking it done here wedged it with BUSY up for
+        // good; finish_stale() leaves it to be recaptured after the move
+        // (review of #65).
+        if (published)
+          S.rd_done = seq;
+        else
+          finish_stale();
         // Multi-record keeps the captured window: every remaining sector of
         // this track is already in it, so no re-capture is needed.
       } else {
@@ -4819,8 +5152,6 @@ void fdc_disk_task(void) {
           fdc_note_track_ids(flux, g_flux_n);
         else
           S.rd_ids_seen = 0;
-        if (live)
-          S.err_rnf = true;
         if (!S.read_addr && !live && sd.cyl_mismatch) {
           // Stale, but the disk still said where the head is: keep the fix.
           fdc_resync_head(sd.seen_cyl);
@@ -4845,13 +5176,26 @@ void fdc_disk_task(void) {
             fdc_note_failure(1, want, 0xFF, 0xFF);
           }
         }
-        if (live) {
-          S.drq = false;
-          S.reading = false;
-          S.busy = false;
-          fdc_refresh_int_line(); // WD raises INTRQ on an errored completion too
-        }
-        S.rd_done = seq;
+        // The resync can block for seconds (a recalibrate, with its retries,
+        // #31). A host that gave up meanwhile -- Force Interrupt, then a new
+        // READ -- must not have that NEW command ended here with BUSY down,
+        // no DRQ and no error: it would take a stale buffer for its data
+        // (review of #64; rule 4).
+        [&]() RAM_FUNC {
+          FdcPub pub; // check + publish as one step (#61)
+          live = live && S.reading && S.rd_seq == seq && S.cmd_gen == gen;
+          if (live) {
+            FDC_RACE_POINT(3);
+            S.err_rnf = true;
+            S.drq = false;
+            S.reading = false;
+            S.busy = false;
+            fdc_refresh_int_line(); // WD raises INTRQ on an errored completion too
+            S.rd_done = seq;
+          } else {
+            finish_stale();
+          }
+        }();
         g_flux_n = 0;
       }
     }

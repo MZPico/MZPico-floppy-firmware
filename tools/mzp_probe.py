@@ -94,6 +94,7 @@ MZP_CMD_IDXBIT = 0x9F
 MZP_CMD_FWVER = 0xA0
 MZP_CMD_DENSEL = 0xA1
 MZP_CMD_RDWIN = 0xA2
+MZP_CMD_RECALDIAG = 0xA3
 MZP_CMD_GPIOREAD = 0x84
 MZP_CMD_PINTEST = 0x85
 MZP_CMD_FDCDUMP = 0x86
@@ -1216,6 +1217,56 @@ def do_resetdiag(s, clear=False):
         print("  it is active low and the polarity assumption is inverted.")
 
 
+RECAL_SITES = {1: "RESTORE", 2: "SEEK", 3: "select catch-up",
+               4: "head resync", 5: "bench-head restore"}
+
+
+def fetch_recaldiag(s, clear=False):
+    """(status, reply): status "ok" with the 28-byte reply, "unsupported" for
+    firmware that answers BADCMD (nothing else follows), "short" for an
+    incomplete reply. With clear=True the firmware resets the latch right
+    after this report, in the same handler."""
+    s.write(bytes([MZP_CMD_RECALDIAG, 3, 1 if clear else 0]))
+    s.flush()
+    r = read_exact(s, 2)
+    if len(r) == 2 and r[1] != 0:
+        return "unsupported", None
+    if len(r) < 2:
+        return "short", None
+    r += read_exact(s, 26)
+    return ("ok", r) if len(r) == 28 else ("short", None)
+
+
+def do_recaldiag(s, fetched=None):
+    """Recalibrates that never found TRK00 (#31) -- the cause behind a later
+    wrong-cylinder read. Printed as part of `firstfail`."""
+    status, r = fetched if fetched is not None else fetch_recaldiag(s)
+    if status == "unsupported":
+        print("recalibrates: (not reported by this firmware)")
+        return
+    if status != "ok":
+        print("recalibrates: (incomplete reply)")
+        return
+    u32 = lambda o: int.from_bytes(r[o:o + 4], "little")
+    fails, ok, bad = u32(2), u32(6), u32(10)
+    print(f"recalibrates that never saw TRK00: {fails}"
+          + (f"  (retry with the spindle up: {ok} found it, {bad} did not)"
+             if fails else ""))
+    if not r[14]:
+        return
+    at_ms, drv, site, tgt, st, mon = u32(15), r[19], r[20], r[21], r[22], u32(23)
+    retry = ("never found it" if r[27] == 0xFF
+             else f"found TRK00 on attempt {r[27]}")
+    flags = [n for b, n in ((1, "host motor bit"), (2, "motor applied"),
+                            (4, "~MOTOR_ON line"), (8, "drive selected"),
+                            (0x10, "index seen"), (0x20, "spin-up gate PENDING"))
+             if st & b]
+    print(f"  first one at {at_ms / 1000:.1f} s: drive {'?' if drv == 0xFF else drv},"
+          f" {RECAL_SITES.get(site, site)} to cylinder {tgt}; retry {retry}")
+    print(f"  state     : {', '.join(flags) or '(nothing set)'}"
+          + ("" if mon == 0xFFFFFFFF else f"; motor line on for {mon} ms"))
+
+
 def do_firstfail(s, clear=False):
     """The first failure since power-up, held unaltered.
 
@@ -1223,6 +1274,13 @@ def do_firstfail(s, clear=False):
     moment a host retries -- the retry that succeeds erases the evidence. That
     is why the rare boot-time `FD:Loading error` has never been diagnosable.
     """
+    # The recalibrate latch is reported (and, with clear, reset in the same
+    # handler) first. If that reply is incomplete, nothing is cleared: a
+    # latched failure must never be discarded unseen.
+    recal = fetch_recaldiag(s, clear=clear)
+    if clear and recal[0] == "short":
+        print("recalibrate diagnostics came back incomplete: NOT clearing")
+        clear = False
     s.write(bytes([MZP_CMD_FIRSTFAIL, 3, 1 if clear else 0]))
     s.flush()
     r = read_exact(s, 67)
@@ -1257,8 +1315,11 @@ def do_firstfail(s, clear=False):
     print(f"head-position resyncs:   {resyncs}"
           + (f"  (last: disk said {rs_from}, we wanted {rs_to})"
              if resyncs else ""))
+    do_recaldiag(s, recal)
     if not valid:
-        print("no failure latched yet -- nothing has gone wrong since boot")
+        print("no first read/seek failure latched"
+              + ("" if recal[0] == "ok" and int.from_bytes(recal[1][2:6], "little")
+                 else " -- nothing has gone wrong since boot"))
         return
     print(f"\nFIRST failure, at {at_ms / 1000:.1f} s after boot:")
     print(f"  kind      : {FF_KINDS.get(kind, kind)}")

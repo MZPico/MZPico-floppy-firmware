@@ -100,6 +100,9 @@ Every fixed review bug keeps a test that fails on the old firmware:
 
 - The interleave is about 1 µs, not one instruction. A race narrower than that
   is only reachable by a test that forces the ordering.
+  `FDC_RACE_POINT(id)` in fdc.cpp marks such a point; a test runs host
+  commands there with `set_race_point()` / `race_out()`. While core0 holds the
+  publish lock those writes are deferred to the unlock, as core1 would wait.
 - Bus timing is not simulated: there is no PIO, EXWAIT or ~560 ns window.
   Rules about core1's listen loop still have to be checked on hardware
   (`mzp_probe.py health`, `BUSTEST.MZF`).
