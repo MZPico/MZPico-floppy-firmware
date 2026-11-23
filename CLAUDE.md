@@ -154,9 +154,17 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
   4. core0 publishes nothing host-visible (buffer, error bits, DRQ, BUSY) from
      work that blocked, if `S.cmd_gen` moved meanwhile: core1 bumps it on every
      command write, Force Interrupt included. The per-kind `*_seq` counters
-     only see commands of their own kind (#1, #3). Side and drive select are
-     re-applied at the start of every operation block, not just once per pass
-     (#2);
+     only see commands of their own kind (#1, #3). The check and the publish
+     are **one step under the publish lock** (`FdcPub`, #61): core1 takes the
+     same hardware spinlock around `cmd_gen++`, so a command lands either
+     before the check (which fails) or after the publish (and overrides it).
+     Two separate steps let a command slip in between: a new READ's BUSY
+     dropped by the old command's completion, a DRQ raised after the host's
+     Force Interrupt. Hold the lock only for the check and a few stores —
+     never a buffer copy, a decode or anything that can block: a command
+     write on core1 waits on it, and core1 must still answer the next bus
+     cycle within ~560 ns. Side and drive select are re-applied at the start
+     of every operation block, not just once per pass (#2);
   5. take the `cmd_gen` snapshot **before** anything in an operation block
      that can block — the drive select (catch-up seek), the bench-head
      restore, a spin-up — and re-check it after. Snapshotted after them, a

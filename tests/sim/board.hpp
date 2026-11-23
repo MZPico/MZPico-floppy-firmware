@@ -3,6 +3,7 @@
 // helpers that drive the FDC registers the way an MZ-800 does.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "disk_image.hpp"
@@ -16,6 +17,13 @@ namespace sim {
 // process before running anything (each test runs in its own process).
 void board_boot();
 void insert(int unit, Disk *disk);
+// #61: run `cb(id)` at each FDC_RACE_POINT(id) in fdc.cpp (a point between a
+// check and the publish it guards); host register writes made from it are
+// deferred while core0 holds the publish lock, as core1 would wait on it.
+void set_race_point(std::function<void(int)> cb);
+// A host register write from inside a race-point callback (core0's context:
+// no simulated time passes). Deferred while the publish lock is held.
+void race_out(uint8_t port, uint8_t v);
 
 // ---- MZ-800 side, used from inside run_script() ----
 // Port I/O as the Z80 performs it: 0xD8..0xDB carry the CPL'd value on the

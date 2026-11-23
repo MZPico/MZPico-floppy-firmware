@@ -23,3 +23,4 @@ __pycache__/
 # Editor workspace files
 *.code-workspace
 .vscode/
+/build-pinned/
