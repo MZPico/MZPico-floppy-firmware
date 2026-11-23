@@ -84,10 +84,12 @@ public:
 
   bool drive_is_selected() const { return _is_drive_selected; }
   bool motor_is_spinning() const { return _is_motor_spinning; }
+  bool index_seen() const { return _is_index_seen; } // this spindle, since motor-on
   // The physical ~MOTOR_ON line. It is ONE wire for every drive on the
   // cable, so this -- not any one object's belief -- is the truth about
   // whether the spindles are being driven.
   static bool motor_line_on() { return s_motor_line_on; }
+  static uint32_t motor_on_since_us() { return s_motor_on_us; }
 
   size_t capture_track(volatile uint8_t *pulses, size_t max_pulses,
                        int32_t *falling_index_offset, bool store_greaseweazle,

@@ -3112,3 +3112,501 @@ TEST(integ_e3_write_track_on_empty_drive_then_restore) {
     CHECK(!(wd::status() & wd::BUSY));
   });
 }
+
+// ---------------- Recalibrate that misses TRK00 (#31) ----------------
+// These drives lose STEP pulses until the spindle is at speed. A recalibrate
+// issued right after the spin-up's first index never reaches TRK00 and used to
+// leave the head stranded, position unknown: the host's next read then hit the
+// wrong cylinder (the #31 capture: head_target=0, phys_track=?). The failure is
+// now latched in full and the move retried with the spindle up.
+namespace {
+FdcRecalDiag recal() {
+  FdcRecalDiag r{};
+  fdc_recaldiag_snapshot(&r);
+  return r;
+}
+} // namespace
+
+TEST(cold_recalibrate_that_misses_trk00_is_retried_with_the_spindle_up) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  // Longer than one whole recalibrate attempt (100 step-outs and 20 step-ins,
+  // about 1 s), so the first attempt really fails; over before the retry.
+  cable().drive[0].steps_need_motor_for_ticks = ms(1800);
+  run([] {
+    wd::select(0);
+    uint8_t st = wd::restore();
+    CHECK(st & wd::TRK0);
+    CHECK_EQ(cable().drive[0].cyl, 0);
+    CHECK(cable().drive[0].steps_lost > 0); // the first attempt really missed
+    FdcRecalDiag r = recal();
+    CHECK_EQ(r.fails, 1u);
+    CHECK_EQ(r.retry_ok, 1u);
+    CHECK_EQ(r.first_valid, 1);
+    CHECK_EQ(r.first_site, 1);   // RESTORE
+    CHECK_EQ(r.first_drive, 0);
+    CHECK(r.first_retry >= 1 && r.first_retry <= 2);
+    CHECK(r.first_state & 0x04); // the motor line was on
+    wd::side(1);
+    wd::Xfer x = wd::read_sector(0, 1, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 1));
+  });
+}
+
+// The #31 shape: drive 1 used for the first time, CP/M-style, its steps lost
+// at first. The head must still end up where the host asked.
+TEST(first_seek_on_unit1_with_lost_steps_lands_on_the_target) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  g_disk[1] = make_disk(Geometry::MZ_DD_DATA, 80, "B");
+  insert(0, &g_disk[0]);
+  insert(1, &g_disk[1]);
+  board_boot();
+  cable().drive[1].cyl = 9;
+  cable().drive[1].steps_need_motor_for_ticks = ms(1800);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::side(1);
+    wd::read_sector(0, 1, 512);
+    // ~MOTOR_ON is one wire: drive 1's spindle has been turning all along.
+    // The quirk only bites from a cold start of the line, so stop it first.
+    wd::select(0, false);
+    wait_ms(4000);
+    CHECK(!cable().drive[1].motor);
+    wd::select(1);
+    wd::restore();
+    wd::seek(2);
+    CHECK_EQ(cable().drive[1].cyl, 2);
+    wd::Xfer x = wd::read_sector(2, 3, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 2, 0, 3));
+    CHECK_EQ(dbg().sec_cyl_mismatch, 0u);
+    FdcRecalDiag r = recal();
+    CHECK(r.fails >= 1);
+    CHECK_EQ(r.retry_fail, 0u);
+    CHECK_EQ(r.first_drive, 1);
+  });
+}
+
+// A drive that never finds TRK00 (no disk turning it, a dead sensor) is
+// latched as such, and the controller does not wedge.
+TEST(recalibrate_that_never_finds_trk00_is_latched_and_does_not_wedge) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    uint8_t st = wd::wait_ready(8000);
+    CHECK(!(st & wd::BUSY));
+    CHECK(!(st & wd::TRK0));
+    FdcRecalDiag r = recal();
+    CHECK_EQ(r.fails, 1u);
+    CHECK_EQ(r.retry_fail, 1u);
+    CHECK_EQ(r.first_retry, 0xFF);
+    // Not cleared with firstfail's latch (a failure latched between the two
+    // reports would be lost); it has its own clear.
+    fdc_firstfail_reset();
+    CHECK_EQ(recal().first_valid, 1);
+    fdc_recaldiag_reset();
+    CHECK_EQ(recal().first_valid, 0);
+    CHECK_EQ(recal().fails, 0u);
+  }, ms(60000));
+}
+
+// A resync inside the READ path that has to recalibrate (target 0)
+// and whose recalibrate is retried blocks core0 for seconds. `live` was taken
+// before it; a Force Interrupt + new READ meanwhile must not be ended by the
+// stale read's publish.
+TEST(resync_retry_does_not_end_a_newer_read) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(2600);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    // No RESTORE: position unknown, head over cyl 5, host thinks cyl 0.
+    wd::Xfer x1 = wd::read_sector(0, 1, 512, false, 1200);
+    wd::Xfer x2 = wd::read_sector(0, 2, 512, false, 6000);
+    CHECK(x1.timed_out);  // the host gave up (and sent Force Interrupt)
+    CHECK(!x2.timed_out); // the newer READ finished on its own
+    // ...and either delivered its sector or reported an error -- never
+    // "complete, no error" with no data.
+    CHECK(!(x2.data.empty() && error_bits(x2.status) == 0));
+  });
+}
+
+// a failed RESTORE -- what does the host see, and how long is BUSY?
+TEST(failed_restore_reports_seek_error_and_recalibrates_once) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    for (int v = 0; v < 2; ++v) {
+      uint64_t t0 = now();
+      out(0xD8, v ? 0x04 : 0x00); // RESTORE, verify flag v
+      wait_us(30);
+      uint8_t st = wd::wait_ready(20000);
+      uint64_t busy_ms = (now() - t0) / ms(1);
+      CHECK(st & wd::SEEKERR); // a WD sets Seek Error when TRK00 never shows
+      CHECK(!(st & wd::BUSY));
+      CHECK(busy_ms < 5000);   // one recalibrate with its retries, not two
+    }
+  }, ms(120000));
+}
+
+// the retry spins up with the host's motor bit off. The deferred stop
+// and the idle ~DSn release must still follow.
+TEST(recalibrate_retry_with_motor_off_still_stops_and_releases) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1500);
+  run([] {
+    wd::select(0, false);
+    wd::restore();
+    wait_ms(6000);
+    CHECK(!cable().drive[0].motor);
+    CHECK(pin_level(PIN_DS0)); // released (active low)
+  }, ms(60000));
+}
+
+// ---- second review of #64 ----
+
+// A STEP (no Force Interrupt) written while a READ is blocked in a resync
+// recalibrate. Does BUSY ever drop?
+TEST(step_during_a_read_resync_does_not_wedge) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(2600);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 1);
+    wd::command(0x80);
+    wait_ms(1500); // inside the resync's recalibrate
+    uint64_t t0 = now();
+    wd::command(0x50); // STEP IN, update
+    uint8_t st = wd::wait_ready(15000);
+    CHECK(st != 0xFF);
+  }, ms(60000));
+}
+
+// Same, but the read is blocked in the multi-window search for a sector that
+// is not there (no resync): is the wedge pre-existing?
+TEST(step_during_a_missing_sector_search_does_not_wedge) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::restore();
+    out(0xD9, 0);
+    out(0xDA, 30);
+    wd::command(0x80);
+    wait_ms(400);
+    uint64_t t0 = now();
+    wd::command(0x50);
+    uint8_t st = wd::wait_ready(15000);
+    CHECK(st != 0xFF);
+  }, ms(60000));
+}
+
+// Seek Error from a failed RESTORE must not stick: a later RESTORE that finds
+// TRK00 clears it.
+TEST(seek_error_of_a_failed_restore_clears_on_the_next_good_one) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(6000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00);
+    uint8_t st = wd::wait_ready(20000);
+    CHECK(st & wd::SEEKERR);
+    wait_ms(3000);
+    wd::command(0x00);
+    st = wd::wait_ready(20000);
+    CHECK(st & wd::TRK0);
+    CHECK(!(st & wd::SEEKERR));
+  }, ms(120000));
+}
+
+// Force Interrupt during a RESTORE that is failing: what does STATUS say once
+// core0 finishes? A WD aborted by FI does not report Seek Error.
+TEST(force_interrupt_during_a_failed_restore_reports_no_seek_error) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00);
+    wait_ms(300);
+    wd::force_interrupt();
+    uint8_t s1 = wd::status();
+    wait_ms(6000);
+    uint8_t s2 = wd::status();
+    CHECK(!(s2 & wd::SEEKERR));
+  }, ms(60000));
+}
+
+// CP/M-style burst: RESTORE, then STEP IN (no V) before core0 has run either;
+// the recalibrate fails. Does the STEP (V=0) report Seek Error?
+TEST(step_folded_after_a_failed_restore_reports_no_seek_error) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    out(0xD8, 0x00);
+    out(0xD8, 0xD0);
+    out(0xD8, 0x50);
+    wait_us(30);
+    uint8_t st = wd::wait_ready(20000);
+    CHECK(!(st & wd::SEEKERR));
+  }, ms(60000));
+}
+
+// A STEP (no Force Interrupt) landing on a READ ADDRESS in flight: the Type I
+// handler clears read_addr but leaves the read running. The READ ADDRESS must
+// end -- not come back as a READ SECTOR -- and the STEP must complete.
+TEST(step_during_a_read_address_ends_it_and_completes) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::read_sector(5, 1, 512);
+    for (int k = 0; k < 3; ++k) {
+      out(0xD8, 0xC0); // READ ADDRESS
+      wait_us(200 + 300 * k);
+      out(0xD8, 0x50); // STEP IN, no Force Interrupt
+      uint8_t st = wd::wait_ready(3000);
+      CHECK(!(st & wd::BUSY));
+      CHECK(!(st & wd::DRQ));
+    }
+    CHECK_EQ(cable().drive[0].cyl, 8);
+    wd::Xfer x = wd::read_sector(8, 2, 512); // and the controller still works
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 8, 0, 2));
+  });
+}
+
+// A STEP landing while the READ ADDRESS is still inside its ID search (the
+// rd_fresh block), not in the decode block: does it come back as a READ
+// SECTOR? Watch DRQ and the counters, not just the final BUSY.
+TEST(step_during_read_address_search_never_raises_drq) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::read_sector(5, 1, 512);
+    for (int k = 0; k < 4; ++k) {
+      FdcDebug d0{};
+      fdc_debug_snapshot(&d0);
+      out(0xD8, 0xC0); // READ ADDRESS
+      wait_us(200 + 300 * k);
+      out(0xD8, 0x50); // STEP IN, no Force Interrupt
+      // After a STEP, STATUS is in the Type I layout, where bit 1 is INDEX:
+      // watch the controller's own DRQ flag (rd_flags b2) instead.
+      bool saw_drq = false;
+      uint8_t st = 0;
+      for (int i = 0; i < 200000; ++i) {
+        st = wd::status();
+        if (dbg().rd_flags & 0x04)
+          saw_drq = true;
+        if (!(st & wd::BUSY))
+          break;
+      }
+      FdcDebug d1{};
+      fdc_debug_snapshot(&d1);
+      CHECK(!saw_drq);
+      CHECK(!(st & wd::BUSY));
+      CHECK_EQ(d1.lost_data_events, d0.lost_data_events);
+      CHECK_EQ(d1.sec_ok, d0.sec_ok);
+      CHECK_EQ(d1.sec_rnf, d0.sec_rnf);
+    }
+  });
+}
+
+// CP/M's recalibrate idiom: READ ADDRESS, then a STEP that does not update
+// the Track register. If the READ ADDRESS turns into a READ SECTOR of the
+// last sector number against the (now wrong) Track register, it reports a
+// wrong-cylinder RNF -- the #31 signature -- for a command that never read.
+TEST(step_no_update_during_read_address_search_counts_no_cyl_mismatch) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    wd::read_sector(5, 1, 512);
+    FdcDebug d0{};
+    fdc_debug_snapshot(&d0);
+    uint64_t t0 = now();
+    out(0xD8, 0xC0); // READ ADDRESS
+    wait_us(200);
+    out(0xD8, 0x40); // STEP IN, no update, no Force Interrupt
+    uint8_t st = wd::wait_ready(5000);
+    uint64_t dt = now() - t0;
+    FdcDebug d1{};
+    fdc_debug_snapshot(&d1);
+    CHECK(!(st & wd::BUSY));
+    CHECK_EQ(d1.sec_rnf, d0.sec_rnf);
+    CHECK_EQ(d1.sec_cyl_mismatch, d0.sec_cyl_mismatch);
+    CHECK(dt < ms(100));
+  });
+}
+
+// A failed RESTORE's Seek Error, then a RESTORE that succeeds but is followed
+// at once by a Force Interrupt (the host does not wait for BUSY). The publish
+// is skipped for the second RESTORE -- does the first one's Seek Error stay?
+TEST(seek_error_does_not_survive_a_good_restore_followed_by_force_interrupt) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(6000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00);
+    uint8_t st = wd::wait_ready(20000);
+    CHECK(st & wd::SEEKERR);
+    wait_ms(3000);
+    out(0xD8, 0x00); // RESTORE
+    wait_us(20);
+    out(0xD8, 0xD0); // Force Interrupt right behind it
+    wait_ms(8000);   // core0 finishes the (now good) recalibrate
+    st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(st & wd::TRK0);
+    CHECK(!(st & wd::SEEKERR));
+  }, ms(120000));
+}
+
+// Same, CP/M style: a STEP IN + Force Interrupt burst after the failed
+// RESTORE. A STEP without V never reports Seek Error.
+TEST(seek_error_does_not_survive_a_step_force_interrupt_burst) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(6000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00);
+    uint8_t st = wd::wait_ready(20000);
+    CHECK(st & wd::SEEKERR);
+    wait_ms(3000);
+    out(0xD8, 0x50); // STEP IN
+    wait_us(20);
+    out(0xD8, 0xD0);
+    wait_ms(8000);
+    st = wd::status();
+    CHECK(!(st & wd::BUSY));
+    CHECK(!(st & wd::SEEKERR));
+  }, ms(120000));
+}
+
+// ---- fourth review of #64 ----
+
+// EINT armed, a READ ADDRESS raises DRQ (and ~INT), the host takes two bytes
+// and then issues a STEP. core1 ends the READ ADDRESS (reading/drq cleared),
+// but the ~INT refresh in the command handler ran BEFORE that clear, so the
+// line must not stay asserted with nothing pending.
+TEST(step_mid_read_address_transfer_releases_int) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(5);
+    wd::side(1);
+    out(0xDF, 0x01); // EINT on
+    out(0xD8, 0xC0); // READ ADDRESS
+    bool drq = false;
+    for (uint64_t end = now() + ms(500); now() < end;) {
+      if (wd::status() & wd::DRQ) { drq = true; break; }
+    }
+    CHECK(drq);
+    CHECK(pin_oe(12));
+    in(0xDB);
+    in(0xDB);
+    out(0xD8, 0x50); // STEP IN, no Force Interrupt
+    wait_us(50);
+    bool held = pin_oe(12);
+    wd::wait_ready(3000);
+    out(0xDF, 0x00);
+    CHECK(!held); // ~INT asserted with no DRQ pending
+  });
+}
+
+
+// A second RESTORE arriving while the first one's failed recalibrate is still
+// retrying: the first one's Seek Error must not be reported as the second's
+// (CodeRabbit on #64). Here the second finds TRK00.
+TEST(failed_restore_seek_error_is_not_reported_for_a_later_restore) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(1000000); // A cannot win
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    out(0xD8, 0x00); // RESTORE A
+    wait_ms(1500);   // inside A's retries
+    out(0xD8, 0x00); // RESTORE B
+    // Once A has given up for good, let the steps land: B then succeeds.
+    for (uint64_t end = now() + ms(10000); now() < end && recal().retry_fail == 0;)
+      wait_us(200);
+    CHECK_EQ(recal().retry_fail, 1u);
+    cable().drive[0].steps_need_motor_for_ticks = 0;
+    // While B runs, A's failure must not show as B's Seek Error, nor be
+    // latched as the first failure.
+    bool seek_err_seen = false;
+    uint8_t st = 0;
+    for (uint64_t end = now() + ms(8000); now() < end;) {
+      st = wd::status();
+      if (st & wd::SEEKERR)
+        seek_err_seen = true;
+      if (!(st & wd::BUSY))
+        break;
+      wait_us(200);
+    }
+    FdcFirstFail ff{};
+    fdc_firstfail_snapshot(&ff);
+    CHECK(!seek_err_seen);
+    CHECK_EQ(ff.count, 0u);
+    CHECK(!(st & wd::BUSY));
+    CHECK(st & wd::TRK0);
+    CHECK(!(st & wd::SEEKERR));
+    CHECK_EQ(cable().drive[0].cyl, 0);
+  }, ms(60000));
+}

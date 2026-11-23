@@ -563,9 +563,14 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     `head_target=0` and the head position **unknown** — i.e. an earlier
     recalibrate on that drive had not seen TRK00. Not reproduced in the
     simulator, and a link to that release's select/motor changes is not
-    ruled out (compare against fw-6e1f7b4). Worth latching the moment a
-    recalibrate fails. The original account follows; two symptoms, both
-    characterised, neither root-caused:
+    ruled out (compare against fw-6e1f7b4). Since then a failed recalibrate
+    is **latched** (`recaldiag`, printed by `firstfail`: when, which drive,
+    which path, motor bit / applied / line, selected, index seen, spin-up
+    gate) and **retried** twice with the spindle confirmed up. Note that
+    `~MOTOR_ON` is shared, so drive 1's spindle has usually been turning
+    long before its recalibrate: the spin-up quirk explains a failure only
+    if the latch shows the line freshly on. The original account follows;
+    two symptoms, both characterised, neither root-caused:
     - ~1.5 % of positioning bursts to the directory track leave the head
       physically short (host wants track 2, disk says 4..15) — identical rate
       on two unrelated drives (ALPS DF354H090F, Mitsumi D359M3), so not the

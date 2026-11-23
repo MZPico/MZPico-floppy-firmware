@@ -81,6 +81,11 @@ void FloppyCable::output(int pin, bool level, uint64_t now) {
     Drive *d = selected();
     if (!d)
       return;
+    if (d->steps_need_motor_for_ticks &&
+        (!d->motor || now < d->motor_on_since + d->steps_need_motor_for_ticks)) {
+      d->steps_lost++; // the head does not move (see the Drive field)
+      return;
+    }
     bool in = !pin_level(PIN_DIR); // ~DIR low = toward the spindle
     int c = d->cyl + (in ? 1 : -1);
     d->cyl = std::clamp(c, 0, MAX_CYL - 1);
