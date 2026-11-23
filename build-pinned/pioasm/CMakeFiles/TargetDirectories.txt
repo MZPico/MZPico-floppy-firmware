@@ -1,7 +1,0 @@
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm/CMakeFiles/pioasm.dir
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm/CMakeFiles/edit_cache.dir
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm/CMakeFiles/rebuild_cache.dir
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm/CMakeFiles/list_install_components.dir
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm/CMakeFiles/install.dir
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm/CMakeFiles/install/local.dir
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm/CMakeFiles/install/strip.dir
