@@ -153,7 +153,8 @@ two revolutions of clean flux); both fixed:
 **Status since (2026-11, #31):** a re-test on fw-eb7f2dc was clean on the
 write side (128/128 writes, 0 RNF, `PIP [V]` twice) with one wrong-cylinder
 read in 4016; fw-2a1d1c5 saw one more, on drive 1, with the head position
-unknown at that moment (an earlier recalibrate had not seen TRK00). Each was
+unknown at that moment (either a recalibrate had failed to see TRK00, or the
+position had never been established; `recaldiag` now tells which). Each was
 rejected by the ID track compare and retried. The bulk-copy content fault
 below has not been seen again. What follows is the 2026-08 account.
 
