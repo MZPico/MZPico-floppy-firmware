@@ -12,7 +12,9 @@ interrupt handler, and following every
 function they can call (transitively), each function reached must:
   - itself live in RAM (0x2xxxxxxx);
   - call only RAM functions, and no linker veneer (a RAM stub that jumps on
-    into flash: how the idivmod calls appeared);
+    into flash: how the idivmod calls appeared) -- including tail calls (a
+    `b` to another function) and no indirect call (`blx rN`), which cannot
+    be followed;
   - load no literal-pool word that points into flash (0x10xxxxxx).
 
     tools/ci/check_core1_ram.py build/mzpico_floppy.elf
@@ -29,6 +31,9 @@ ROOTS = ["_ZL11listen_loopv", "_Z13fdc_reg_writehh", "_Z12fdc_reg_readh",
 FUNC_RE = re.compile(r"^([0-9a-f]{8}) <([^>]+)>:$")
 CALL_RE = re.compile(r"\sblx?\s+([0-9a-f]+) <([^>+]+)(\+0x[0-9a-f]+)?>")
 WORD_RE = re.compile(r"\.word\s+0x(1[0-9a-f]{7})\b")
+# A branch to another symbol is a tail call; a register call is unknowable.
+BRANCH_RE = re.compile(r"\sb(?:\.[nw])?\s+([0-9a-f]+) <([^>+]+)(\+0x[0-9a-f]+)?>")
+INDIRECT_RE = re.compile(r"\sbl?x\s+(r\d+|ip|lr)\b")
 
 
 def disassemble(elf):
@@ -73,6 +78,15 @@ def main():
                     problems.append(f"{f}: calls flash: {line.strip()}")
                 elif callee != f and not off:
                     todo.append(callee)  # follow it: RAM alone proves nothing
+            b = BRANCH_RE.search(line)
+            if b and b.group(2) != f:  # a jump into ANOTHER function
+                target, callee = int(b.group(1), 16), b.group(2)
+                if target >> 28 != 0x2 or callee.endswith("_veneer"):
+                    problems.append(f"{f}: tail-calls flash: {line.strip()}")
+                elif not b.group(3):
+                    todo.append(callee)
+            if INDIRECT_RE.search(line) and "bx\tlr" not in line and " bx lr" not in line:
+                problems.append(f"{f}: indirect call (cannot be checked): {line.strip()}")
             if WORD_RE.search(line):
                 problems.append(f"{f}: flash literal: {line.strip()}")
     for p in problems:
