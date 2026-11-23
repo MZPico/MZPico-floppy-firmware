@@ -1278,6 +1278,9 @@ def do_firstfail(s, clear=False):
     # handler) first. If that reply is incomplete, nothing is cleared: a
     # latched failure must never be discarded unseen.
     recal = fetch_recaldiag(s, clear=clear)
+    # Printed now, not with the rest: with clear the firmware has already
+    # reset it, so a bad FIRSTFAIL reply below must not lose it unseen.
+    do_recaldiag(s, recal)
     if clear and recal[0] == "short":
         print("recalibrate diagnostics came back incomplete: NOT clearing")
         clear = False
@@ -1315,7 +1318,6 @@ def do_firstfail(s, clear=False):
     print(f"head-position resyncs:   {resyncs}"
           + (f"  (last: disk said {rs_from}, we wanted {rs_to})"
              if resyncs else ""))
-    do_recaldiag(s, recal)
     if not valid:
         print("no first read/seek failure latched"
               + ("" if recal[0] == "ok" and int.from_bytes(recal[1][2:6], "little")
