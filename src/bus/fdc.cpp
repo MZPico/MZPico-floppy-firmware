@@ -4867,11 +4867,12 @@ void fdc_disk_task(void) {
       uint32_t seq = S.rd_seq; // snapshot
       uint32_t gen = S.cmd_gen;
       // Which kind of read this result is for, taken with seq/gen: a Type I
-      // during the blocking search below ends a READ ADDRESS on core1 and
-      // clears S.read_addr, and the stale result must still be treated as
-      // one (its synthetic size_n must not reach the size cache).
+      // landing after this point (for a READ ADDRESS, between the search
+      // above and the result below; for a READ SECTOR, during its blocking
+      // decode) ends a READ ADDRESS on core1 and clears S.read_addr, and the
+      // stale result must still be treated as one (its synthetic size_n
+      // must not reach the size cache).
       const bool ra = S.read_addr;
-      FDC_RACE_POINT(24);
       // A result that went stale while we blocked: is the command it was for
       // still pending? Then do NOT mark it done -- nothing would ever end it
       // (the seek block will not drop BUSY while `reading` is set). It is a
@@ -5010,6 +5011,7 @@ void fdc_disk_task(void) {
           present |= S.rd_ids[k] == want;
         lookahead_absent = S.rd_ids_seen > 0 && !present;
       }
+      FDC_RACE_POINT(24);
       S.rd_search_us = time_us_32() - t0;
       S.rd_want = want;
       S.last_head_target = (uint8_t)S.head_target[fdc_cur_idx()];
