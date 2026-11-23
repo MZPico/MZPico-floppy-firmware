@@ -568,8 +568,11 @@ Flux-critical PIO pins: `~RDATA` (GPIO20 in), `~WDATA` (GPIO18 out),
     one wrong-cylinder read in 4016 sectors), and the issue was closed. It
     was reopened on fw-2a1d1c5: one wrong-cylinder read on drive 1 (host
     wanted track 2, disk said 3), rejected and repaired, with
-    `head_target=0` and the head position **unknown** — i.e. an earlier
-    recalibrate on that drive had not seen TRK00. Not reproduced in the
+    `head_target=0` and the head position **unknown**. Two candidates: a
+    recalibrate on that drive had failed to see TRK00 (the only way the
+    position becomes unknown during a session), or it had never been
+    established (it starts unknown at power-up). The recalibrate latch below
+    tells the two apart. Not reproduced in the
     simulator, and a link to that release's select/motor changes is not
     ruled out (compare against fw-6e1f7b4). Since then a failed recalibrate
     is **latched** (`recaldiag`, printed by `firstfail`: when, which drive,

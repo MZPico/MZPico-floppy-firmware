@@ -499,10 +499,12 @@ BUSY-polling covers latency instead, per the ROM driver).
       those two bytes appearing anywhere, which arbitrary sector data satisfies
       about 86% of the time each. The media is protected by physical `~WPT`,
       the `wren` switch, that check, and WRITE TRACK running index-to-index.
-    - **The catch-up seek on select** only fires when `head_target` diverges
-      from the head, and only core1 sets `head_target` — from real host Type I
-      commands. Bench seeks drive the head directly and never create that
-      divergence. It is exercised in the simulator
+    - **The catch-up seek on select** handles one kind of divergence between
+      `head_target` and the head: a host Type I folded into a unit's target
+      while core0 had the other unit selected (only core1 sets
+      `head_target`). A bench seek also moves the head away from its target,
+      but that case is `fdc_bench_restore_head()`'s, at the next operation;
+      the catch-up seek does not cover it. It is exercised in the simulator
       (`unit_first_spun_by_a_motor_off_seek_still_gets_its_catch_up_seek`: a
       STEP folded for unit 1 while unit 0 is selected is caught up on the
       switch back) and still not observed on hardware (#34). Since #57 it runs

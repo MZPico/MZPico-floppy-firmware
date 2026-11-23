@@ -3945,3 +3945,264 @@ TEST(type1_between_live_and_read_publish_does_not_wedge_the_read) {
     CHECK(done);
   });
 }
+
+// ---- final review: the three PRs combined (#64 recal retry x #65 lock x #66) ----
+namespace {
+void xrv_bus_reset() {
+  sim::pin_set_input(29, true);  sim_fire_gpio_irq();
+  wait_us(65);
+  sim::pin_set_input(29, false); sim_fire_gpio_irq();
+}
+// Head over cyl 5, position unknown, steps lost for `lost_ms` from motor-on:
+// a READ of cyl 0 hits a wrong-cylinder ID, and its resync recalibrate fails
+// once and is retried (#64) -- core0 blocked for seconds.
+void xrv_boot_stranded(uint64_t lost_ms) {
+  g_disk[0] = make_disk(Geometry::MZ_DD_DATA, 80, "A");
+  insert(0, &g_disk[0]);
+  board_boot();
+  cable().drive[0].cyl = 5;
+  cable().drive[0].steps_need_motor_for_ticks = ms(lost_ms);
+}
+} // namespace
+
+// Force Interrupt + a new READ while the resync's recalibrate is retrying:
+// the new READ is served, CRC-clean, from cylinder 0 once the retry lands.
+TEST(combined_fi_and_read_during_resync_retry_delivers_the_new_sector) {
+  xrv_boot_stranded(2600);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 1);
+    wd::command(0x80);
+    wait_ms(1500); // inside the resync's recalibrate retry
+    CHECK(wd::status() & wd::BUSY);
+    wd::force_interrupt();
+    wd::Xfer x = wd::read_sector(0, 2, 512, false, 10000);
+    CHECK(!x.timed_out);
+    CHECK_EQ(x.data.size(), 512u);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 2));
+    CHECK_EQ(cable().drive[0].cyl, 0);
+    CHECK_EQ(recal().retry_ok, 1u);
+  }, ms(60000));
+}
+
+// A bus RESET while the resync recalibrate retries: STATUS is clean at once,
+// nothing from the dead READ is published afterwards, and the boot ROM's
+// RESTORE + READ after the reset work.
+TEST(combined_bus_reset_during_resync_retry_then_rom_restore_and_read) {
+  xrv_boot_stranded(2600);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 1);
+    wd::command(0x80);
+    wait_ms(1500);
+    xrv_bus_reset();
+    uint8_t s0 = wd::status();
+    CHECK(!(s0 & (wd::BUSY | wd::DRQ)));
+    // Watch the dead READ's completion: nothing may come up.
+    bool drq = false;
+    for (uint64_t end = now() + ms(4000); now() < end;) {
+      if (dbg().rd_flags & 0x04)
+        drq = true;
+      wait_us(500);
+    }
+    CHECK(!drq);
+    CHECK(!(wd::status() & wd::BUSY));
+    // the ROM after reset
+    wd::select(0);
+    uint8_t st = wd::restore();
+    CHECK(st & wd::TRK0);
+    CHECK(!(st & wd::SEEKERR));
+    wd::side(1);
+    wd::Xfer x = wd::read_sector(0, 3, 512, false, 5000);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 0, 0, 3));
+  }, ms(60000));
+}
+
+// CP/M's recalibrate idiom (FI, READ ADDRESS, STEP) while the previous READ's
+// resync recalibrate is still retrying. Everything must end; no phantom DRQ;
+// the head lands where the folded target says (0 + 1).
+TEST(combined_read_address_and_step_during_resync_retry) {
+  xrv_boot_stranded(2600);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    out(0xD9, 0);
+    out(0xDA, 1);
+    wd::command(0x80);
+    wait_ms(1500);
+    out(0xD8, 0xD0);
+    out(0xD8, 0xC0); // READ ADDRESS
+    wait_us(100);
+    out(0xD8, 0x50); // STEP IN, update -> Track 1
+    bool drq = false;
+    uint8_t st = 0xFF;
+    for (uint64_t end = now() + ms(10000); now() < end;) {
+      st = wd::status();
+      if (dbg().rd_flags & 0x04)
+        drq = true;
+      if (!(st & wd::BUSY))
+        break;
+      wait_us(200);
+    }
+    CHECK(!(st & wd::BUSY));
+    CHECK(!drq);
+    CHECK(!(st & wd::SEEKERR));
+    CHECK_EQ(cable().drive[0].cyl, 1);
+    wd::Xfer x = wd::read_sector(1, 2, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 1, 0, 2));
+  }, ms(60000));
+}
+
+// A STEP (no FI) between `live` and the locked publish (#65): by design a Type
+// I does not end a READ SECTOR, so the READ is left pending (finish_stale) and
+// recaptured after the move. It must end (BUSY drops), never wedge, and the
+// controller must serve the next READ from the new cylinder. (Its own result
+// is published under the STEP's Type I STATUS layout -- see the report.)
+TEST(combined_step_at_read_publish_race_does_not_wedge) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    wd::read_sector(6, 1, 512);
+    RaceOnce r{20, [] { race_out(0xD8, 0x50); }}; // STEP IN, update -> 7
+    arm_race(r);
+    out(0xDF, 0x01); // EINT on, as CP/M runs
+    out(0xDA, 2);
+    out(0xD8, 0x80);
+    bool int_seen = false, drq_seen = false;
+    uint8_t st = 0xFF;
+    for (uint64_t end = now() + ms(5000); now() < end;) {
+      st = wd::status();
+      if (r.fired && pin_oe(12)) int_seen = true;
+      if (r.fired && (dbg().rd_flags & 0x04)) drq_seen = true;
+      if (r.fired && !(st & wd::BUSY)) break;
+      wait_us(200);
+    }
+    out(0xDF, 0x00);
+    set_race_point(nullptr);
+    std::printf("    xrv20: st=%02X int_seen=%d drq_seen(after STEP)=%d lost=%u\n", st, int_seen, drq_seen, dbg().lost_data_events);
+    CHECK(r.fired);
+    CHECK(!(st & wd::BUSY));
+    CHECK_EQ(cable().drive[0].cyl, 7);
+    wd::Xfer x = wd::read_sector(7, 3, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 7, 0, 3));
+  });
+}
+
+// Same race on the RNF publish (point 3): the READ of a missing sector is
+// retried after the STEP and ends; the controller is usable afterwards.
+TEST(combined_step_at_rnf_publish_race_does_not_wedge) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    wd::read_sector(6, 1, 512);
+    RaceOnce r{3, [] { race_out(0xD8, 0x50); }};
+    arm_race(r);
+    out(0xDA, 14);
+    out(0xD8, 0x80);
+    uint8_t st = wd::wait_ready(10000);
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    CHECK(st != 0xFF);
+    CHECK_EQ(cable().drive[0].cyl, 7);
+    wd::Xfer x = wd::read_sector(7, 3, 512);
+    CHECK_EQ(error_bits(x.status), 0);
+    CHECK(matches_pattern(x.data, 7, 0, 3));
+  }, ms(60000));
+}
+
+// A failed RESTORE, and a READ the host issues during its retries (CP/M does
+// not wait for BUSY). The READ owns BUSY; it must end, and the RESTORE's Seek
+// Error must not be published over it.
+TEST(combined_read_during_failed_restore_retries_ends) {
+  xrv_boot_stranded(1000000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00); // RESTORE
+    wait_ms(1500);
+    out(0xDA, 1);
+    out(0xD8, 0x80);
+    uint8_t st = wd::wait_ready(30000);
+    CHECK(st != 0xFF);
+    CHECK(error_bits(st) != 0); // the head is nowhere known: an error, not data
+  }, ms(120000));
+}
+
+// RESET during a failed RESTORE's retries, then the boot ROM's own RESTORE
+// once the drive can step: TRK00, no Seek Error from the dead one.
+TEST(combined_reset_during_failed_restore_then_rom_restore_is_clean) {
+  xrv_boot_stranded(1000000);
+  run([] {
+    wd::select(0);
+    wd::side(1);
+    wd::command(0x00);
+    wait_ms(1500);
+    xrv_bus_reset();
+    CHECK(!(wd::status() & (wd::BUSY | wd::SEEKERR)));
+    wd::select(0);
+    out(0xD8, 0x0B); // the ROM's RESTORE (h, r=11, no V)
+    for (uint64_t end = now() + ms(10000); now() < end && recal().retry_fail == 0;)
+      wait_us(200);
+    cable().drive[0].steps_need_motor_for_ticks = 0;
+    bool seek_err_seen = false;
+    uint8_t st = 0xFF;
+    for (uint64_t end = now() + ms(15000); now() < end;) {
+      st = wd::status();
+      if (st & wd::SEEKERR)
+        seek_err_seen = true;
+      if (!(st & wd::BUSY))
+        break;
+      wait_us(200);
+    }
+    CHECK(!seek_err_seen);
+    CHECK(!(st & wd::BUSY));
+    CHECK(st & wd::TRK0);
+    CHECK_EQ(cable().drive[0].cyl, 0);
+  }, ms(120000));
+}
+
+// CodeRabbit on #64: the read-result block took S.read_addr live. A STEP
+// landing right after the seq/gen snapshot ends the READ ADDRESS on core1;
+// the stale result then lost its READ ADDRESS marker and its synthetic
+// size_n (0) was cached as this cylinder's sector size -- 128 bytes, the
+// length core1 then gives the next WRITE SECTOR here.
+TEST(stale_read_address_does_not_poison_the_size_cache) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    CHECK(wd::read_sector(6, 1, 512).data.size() == 512); // caches N=2
+    RaceOnce r{24, [] { race_out(0xD8, 0x50); }}; // STEP IN, update
+    arm_race(r);
+    out(0xD8, 0xC0); // READ ADDRESS
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(1);
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    wd::wait_ready(3000);
+    out(0xD8, 0x70); // STEP OUT, update: back to 6
+    wd::wait_ready(3000);
+    CHECK_EQ(in(0xD9), 6);
+    std::vector<uint8_t> v(512);
+    for (size_t i = 0; i < v.size(); ++i)
+      v[i] = (uint8_t)(i * 11 + 7);
+    CHECK_EQ(error_bits(wd::write_sector(6, 4, v).status), 0);
+    CHECK(wd::read_sector(6, 4, 512).data == v);
+  });
+}
