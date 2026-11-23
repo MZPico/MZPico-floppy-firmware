@@ -4174,3 +4174,35 @@ TEST(combined_reset_during_failed_restore_then_rom_restore_is_clean) {
     CHECK_EQ(cable().drive[0].cyl, 0);
   }, ms(120000));
 }
+
+// CodeRabbit on #64: the read-result block took S.read_addr live. A STEP
+// landing right after the seq/gen snapshot ends the READ ADDRESS on core1;
+// the stale result then lost its READ ADDRESS marker and its synthetic
+// size_n (0) was cached as this cylinder's sector size -- 128 bytes, the
+// length core1 then gives the next WRITE SECTOR here.
+TEST(stale_read_address_does_not_poison_the_size_cache) {
+  boot_with(Geometry::MZ_DD_DATA);
+  run([] {
+    wd::select(0);
+    wd::restore();
+    wd::seek(6);
+    wd::side(1);
+    CHECK(wd::read_sector(6, 1, 512).data.size() == 512); // caches N=2
+    RaceOnce r{24, [] { race_out(0xD8, 0x50); }}; // STEP IN, update
+    arm_race(r);
+    out(0xD8, 0xC0); // READ ADDRESS
+    for (uint64_t end = now() + ms(3000); now() < end && !r.fired;)
+      wait_ms(1);
+    set_race_point(nullptr);
+    CHECK(r.fired);
+    wd::wait_ready(3000);
+    out(0xD8, 0x70); // STEP OUT, update: back to 6
+    wd::wait_ready(3000);
+    CHECK_EQ(in(0xD9), 6);
+    std::vector<uint8_t> v(512);
+    for (size_t i = 0; i < v.size(); ++i)
+      v[i] = (uint8_t)(i * 11 + 7);
+    CHECK_EQ(error_bits(wd::write_sector(6, 4, v).status), 0);
+    CHECK(wd::read_sector(6, 4, 512).data == v);
+  });
+}

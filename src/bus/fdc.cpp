@@ -4871,6 +4871,7 @@ void fdc_disk_task(void) {
       // clears S.read_addr, and the stale result must still be treated as
       // one (its synthetic size_n must not reach the size cache).
       const bool ra = S.read_addr;
+      FDC_RACE_POINT(24);
       // A result that went stale while we blocked: is the command it was for
       // still pending? Then do NOT mark it done -- nothing would ever end it
       // (the seek block will not drop BUSY while `reading` is set). It is a
