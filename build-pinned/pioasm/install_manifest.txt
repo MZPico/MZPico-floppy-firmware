@@ -1,0 +1,5 @@
+/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm-install/pioasm/pioasm
+/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm-install/pioasm/pioasmTargets.cmake
+/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm-install/pioasm/pioasmTargets-release.cmake
+/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm-install/pioasm/pioasmConfig.cmake
+/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pioasm-install/pioasm/pioasmConfigVersion.cmake

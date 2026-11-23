@@ -4062,7 +4062,8 @@ void fdc_disk_task(void) {
       FdcPub pub;
       if (publish) {
         // (re-evaluated under the lock: a command may have landed since)
-        publish = recal_failed ? S.restore_gen == S.cmd_gen
+        publish = recal_failed ? (S.restore_req == rseq && S.restore_gen == rgen &&
+                                  rgen == S.cmd_gen)
                                : S.op_seq == seq && S.cmd_gen == gen;
         FDC_RACE_POINT(10);
         if (publish)
