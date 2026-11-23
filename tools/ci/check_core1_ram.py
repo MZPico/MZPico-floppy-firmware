@@ -7,7 +7,8 @@ call into flash -- a libgcc division helper (`% 96` did: two __aeabi_idivmod
 calls per register access) -- or load a switch's jump table from flash
 .rodata. On an XIP cache miss either costs ~0.5 us. Issue #12.
 
-Starting from the listen loop and the register handlers, and following every
+Starting from the listen loop, the register handlers and the bus-RESET
+interrupt handler, and following every
 function they can call (transitively), each function reached must:
   - itself live in RAM (0x2xxxxxxx);
   - call only RAM functions, and no linker veneer (a RAM stub that jumps on
@@ -20,7 +21,10 @@ import re
 import subprocess
 import sys
 
-ROOTS = ["_ZL11listen_loopv", "_Z13fdc_reg_writehh", "_Z12fdc_reg_readh"]
+# The bus-RESET edge interrupt runs on core1 too, between bus cycles: a
+# flash fetch there delays core1's next answer just the same.
+ROOTS = ["_ZL11listen_loopv", "_Z13fdc_reg_writehh", "_Z12fdc_reg_readh",
+         "_ZN12_GLOBAL__N_1L17fdc_bus_reset_isrEv"]
 
 FUNC_RE = re.compile(r"^([0-9a-f]{8}) <([^>]+)>:$")
 CALL_RE = re.compile(r"\sblx?\s+([0-9a-f]+) <([^>+]+)(\+0x[0-9a-f]+)?>")

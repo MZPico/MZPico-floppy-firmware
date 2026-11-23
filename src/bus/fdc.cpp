@@ -10,6 +10,10 @@
 #include "mz_bus.hpp"      // bus_diag_reset
 #include "hardware/gpio.h" // gpio_get (index-edge sync), RESET edge IRQ
 #include "hardware/irq.h"  // IO_IRQ_BANK0 (bus RESET)
+#ifndef MZP_HOST_SIM
+#include "hardware/structs/timer.h" // timer_hw (inline 64-bit time in the RESET ISR)
+#include "hardware/structs/io_bank0.h" // io_bank0_hw (inline IRQ acknowledge)
+#endif
 #include "pico/time.h"     // sleep_ms
 #include <cstring>         // memcpy
 
@@ -418,7 +422,7 @@ struct FdcState {
   // believed, and we adopted the disk's answer (see fdc_resync_head).
   // Bus RESET (GPIO29). An edge interrupt on core1 -- see fdc_bus_reset_isr().
   volatile uint32_t reset_events = 0;
-  volatile uint32_t reset_at_ms = 0;
+  volatile uint64_t reset_at_us = 0; // raw, from the ISR; converted on core0
   volatile bool reset_active = false;
   // Raw line telemetry, recorded with NO polarity assumption. If a reset press
   // produces no event, this is what says why: whether the pin moved at all, in
@@ -857,6 +861,34 @@ ALWAYS_INLINE void fdc_refresh_int_line(void) {
 // exactly what we want to spend 20 us rejecting.
 static constexpr uint32_t FDC_RESET_CONFIRM_US = 20;
 
+// The RESET ISR runs on core1 between bus cycles, so it must not fetch from
+// flash any more than the listen loop may (tools/ci/check_core1_ram.py now
+// checks it): no SDK time functions, no libgcc division. These two are the
+// inline replacements.
+ALWAYS_INLINE uint64_t fdc_isr_time_us_64(void) {
+#ifdef MZP_HOST_SIM
+  return time_us_64();
+#else
+  uint32_t hi = timer_hw->timerawh;
+  for (;;) {
+    uint32_t lo = timer_hw->timerawl;
+    uint32_t hi2 = timer_hw->timerawh;
+    if (hi2 == hi)
+      return ((uint64_t)hi << 32) | lo;
+    hi = hi2;
+  }
+#endif
+}
+ALWAYS_INLINE void fdc_isr_busy_wait_us(uint32_t us) {
+#ifdef MZP_HOST_SIM
+  busy_wait_us_32(us); // the simulation advances virtual time here
+#else
+  uint32_t t0 = time_us_32();
+  while (time_us_32() - t0 < us) {
+  }
+#endif
+}
+
 RAM_FUNC static void fdc_bus_reset_isr(void) {
   // A rising RESET can land in the middle of a served read, between
   // acquire_data_bus_for_writing() and release_data_bus(). The Z80 drops
@@ -868,7 +900,13 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   if (sio_hw->gpio_in & (1u << RESET_PIN))
     sio_hw->gpio_oe_clr = DATA_BUS_MASK | (1u << EXWAIT_PIN);
   uint32_t events = gpio_get_irq_event_mask(RESET_PIN);
+#ifdef MZP_HOST_SIM
   gpio_acknowledge_irq(RESET_PIN, events);
+#else
+  // What gpio_acknowledge_irq() does -- written out: it is an inline in SDK
+  // 2.2.0 but a flash function in 2.1.x.
+  io_bank0_hw->intr[RESET_PIN / 8] = events << (4 * (RESET_PIN % 8));
+#endif
   if (!g_reset_poll_enabled)
     return;
 
@@ -888,13 +926,13 @@ RAM_FUNC static void fdc_bus_reset_isr(void) {
   S.rst_edge_us = now;
 
   // Debounce by duration, in the handler. The machine holds this for 65 us.
-  busy_wait_us_32(FDC_RESET_CONFIRM_US);
+  fdc_isr_busy_wait_us(FDC_RESET_CONFIRM_US);
   if (!gpio_get(RESET_PIN))
     return; // glitch, not a reset
 
   S.reset_active = true;
   S.reset_events++;
-  S.reset_at_ms = to_ms_since_boot(get_absolute_time());
+  S.reset_at_us = fdc_isr_time_us_64(); // ms on core0, in the snapshots
 
   // 1. Release the interrupt. This is the part that must happen. ~INT reaches
   //    expansion pin 38 unbuffered and the Z80's INT input is level sensitive,
@@ -2932,7 +2970,7 @@ void fdc_firstfail_snapshot(FdcFirstFail *o) {
   for (int k = 0; k < FDC_IDS_N; ++k)
     o->ids[k] = S.ff_ids[k];
   o->reset_events = S.reset_events;
-  o->reset_at_ms = S.reset_at_ms;
+  o->reset_at_ms = (uint32_t)(S.reset_at_us / 1000u);
   o->reset_line = gpio_get(RESET_PIN) ? 1 : 0;
   o->reset_active = S.reset_active ? 1 : 0;
   o->pos_resyncs = S.pos_resyncs;
@@ -2948,7 +2986,7 @@ void fdc_resetdiag_snapshot(FdcResetDiag *o) {
   o->high_max_us = S.rst_high_max_us;
   o->last_high_us = S.rst_last_high_us;
   o->events = S.reset_events;
-  o->at_ms = S.reset_at_ms;
+  o->at_ms = (uint32_t)(S.reset_at_us / 1000u);
 }
 
 void fdc_resetdiag_clear(void) {
@@ -2958,7 +2996,7 @@ void fdc_resetdiag_clear(void) {
   S.rst_high_max_us = 0;
   S.rst_last_high_us = 0;
   S.reset_events = 0;
-  S.reset_at_ms = 0;
+  S.reset_at_us = 0;
 }
 
 void fdc_firstfail_reset(void) {
