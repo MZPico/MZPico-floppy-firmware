@@ -4828,6 +4828,11 @@ void fdc_disk_task(void) {
     if (S.rd_done != S.rd_seq && !S.drq) {
       uint32_t seq = S.rd_seq; // snapshot
       uint32_t gen = S.cmd_gen;
+      // Which kind of read this result is for, taken with seq/gen: a Type I
+      // during the blocking search below ends a READ ADDRESS on core1 and
+      // clears S.read_addr, and the stale result must still be treated as
+      // one (its synthetic size_n must not reach the size cache).
+      const bool ra = S.read_addr;
       // A result that went stale while we blocked: is the command it was for
       // still pending? Then do NOT mark it done -- nothing would ever end it
       // (the seek block will not drop BUSY while `reading` is set). It is a
@@ -4844,7 +4849,7 @@ void fdc_disk_task(void) {
       // that left this read live (a Type I does not end a read) gets a fresh
       // capture for the live state -- after its move, since the capture waits
       // for op_done -- instead of a decode of stale flux, or a wedge.
-      if (!S.read_addr && g_flux_gen != gen) {
+      if (!ra && g_flux_gen != gen) {
         if (g_rc_active)
           fdc_read_capture_end(false);
         g_flux_n = 0;
@@ -4858,7 +4863,7 @@ void fdc_disk_task(void) {
       uint32_t t0 = time_us_32();
       SectorRead sd{};
       bool lookahead_absent = false;
-      if (S.read_addr) {
+      if (ra) {
         // READ ADDRESS: the first ID field found, as six bytes over DRQ.
         if (g_readaddr_found) {
           sd.found = sd.has_data = sd.data_crc_ok = true;
@@ -4958,7 +4963,7 @@ void fdc_disk_task(void) {
       // not counted, and not latched in firstfail (#23). Judged on the final
       // capture of the whole search, not on a single decode, so a sector the
       // decoder merely missed once is not mistaken for an absent one.
-      if (!S.read_addr && !sd.found && !sd.cyl_mismatch && want != S.rd_first &&
+      if (!ra && !sd.found && !sd.cyl_mismatch && want != S.rd_first &&
           g_flux_complete && g_flux_n > 0) {
         fdc_note_track_ids(flux, g_flux_n);
         bool present = false;
@@ -4975,7 +4980,7 @@ void fdc_disk_task(void) {
       }
       S.rd_result = (uint8_t)((sd.found ? 1 : 0) | (sd.has_data ? 2 : 0) |
                               (sd.data_crc_ok ? 4 : 0) | (sd.deleted ? 8 : 0));
-      if (S.read_addr)
+      if (ra)
         S.rd_result |= 0x10; // mark the diagnostic as a READ ADDRESS result
 
       // Everything host-visible below -- the buffer, the error bits, DRQ, BUSY,
@@ -4988,10 +4993,10 @@ void fdc_disk_task(void) {
       bool live = S.reading && S.rd_seq == seq && S.cmd_gen == gen;
 
       if (sd.found && sd.has_data && !live) {
-        // Not for a READ ADDRESS result (rd_result b4, set above from this
-        // pass's own decode): its sd.size_n is not a sector's, and the live
-        // S.read_addr may have been cleared by a command meanwhile.
-        if (!(S.rd_result & 0x10))
+        // Not for a READ ADDRESS result (ra, snapshotted with seq/gen: the
+        // live S.read_addr may have been cleared by a command meanwhile):
+        // its sd.size_n is not a sector's.
+        if (!ra)
           fdc_note_size_code(sd.cyl, sd.size_n);
         finish_stale();
       } else if (sd.found && sd.has_data) {
@@ -5030,18 +5035,18 @@ void fdc_disk_task(void) {
         // CRC ERROR set) instead of auto-advancing to the next record.
         if (!sd.data_crc_ok) {
           // (S.err_crc / S.multi are host-visible: set with DRQ, below)
-          if (!S.read_addr)
+          if (!ra)
             fdc_note_failure(2, want, sd.cyl, sd.head);
           // Guarded like sec_ok below: this counter is what rddiag prints as
           // "handed the host corrupt bytes", so a READ ADDRESS must never reach
           // it. Unreachable today (the read_addr branch synthesises
           // data_crc_ok = true) but the asymmetry is a trap for later edits.
-          if (!S.read_addr)
+          if (!ra)
             S.sec_crc_err++;
-        } else if (!S.read_addr) {
+        } else if (!ra) {
           S.sec_ok++;
         }
-        if (!S.read_addr) {
+        if (!ra) {
           // A read is where the write path learns this cylinder's sector size
           // (see FDC_SIZE_CACHE_N). The ID track compare has already confirmed
           // sd.cyl == the Track register, so either indexes the same entry.
@@ -5072,7 +5077,7 @@ void fdc_disk_task(void) {
           FDC_RACE_POINT(2);
           S.xfer_len = n;
           S.xfer_pos = 0;
-          if (S.read_addr)
+          if (ra)
             // WD quirk: READ ADDRESS also loads the track address byte into
             // the Sector register. A host probing head position may read it
             // there rather than from the data stream.
@@ -5111,14 +5116,14 @@ void fdc_disk_task(void) {
         // this track is already in it, so no re-capture is needed.
       } else {
         // Not on this track (or undecodable). Record what IS there, then RNF.
-        if (!S.read_addr)
+        if (!ra)
           fdc_note_track_ids(flux, g_flux_n);
         else
           S.rd_ids_seen = 0;
-        if (!S.read_addr && !live && sd.cyl_mismatch) {
+        if (!ra && !live && sd.cyl_mismatch) {
           // Stale, but the disk still said where the head is: keep the fix.
           fdc_resync_head(sd.seen_cyl);
-        } else if (!S.read_addr && live && !lookahead_absent) {
+        } else if (!ra && live && !lookahead_absent) {
           // (An end-of-track look-ahead is expected, not a failure: it is not
           // counted, and it must not consume the firstfail latch, #23.)
           S.sec_rnf++;
