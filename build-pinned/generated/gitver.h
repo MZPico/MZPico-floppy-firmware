@@ -1,1 +1,1 @@
-#define FW_GIT_HASH "cd61880+dirty"
+#define FW_GIT_HASH "a5c86b6+dirty"

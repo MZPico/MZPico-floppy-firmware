@@ -184,7 +184,6 @@
 /home/matyamar/src/MZPico-floppy-firmware/build-pinned/pico-sdk/src/rp2_common/pico_fix/CMakeFiles/rebuild_cache.dir
 /home/matyamar/src/MZPico-floppy-firmware/build-pinned/pico-sdk/src/rp2_common/pico_fix/rp2040_usb_device_enumeration/CMakeFiles/edit_cache.dir
 /home/matyamar/src/MZPico-floppy-firmware/build-pinned/pico-sdk/src/rp2_common/pico_fix/rp2040_usb_device_enumeration/CMakeFiles/rebuild_cache.dir
-/home/matyamar/src/MZPico-floppy-firmware/build-pinned/pico-sdk/src/rp2_common/pico_status_led/CMakeFiles/pioasmBuild.dir
 /home/matyamar/src/MZPico-floppy-firmware/build-pinned/pico-sdk/src/rp2_common/pico_status_led/CMakeFiles/pico_status_led_ws2812_pio_h.dir
 /home/matyamar/src/MZPico-floppy-firmware/build-pinned/pico-sdk/src/rp2_common/pico_status_led/CMakeFiles/edit_cache.dir
 /home/matyamar/src/MZPico-floppy-firmware/build-pinned/pico-sdk/src/rp2_common/pico_status_led/CMakeFiles/rebuild_cache.dir

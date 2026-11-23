@@ -25,6 +25,13 @@ import sys
 
 # The bus-RESET edge interrupt runs on core1 too, between bus cycles: a
 # flash fetch there delays core1's next answer just the same.
+# core0's publish-lock regions (#61): while core0 holds the lock a core1
+# command write spins on it, so these must be RAM-only and call nothing --
+# not even another RAM function (a call could block or grow the hold time).
+# Each locked region is a lambda in fdc_disk_task (plus one helper).
+LOCKED_RE = re.compile(r"^_ZZ13fdc_disk_taskvENKUlvE\d*_clEv(\.\w+\.\d+)?$")
+LOCKED_EXTRA = ["_ZL24fdc_end_for_missing_unitv"]
+
 ROOTS = ["_ZL11listen_loopv", "_Z13fdc_reg_writehh", "_Z12fdc_reg_readh",
          "_ZN12_GLOBAL__N_1L17fdc_bus_reset_isrEv"]
 
@@ -89,11 +96,28 @@ def main():
                 problems.append(f"{f}: indirect call (cannot be checked): {line.strip()}")
             if WORD_RE.search(line):
                 problems.append(f"{f}: flash literal: {line.strip()}")
+    locked = [n for n in funcs if LOCKED_RE.match(n)] + \
+             [n for n in LOCKED_EXTRA if n in funcs]
+    if not locked:
+        problems.append("no publish-lock regions found (renamed? update LOCKED_RE)")
+    for f in locked:
+        addr, body = funcs[f]
+        if addr >> 28 != 0x2:
+            problems.append(f"{f}: publish-lock region at 0x{addr:08x}, not in RAM")
+        for line in body:
+            if CALL_RE.search(line) or INDIRECT_RE.search(line) and "bx\tlr" not in line:
+                problems.append(f"{f}: publish-lock region calls out: {line.strip()}")
+            b = BRANCH_RE.search(line)
+            if b and b.group(2) != f:
+                problems.append(f"{f}: publish-lock region jumps out: {line.strip()}")
+            if WORD_RE.search(line):
+                problems.append(f"{f}: publish-lock region flash literal: {line.strip()}")
     for p in problems:
         print(f"check_core1_ram: {p}", file=sys.stderr)
     if not problems:
         print(f"check_core1_ram: OK -- {len(seen)} function(s) reachable from "
-              f"core1's bus path, all in RAM: {', '.join(sorted(seen))}")
+              f"core1's bus path, all in RAM: {', '.join(sorted(seen))}; "
+              f"{len(locked)} publish-lock region(s) RAM-only with no calls")
     return 1 if problems else 0
 
 
